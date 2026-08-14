@@ -1,0 +1,250 @@
+{
+  "Comment": "Panasa Agent Deployment Workflow — CLAUDE.md F1 (ARCHITECTURE FREEZE v1.2): 12-stage fully automated pipeline. POLICY_CHECK is the only decision point and it is automated — PASS proceeds to APPLYING, BLOCK stops the pipeline. There is no manual approval gate anywhere in this definition. Every CodeBuild stage from SecurityScanning through TerraformPlan runs against generatingIac.branch (F5's PR, not yet merged) via SourceVersion; PolicyCheck merges (PASS) or closes (BLOCK) that PR, so Applying is the first stage to run against the default branch. Rendered from this file by bootstrap/stage1/step_functions.tf's templatefile() — placeholders below are filled in with real Lambda ARNs / CodeBuild project names at `terraform apply` time.",
+  "StartAt": "Validating",
+  "States": {
+    "Validating": {
+      "Type": "Task",
+      "Comment": "Capability contract, circular dep check, schema validation",
+      "Resource": "${validating_lambda_arn}",
+      "ResultPath": "$.validating",
+      "Next": "ChangeImpact",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}]
+    },
+    "ChangeImpact": {
+      "Type": "Task",
+      "Comment": "Deterministic rules engine — LOW/MEDIUM/HIGH/CRITICAL label is informational only (R08); it never gates this pipeline",
+      "Resource": "${change_impact_lambda_arn}",
+      "ResultPath": "$.changeImpact",
+      "Next": "GeneratingIac",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}]
+    },
+    "GeneratingIac": {
+      "Type": "Task",
+      "Comment": "Conditional Terraform/CDK generation from AgentConfiguration (R20)",
+      "Resource": "${generating_iac_lambda_arn}",
+      "ResultPath": "$.generatingIac",
+      "Next": "SecurityScanning",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}]
+    },
+    "SecurityScanning": {
+      "Type": "Parallel",
+      "Comment": "Section 6.2 — five scan types run in parallel (app.modules.security.scanner.SCAN_TYPES); each writes its own SecurityScanSummary via write_stage_result.sh-style DynamoDB update",
+      "ResultPath": "$.securityScanning",
+      "Next": "Evaluating",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}],
+      "Branches": [
+        {
+          "StartAt": "Sast",
+          "States": {
+            "Sast": {
+              "Type": "Task",
+              "Comment": "Bandit + Semgrep",
+              "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+              "Parameters": {
+                "ProjectName": "${sast_codebuild_project}",
+                "SourceVersion.$": "$.generatingIac.branch",
+                "EnvironmentVariablesOverride": [
+                  {"Name": "DEPLOYMENT_ID", "Value.$": "$.deploymentId"},
+                  {"Name": "AGENT_ID", "Value.$": "$.agentId"}
+                ]
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "SecretScan",
+          "States": {
+            "SecretScan": {
+              "Type": "Task",
+              "Comment": "Trufflehog",
+              "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+              "Parameters": {
+                "ProjectName": "${secret_scan_codebuild_project}",
+                "SourceVersion.$": "$.generatingIac.branch",
+                "EnvironmentVariablesOverride": [
+                  {"Name": "DEPLOYMENT_ID", "Value.$": "$.deploymentId"},
+                  {"Name": "AGENT_ID", "Value.$": "$.agentId"}
+                ]
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "DependencyScan",
+          "States": {
+            "DependencyScan": {
+              "Type": "Task",
+              "Comment": "Safety",
+              "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+              "Parameters": {
+                "ProjectName": "${dependency_scan_codebuild_project}",
+                "SourceVersion.$": "$.generatingIac.branch",
+                "EnvironmentVariablesOverride": [
+                  {"Name": "DEPLOYMENT_ID", "Value.$": "$.deploymentId"},
+                  {"Name": "AGENT_ID", "Value.$": "$.agentId"}
+                ]
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "IacScan",
+          "States": {
+            "IacScan": {
+              "Type": "Task",
+              "Comment": "Checkov + tfsec",
+              "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+              "Parameters": {
+                "ProjectName": "${iac_scan_codebuild_project}",
+                "SourceVersion.$": "$.generatingIac.branch",
+                "EnvironmentVariablesOverride": [
+                  {"Name": "DEPLOYMENT_ID", "Value.$": "$.deploymentId"},
+                  {"Name": "AGENT_ID", "Value.$": "$.agentId"}
+                ]
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "ContainerScan",
+          "States": {
+            "ContainerScan": {
+              "Type": "Task",
+              "Comment": "Trivy — only meaningful if the container image changed (Section 7 container_image rule)",
+              "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+              "Parameters": {
+                "ProjectName": "${container_scan_codebuild_project}",
+                "SourceVersion.$": "$.generatingIac.branch",
+                "EnvironmentVariablesOverride": [
+                  {"Name": "DEPLOYMENT_ID", "Value.$": "$.deploymentId"},
+                  {"Name": "AGENT_ID", "Value.$": "$.agentId"}
+                ]
+              },
+              "End": true
+            }
+          }
+        }
+      ]
+    },
+    "Evaluating": {
+      "Type": "Task",
+      "Comment": "RAGAS (RAG agents only, R14) + agent evaluation tests",
+      "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+      "Parameters": {
+        "ProjectName": "${evaluating_codebuild_project}",
+        "SourceVersion.$": "$.generatingIac.branch",
+        "EnvironmentVariablesOverride": [
+          {"Name": "DEPLOYMENT_ID", "Value.$": "$.deploymentId"},
+          {"Name": "AGENT_ID", "Value.$": "$.agentId"}
+        ]
+      },
+      "ResultPath": "$.evaluating",
+      "Next": "TerraformValidate",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}]
+    },
+    "TerraformValidate": {
+      "Type": "Task",
+      "Comment": "terraform validate — syntax/schema only, no AWS call (F1)",
+      "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+      "Parameters": {
+        "ProjectName": "${terraform_validate_codebuild_project}",
+        "SourceVersion.$": "$.generatingIac.branch",
+        "EnvironmentVariablesOverride": [
+          {"Name": "DEPLOYMENT_ID", "Value.$": "$.deploymentId"},
+          {"Name": "AGENT_ID", "Value.$": "$.agentId"}
+        ]
+      },
+      "ResultPath": "$.terraformValidate",
+      "Next": "TerraformPlan",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}]
+    },
+    "TerraformPlan": {
+      "Type": "Task",
+      "Comment": "Customer CI/CD runs terraform plan, writes plan summary to DynamoDB",
+      "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+      "Parameters": {
+        "ProjectName": "${terraform_plan_codebuild_project}",
+        "SourceVersion.$": "$.generatingIac.branch",
+        "EnvironmentVariablesOverride": [
+          {"Name": "DEPLOYMENT_ID", "Value.$": "$.deploymentId"},
+          {"Name": "AGENT_ID", "Value.$": "$.agentId"}
+        ]
+      },
+      "ResultPath": "$.terraformPlan",
+      "Next": "PolicyCheck",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}]
+    },
+    "PolicyCheck": {
+      "Type": "Task",
+      "Comment": "Automated PASS/BLOCK decision (Section 7 policy_gate, F9 R06/R07) — reads all prior stage results, no human input",
+      "Resource": "${policy_check_lambda_arn}",
+      "ResultPath": "$.policyCheck",
+      "Next": "PolicyGateChoice",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}]
+    },
+    "PolicyGateChoice": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.policyCheck.result",
+          "StringEquals": "BLOCK",
+          "Next": "MarkBlocked"
+        }
+      ],
+      "Default": "Applying"
+    },
+    "Applying": {
+      "Type": "Task",
+      "Comment": "Customer CI/CD runs terraform apply — CREATE/UPDATE/DELETE reconciliation (F2)",
+      "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+      "Parameters": {
+        "ProjectName": "${terraform_apply_codebuild_project}",
+        "EnvironmentVariablesOverride": [
+          {"Name": "DEPLOYMENT_ID", "Value.$": "$.deploymentId"},
+          {"Name": "AGENT_ID", "Value.$": "$.agentId"}
+        ]
+      },
+      "ResultPath": "$.applying",
+      "Next": "Deploying",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}]
+    },
+    "Deploying": {
+      "Type": "Task",
+      "Comment": "ECS rolling update, waits for tasks healthy",
+      "Resource": "${deploying_lambda_arn}",
+      "ResultPath": "$.deploying",
+      "Next": "HealthCheck",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}]
+    },
+    "HealthCheck": {
+      "Type": "Task",
+      "Comment": "POST /health on the new agent endpoint, verifies 200 + correct version",
+      "Resource": "${health_check_lambda_arn}",
+      "ResultPath": "$.healthCheck",
+      "Next": "MarkActive",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}]
+    },
+    "MarkActive": {
+      "Type": "Task",
+      "Comment": "Previous version gracefully drained (R22). New version live.",
+      "Resource": "${mark_active_lambda_arn}",
+      "End": true
+    },
+    "MarkBlocked": {
+      "Type": "Task",
+      "Comment": "Terminal — previous version remains ACTIVE (R22)",
+      "Resource": "${mark_blocked_lambda_arn}",
+      "End": true
+    },
+    "MarkFailed": {
+      "Type": "Task",
+      "Comment": "Terminal — previous version remains ACTIVE (R22)",
+      "Resource": "${mark_failed_lambda_arn}",
+      "End": true
+    }
+  }
+}

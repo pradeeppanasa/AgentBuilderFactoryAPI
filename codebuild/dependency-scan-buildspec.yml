@@ -1,0 +1,28 @@
+version: 0.2
+
+# Panasa Agent Builder — SECURITY_SCANNING / dependency_scan branch
+# (Section 6.2, Safety). See sast-buildspec.yml's header for shared caveats.
+
+env:
+  variables:
+    STAGE_NAME: "SECURITY_SCANNING"
+
+phases:
+  install:
+    commands:
+      - pip install --quiet safety
+  build:
+    commands:
+      - safety check -r requirements.txt --json > /tmp/safety.json || true
+      - echo "CRITICAL_CVE=$(jq '[.vulnerabilities[]? | select(.severity=="critical")] | length' /tmp/safety.json 2>/dev/null || echo 0)" >> /tmp/build-env
+  post_build:
+    commands:
+      - source /tmp/build-env
+      - |
+        if [ "${CRITICAL_CVE:-0}" -gt 0 ]; then
+          bash "$CODEBUILD_SRC_DIR/codebuild/scripts/write_stage_result.sh" "$STAGE_NAME" FAILED \
+            "Dependency scan: ${CRITICAL_CVE} critical CVE(s)" "critical_cve_found"
+          exit 1
+        else
+          bash "$CODEBUILD_SRC_DIR/codebuild/scripts/write_stage_result.sh" "$STAGE_NAME" PASSED "Dependency scan: 0 critical"
+        fi

@@ -1,0 +1,43 @@
+version: 0.2
+
+# Panasa Agent Builder — TERRAFORM_PLAN stage.
+# Runs `terraform plan` against the customer's own Terraform state (F0/F2 —
+# the Runtime never reads this state; only this customer-side CI/CD does).
+# The plan summary is written to panasa-deployments.terraform_plan_summary
+# so the Runtime can surface it read-only via GET /deployments/{id}.
+
+env:
+  variables:
+    STAGE_NAME: "TERRAFORM_PLAN"
+
+phases:
+  install:
+    commands:
+      - terraform -version
+      - jq --version
+  build:
+    commands:
+      - bash codebuild/scripts/write_stage_result.sh "$STAGE_NAME" RUNNING
+      - cd "terraform/agents/${AGENT_ID}"
+      - terraform init
+      - terraform plan -out=tfplan -detailed-exitcode -no-color > /tmp/plan-output.txt || PLAN_EXIT=$?
+      - echo "PLAN_EXIT=${PLAN_EXIT:-0}" >> /tmp/build-env
+  post_build:
+    commands:
+      - source /tmp/build-env
+      - PLAN_SUMMARY=$(tail -c 4000 /tmp/plan-output.txt)
+      - |
+        # terraform plan exit codes: 0 = no changes, 1 = error, 2 = changes present
+        if [ "$PLAN_EXIT" = "0" ] || [ "$PLAN_EXIT" = "2" ]; then
+          bash "$CODEBUILD_SRC_DIR/codebuild/scripts/write_stage_result.sh" \
+            "$STAGE_NAME" PASSED "$PLAN_SUMMARY"
+          aws dynamodb update-item \
+            --table-name "$DYNAMODB_DEPLOYMENTS_TABLE" \
+            --key "{\"agent_id\": {\"S\": \"$AGENT_ID\"}, \"deployment_id\": {\"S\": \"$DEPLOYMENT_ID\"}}" \
+            --update-expression "SET terraform_plan_summary = :summary" \
+            --expression-attribute-values "{\":summary\": {\"S\": $(echo "$PLAN_SUMMARY" | jq -Rs .)}}"
+        else
+          bash "$CODEBUILD_SRC_DIR/codebuild/scripts/write_stage_result.sh" \
+            "$STAGE_NAME" FAILED "$PLAN_SUMMARY"
+          exit 1
+        fi

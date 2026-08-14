@@ -1,0 +1,63 @@
+services:
+  agent-builder-runtime:
+    build: .
+    container_name: agent-builder-runtime
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - DYNAMODB_ENDPOINT=http://dynamodb-local:8000
+      - SECRETS_MANAGER_ENDPOINT=http://localstack:4566
+      - S3_ENDPOINT=http://localstack:4566
+      - IAC_OUTPUT_BUCKET=panasa-iac-artifacts-local
+      - DATABASE_URL=postgresql+asyncpg://panasa:panasa@postgres:5432/panasa_agent_builder
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - dynamodb-local
+      - localstack
+      - postgres
+      - redis
+
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    container_name: dynamodb-local
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    ports:
+      - "8001:8000"
+
+  localstack:
+    image: localstack/localstack:latest
+    container_name: localstack
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=secretsmanager,sts,s3,events,stepfunctions
+      - DEBUG=0
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=panasa
+      - POSTGRES_PASSWORD=panasa
+      - POSTGRES_DB=panasa_agent_builder
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: panasa-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save ""
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  postgres-data:

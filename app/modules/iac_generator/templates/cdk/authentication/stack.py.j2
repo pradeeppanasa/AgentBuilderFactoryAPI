@@ -1,0 +1,28 @@
+"""Agent runtime identity — least-privilege execution role (Section 11)."""
+
+from aws_cdk import aws_iam as iam
+
+{% set tool_secrets = agent.tools | selectattr("credentials_secret_arn") | list %}
+
+def add_authentication_resources(stack, agent_id: str) -> None:
+    role = iam.Role(
+        stack,
+        "AgentExecutionRole",
+        role_name=f"panasa-agent-{agent_id}-execution-role",
+        assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+    )
+    stack.agent_execution_role = role
+
+{% if tool_secrets %}
+    role.add_to_policy(
+        iam.PolicyStatement(
+            effect=iam.Effect.ALLOW,
+            actions=["secretsmanager:GetSecretValue"],
+            resources=[
+{% for tool in tool_secrets %}
+                "{{ tool.credentials_secret_arn }}",
+{% endfor %}
+            ],
+        )
+    )
+{% endif %}

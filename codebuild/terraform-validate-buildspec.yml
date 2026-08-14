@@ -1,0 +1,40 @@
+version: 0.2
+
+# Panasa Agent Builder — TERRAFORM_VALIDATE stage.
+# R05: customer CI/CD owns terraform init/refresh/plan/apply; the Runtime
+# never runs terraform itself. This stage is syntax/schema validation only
+# (F1) — no AWS call, no drift check.
+
+env:
+  variables:
+    STAGE_NAME: "TERRAFORM_VALIDATE"
+
+phases:
+  install:
+    commands:
+      - terraform -version
+      - jq --version
+  build:
+    commands:
+      - bash codebuild/scripts/write_stage_result.sh "$STAGE_NAME" RUNNING
+      - cd "terraform/agents/${AGENT_ID}"
+      - terraform init -backend=false
+      - |
+        if terraform validate -json > /tmp/validate-result.json; then
+          echo "VALIDATE_STATUS=PASSED" >> /tmp/build-env
+        else
+          echo "VALIDATE_STATUS=FAILED" >> /tmp/build-env
+        fi
+  post_build:
+    commands:
+      - source /tmp/build-env
+      - |
+        if [ "$VALIDATE_STATUS" = "PASSED" ]; then
+          bash "$CODEBUILD_SRC_DIR/codebuild/scripts/write_stage_result.sh" \
+            "$STAGE_NAME" PASSED "terraform validate passed"
+        else
+          bash "$CODEBUILD_SRC_DIR/codebuild/scripts/write_stage_result.sh" \
+            "$STAGE_NAME" FAILED "terraform validate failed" \
+            "$(cat /tmp/validate-result.json)"
+          exit 1
+        fi

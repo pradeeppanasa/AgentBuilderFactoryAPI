@@ -1,0 +1,40 @@
+"""Human-in-the-loop — Step Functions + SNS + SQS."""
+
+from aws_cdk import Duration
+from aws_cdk import aws_sns as sns
+from aws_cdk import aws_sqs as sqs
+from aws_cdk import aws_stepfunctions as sfn
+from aws_cdk import aws_stepfunctions_tasks as sfn_tasks
+
+
+def add_human_loop_resources(stack, agent_id: str) -> None:
+    sns.Topic(stack, "HumanReviewTopic", topic_name=f"panasa-agent-{agent_id}-human-review")
+
+    queue = sqs.Queue(
+        stack,
+        "HumanReviewQueue",
+        queue_name=f"panasa-agent-{agent_id}-human-review",
+        visibility_timeout=Duration.hours({{ agent.human_review.approval_timeout_hours }}),
+    )
+
+    await_approval = sfn_tasks.CallAwsService(
+        stack,
+        "AwaitApproval",
+        service="sqs",
+        action="sendMessage",
+        integration_pattern=sfn.IntegrationPattern.WAIT_FOR_TASK_TOKEN,
+        parameters={
+            "QueueUrl": queue.queue_url,
+            "MessageBody": sfn.JsonPath.string_at("$.reviewRequest"),
+        },
+        iam_resources=[queue.queue_arn],
+        timeout=Duration.hours({{ agent.human_review.approval_timeout_hours }}),
+    )
+
+    sfn.StateMachine(
+        stack,
+        "HumanReviewWorkflow",
+        state_machine_name=f"panasa-agent-{agent_id}-human-review",
+        definition_body=sfn.DefinitionBody.from_chainable(await_approval),
+        role=stack.agent_execution_role,
+    )

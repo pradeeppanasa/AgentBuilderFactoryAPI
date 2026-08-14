@@ -1,0 +1,50 @@
+{
+  "Comment": "Panasa Platform Upgrade Workflow (CLAUDE.md Section 14 Phase 15). Started directly via stepfunctions:StartExecution from POST /api/v1/platform/upgrade (app.modules.platform.upgrade_orchestrator) — unlike the agent deployment workflow, there is no EventBridge indirection and no customer-CI/CD boundary here: upgrading the Factory's own ECS service is this Runtime's own operational concern (see version_service.py's docstring). Any failure rolls the ECS service back to the pre-upgrade task definition — 'Platform rollback: revert ECS task definition to previous image digest' is the MarkUpgradeFailed branch, not a separate user-triggered action.",
+  "StartAt": "PullingImage",
+  "States": {
+    "PullingImage": {
+      "Type": "Task",
+      "Comment": "Confirms the target image tag/digest actually exists in ECR before touching ECS at all.",
+      "Resource": "${pulling_image_lambda_arn}",
+      "ResultPath": "$.pullingImage",
+      "Next": "RegisteringTaskDefinition",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkUpgradeFailed"}]
+    },
+    "RegisteringTaskDefinition": {
+      "Type": "Task",
+      "Comment": "Clones the current task definition with the target image (+ PLATFORM_VERSION env var) as a new, immutable revision. Records both ARNs — the new one for UpdatingService, the previous one for rollback.",
+      "Resource": "${registering_task_definition_lambda_arn}",
+      "ResultPath": "$.registeringTaskDefinition",
+      "Next": "UpdatingService",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkUpgradeFailed"}]
+    },
+    "UpdatingService": {
+      "Type": "Task",
+      "Comment": "ECS's own deployment configuration (minimumHealthyPercent/maximumPercent) performs the zero-downtime rolling replacement — this stage just points the service at the new revision and waits for it to stabilize.",
+      "Resource": "${updating_service_lambda_arn}",
+      "ResultPath": "$.updatingService",
+      "Next": "PlatformHealthCheck",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkUpgradeFailed"}]
+    },
+    "PlatformHealthCheck": {
+      "Type": "Task",
+      "Comment": "GET /api/v1/platform/health on the Runtime's own ALB endpoint (Section 5.6 — a GET, unlike the agent pipeline's POST /health per F1) — confirms the new version is actually serving before declaring success.",
+      "Resource": "${platform_health_check_lambda_arn}",
+      "ResultPath": "$.healthCheck",
+      "Next": "MarkUpgraded",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkUpgradeFailed"}]
+    },
+    "MarkUpgraded": {
+      "Type": "Task",
+      "Comment": "Terminal success — status=ACTIVE.",
+      "Resource": "${mark_upgraded_lambda_arn}",
+      "End": true
+    },
+    "MarkUpgradeFailed": {
+      "Type": "Task",
+      "Comment": "Terminal failure — rolls the ECS service back to previous_task_definition_arn (a no-op if RegisteringTaskDefinition never ran) and records failure_reason.",
+      "Resource": "${mark_upgrade_failed_lambda_arn}",
+      "End": true
+    }
+  }
+}

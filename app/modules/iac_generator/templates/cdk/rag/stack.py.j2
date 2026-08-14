@@ -1,0 +1,57 @@
+"""Knowledge Base — OpenSearch Serverless + Bedrock KB."""
+
+from aws_cdk import Aws
+from aws_cdk import aws_bedrock as bedrock
+from aws_cdk import aws_iam as iam
+from aws_cdk import aws_opensearchserverless as opensearchserverless
+
+
+def add_rag_resources(stack, agent_id: str) -> None:
+    collection = opensearchserverless.CfnCollection(
+        stack,
+        "AgentKbCollection",
+        name=f"panasa-agent-{agent_id}-kb",
+        type="VECTORSEARCH",
+    )
+
+    knowledge_base = bedrock.CfnKnowledgeBase(
+        stack,
+        "AgentKnowledgeBase",
+        name="{{ agent.knowledge_base.kb_name or (agent_id ~ "-kb") }}",
+        role_arn=stack.agent_execution_role.role_arn,
+        knowledge_base_configuration=bedrock.CfnKnowledgeBase.KnowledgeBaseConfigurationProperty(
+            type="VECTOR",
+            vector_knowledge_base_configuration=bedrock.CfnKnowledgeBase.VectorKnowledgeBaseConfigurationProperty(
+                embedding_model_arn=(
+                    f"arn:aws:bedrock:{Aws.REGION}::foundation-model/"
+                    "{{ agent.knowledge_base.embedding_model }}"
+                ),
+            ),
+        ),
+        storage_configuration=bedrock.CfnKnowledgeBase.StorageConfigurationProperty(
+            type="OPENSEARCH_SERVERLESS",
+            opensearch_serverless_configuration=bedrock.CfnKnowledgeBase.OpenSearchServerlessConfigurationProperty(
+                collection_arn=collection.attr_arn,
+                vector_index_name=f"panasa-agent-{agent_id}-index",
+                field_mapping=bedrock.CfnKnowledgeBase.OpenSearchServerlessFieldMappingProperty(
+                    vector_field="embedding",
+                    text_field="text",
+                    metadata_field="metadata",
+                ),
+            ),
+        ),
+    )
+    stack.agent_knowledge_base = knowledge_base
+
+{% if agent.knowledge_base.s3_bucket %}
+    stack.agent_execution_role.add_to_policy(
+        iam.PolicyStatement(
+            effect=iam.Effect.ALLOW,
+            actions=["s3:GetObject", "s3:ListBucket"],
+            resources=[
+                "arn:aws:s3:::{{ agent.knowledge_base.s3_bucket }}",
+                "arn:aws:s3:::{{ agent.knowledge_base.s3_bucket }}/*",
+            ],
+        )
+    )
+{% endif %}

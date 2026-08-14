@@ -1,0 +1,23 @@
+"""Observability — CloudWatch Logs + X-Ray."""
+
+from aws_cdk import aws_iam as iam
+from aws_cdk import aws_logs as logs
+
+
+def add_observability_resources(stack, agent_id: str) -> None:
+    logs.LogGroup(
+        stack,
+        "AgentLogGroup",
+        log_group_name=f"/panasa/agents/{agent_id}",
+        retention=logs.RetentionDays.ONE_MONTH,
+    )
+
+{% if agent.observability_enabled %}
+    stack.agent_execution_role.add_to_policy(
+        iam.PolicyStatement(
+            effect=iam.Effect.ALLOW,
+            actions=["xray:PutTraceSegments", "xray:PutTelemetryRecords"],
+            resources=["*"],
+        )
+    )
+{% endif %}

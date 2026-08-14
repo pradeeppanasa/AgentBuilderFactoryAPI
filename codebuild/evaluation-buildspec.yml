@@ -1,0 +1,28 @@
+version: 0.2
+
+# Panasa Agent Builder — EVALUATING stage (Phase 10 / Section 28 / F4).
+#
+# PLACEHOLDER for the RAGAS scoring + targeted agent-eval logic itself
+# (Section 28's RAGASEvaluator, and whatever runs PROMPT_EVALUATION /
+# MODEL_EVALUATION / etc. per REQUIRED_VALIDATIONS) — that harness needs a
+# way to actually invoke the agent under test and was never built as
+# runnable code in any phase up to and including Phase 10 (which built the
+# *orchestration* — app/modules/evaluation — deliberately stopping at "starts
+# this CodeBuild project", per the same R05 boundary as security scanning).
+# This buildspec exists so app.modules.evaluation.evaluator.AgentEvaluator
+# has a real CodeBuild project to start; wire in real scoring here before
+# relying on this stage's PASSED result for anything.
+
+env:
+  variables:
+    STAGE_NAME: "EVALUATING"
+
+phases:
+  build:
+    commands:
+      - echo "RUN_RAGAS=${RUN_RAGAS:-false}, REQUIRED_VALIDATIONS=${REQUIRED_VALIDATIONS:-<none>}"
+      - echo "No evaluation harness wired in yet — see this file's header."
+  post_build:
+    commands:
+      - bash "$CODEBUILD_SRC_DIR/codebuild/scripts/write_stage_result.sh" "$STAGE_NAME" PASSED \
+          "Placeholder: RUN_RAGAS=${RUN_RAGAS:-false}, REQUIRED_VALIDATIONS=${REQUIRED_VALIDATIONS:-none} (no scoring harness wired in yet)"

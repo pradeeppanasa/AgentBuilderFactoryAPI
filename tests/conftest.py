@@ -1,0 +1,134 @@
+"""Shared test fixtures.
+
+All DynamoDB / Secrets Manager access goes through boto3, mocked here via
+moto's in-memory AWS backend — no Docker services required. User accounts
+(Phase 3) go through SQLAlchemy; tests point at a temp-file SQLite database
+instead of real Postgres, sharing the same ORM models/migrations-equivalent
+schema (`Base.metadata.create_all`) so the app code under test is identical
+to what runs against Postgres in prototype/enterprise.
+
+DATABASE_URL and JWT_SECRET_ARN are set at module import time (before any
+`app.*` module — and therefore the `Settings()` singleton — is imported),
+since pydantic-settings reads the environment once, at construction.
+"""
+
+from __future__ import annotations
+
+import os
+import tempfile
+import uuid
+from collections.abc import AsyncIterator, Iterator
+
+import pytest
+from moto import mock_aws
+
+_TMP_DB_DIR = tempfile.mkdtemp(prefix="panasa-test-db-")
+os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_TMP_DB_DIR}/test.db"
+os.environ.setdefault("JWT_SECRET_ARN", "jwt-secret")
+os.environ.setdefault("IAC_OUTPUT_BUCKET", "panasa-iac-artifacts-test")
+os.environ.setdefault("AUDIT_S3_BUCKET", "panasa-audit-test")
+os.environ.setdefault("GIT_PROVIDER", "github")
+os.environ.setdefault("GIT_CREDENTIALS_SECRET", "git-token")
+os.environ.setdefault("GIT_REPO_URL", "https://github.com/test-org/test-repo")
+os.environ.setdefault("EVENTBRIDGE_BUS_NAME", "panasa-agent-builder-test")
+# Deliberately unreachable (connection refused, not a timeout) so
+# check_cache()'s "error" path is deterministic in tests regardless of
+# whether a real Redis happens to be running on the test machine — see
+# tests/test_platform_health.py for the "ok" path, exercised against
+# fakeredis directly instead.
+os.environ.setdefault("REDIS_URL", "redis://127.0.0.1:1/0")
+
+TEST_JWT_SECRET = "test-jwt-signing-secret-not-for-production"
+TEST_GIT_TOKEN = "test-git-token-not-for-production"  # noqa: S105
+TEST_IAC_BUCKET = os.environ["IAC_OUTPUT_BUCKET"]
+TEST_AUDIT_BUCKET = os.environ["AUDIT_S3_BUCKET"]
+TEST_EVENTBRIDGE_BUS = os.environ["EVENTBRIDGE_BUS_NAME"]
+
+
+@pytest.fixture(autouse=True)
+def aws_credentials() -> None:
+    os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
+    os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
+    os.environ.setdefault("AWS_SECURITY_TOKEN", "testing")
+    os.environ.setdefault("AWS_SESSION_TOKEN", "testing")
+    os.environ.setdefault("AWS_DEFAULT_REGION", "eu-west-2")
+
+
+@pytest.fixture(autouse=True)
+def mocked_aws(aws_credentials: None) -> Iterator[None]:
+    with mock_aws():
+        import boto3
+
+        secretsmanager = boto3.client("secretsmanager", region_name="eu-west-2")
+        secretsmanager.create_secret(Name="jwt-secret", SecretString=TEST_JWT_SECRET)
+        secretsmanager.create_secret(Name="git-token", SecretString=TEST_GIT_TOKEN)
+
+        s3 = boto3.client("s3", region_name="eu-west-2")
+        s3.create_bucket(
+            Bucket=TEST_IAC_BUCKET,
+            CreateBucketConfiguration={"LocationConstraint": "eu-west-2"},
+        )
+        s3.create_bucket(
+            Bucket=TEST_AUDIT_BUCKET,
+            CreateBucketConfiguration={"LocationConstraint": "eu-west-2"},
+        )
+        boto3.client("events", region_name="eu-west-2").create_event_bus(Name=TEST_EVENTBRIDGE_BUS)
+        yield
+
+
+@pytest.fixture(autouse=True)
+async def reset_database() -> AsyncIterator[None]:
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.modules.auth.models import Base
+
+    engine = create_async_engine(os.environ["DATABASE_URL"])
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.drop_all)
+        await connection.run_sync(Base.metadata.create_all)
+    await engine.dispose()
+    yield
+
+
+@pytest.fixture
+async def make_user_and_token():
+    from app.config import settings
+    from app.modules.auth.db import create_db_engine, create_session_factory
+    from app.modules.auth.models import User
+    from app.modules.auth.security import create_access_token, hash_password
+
+    async def _make(
+        tenant_id: str,
+        role: str = "developer",
+        email: str | None = None,
+        password: str = "TestPassword123!",
+        is_active: bool = True,
+    ) -> tuple[User, str]:
+        engine = create_db_engine(settings)
+        session_factory = create_session_factory(engine)
+        user = User(
+            email=email or f"{uuid.uuid4().hex}@example.com",
+            hashed_password=hash_password(password),
+            role=role,
+            tenant_id=tenant_id,
+            is_active=is_active,
+        )
+        async with session_factory() as session:
+            session.add(user)
+            await session.commit()
+            await session.refresh(user)
+        await engine.dispose()
+
+        token = create_access_token(
+            user,
+            TEST_JWT_SECRET,
+            settings.jwt_algorithm,
+            settings.jwt_access_token_expire_minutes,
+        )
+        return user, token
+
+    return _make
+
+
+def bearer(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}

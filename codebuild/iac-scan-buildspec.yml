@@ -1,0 +1,35 @@
+version: 0.2
+
+# Panasa Agent Builder — SECURITY_SCANNING / iac_scan branch (Section 6.2,
+# Checkov + tfsec). Scans the generated Terraform under
+# terraform/agents/${AGENT_ID} — not this repo's own bootstrap/ Terraform.
+
+env:
+  variables:
+    STAGE_NAME: "SECURITY_SCANNING"
+
+phases:
+  install:
+    commands:
+      - pip install --quiet checkov
+      - curl -sSfL https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+  build:
+    commands:
+      - cd "terraform/agents/${AGENT_ID}"
+      - checkov -d . --compact --output json > /tmp/checkov.json || true
+      - tfsec . --format json > /tmp/tfsec.json || true
+      - |
+        CHECKOV_CRIT=$(jq '[.results.failed_checks[]? | select(.severity=="CRITICAL")] | length' /tmp/checkov.json 2>/dev/null || echo 0)
+        TFSEC_CRIT=$(jq '[.results[]? | select(.severity=="CRITICAL")] | length' /tmp/tfsec.json 2>/dev/null || echo 0)
+        echo "IAC_CRITICAL=$((${CHECKOV_CRIT:-0} + ${TFSEC_CRIT:-0}))" >> /tmp/build-env
+  post_build:
+    commands:
+      - source /tmp/build-env
+      - |
+        if [ "${IAC_CRITICAL:-0}" -gt 0 ]; then
+          bash "$CODEBUILD_SRC_DIR/codebuild/scripts/write_stage_result.sh" "$STAGE_NAME" FAILED \
+            "IaC scan: ${IAC_CRITICAL} critical (checkov+tfsec)" "iam_privilege_escalation"
+          exit 1
+        else
+          bash "$CODEBUILD_SRC_DIR/codebuild/scripts/write_stage_result.sh" "$STAGE_NAME" PASSED "IaC scan: 0 critical"
+        fi

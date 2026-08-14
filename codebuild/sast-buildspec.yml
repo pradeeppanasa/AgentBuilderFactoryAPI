@@ -1,0 +1,39 @@
+version: 0.2
+
+# Panasa Agent Builder — SECURITY_SCANNING / SAST branch (Section 6.2).
+# R05: this is the customer CI/CD's own scan *execution* — the Runtime
+# never runs a scanner itself (app/modules/security/scanner.py only starts
+# this build). KNOWN GAP (pre-existing from Phase 9, not introduced here):
+# all 5 SecurityScanning branches write to the same deployment record's
+# SECURITY_SCANNING stage key concurrently — see bootstrap/README.md.
+
+env:
+  variables:
+    STAGE_NAME: "SECURITY_SCANNING"
+
+phases:
+  install:
+    commands:
+      - pip install --quiet bandit semgrep
+  build:
+    commands:
+      - mkdir -p /tmp/sast
+      - bandit -r app -f json -o /tmp/sast/bandit.json || true
+      - semgrep --config=auto --json --output=/tmp/sast/semgrep.json app || true
+      - |
+        CRITICAL=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' /tmp/sast/semgrep.json 2>/dev/null || echo 0)
+        HIGH_BANDIT=$(jq '[.results[]? | select(.issue_severity=="HIGH")] | length' /tmp/sast/bandit.json 2>/dev/null || echo 0)
+        echo "SAST_CRITICAL=${CRITICAL:-0}" >> /tmp/build-env
+        echo "SAST_HIGH_BANDIT=${HIGH_BANDIT:-0}" >> /tmp/build-env
+  post_build:
+    commands:
+      - source /tmp/build-env
+      - |
+        if [ "${SAST_CRITICAL:-0}" -gt 0 ]; then
+          bash "$CODEBUILD_SRC_DIR/codebuild/scripts/write_stage_result.sh" "$STAGE_NAME" FAILED \
+            "SAST: ${SAST_CRITICAL} critical (semgrep), ${SAST_HIGH_BANDIT} high (bandit)" "critical_cve_found"
+          exit 1
+        else
+          bash "$CODEBUILD_SRC_DIR/codebuild/scripts/write_stage_result.sh" "$STAGE_NAME" PASSED \
+            "SAST: 0 critical, ${SAST_HIGH_BANDIT} high (bandit)"
+        fi

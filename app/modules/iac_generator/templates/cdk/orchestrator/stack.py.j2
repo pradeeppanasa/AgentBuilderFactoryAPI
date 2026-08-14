@@ -1,0 +1,40 @@
+"""Orchestrator compute — ECS Fargate task + service."""
+
+from aws_cdk import aws_ecs as ecs
+
+
+def add_orchestrator_resources(stack, agent_id: str) -> None:
+    runtime_image = stack.node.try_get_context("runtime_image")
+    cluster_arn = stack.node.try_get_context("ecs_cluster_arn")
+    cluster = ecs.Cluster.from_cluster_arn(stack, "AgentEcsCluster", cluster_arn=cluster_arn)
+
+    task_definition = ecs.FargateTaskDefinition(
+        stack,
+        "OrchestratorTaskDef",
+        family=f"panasa-agent-{agent_id}",
+        cpu=512,
+        memory_limit_mib=1024,
+        execution_role=stack.agent_execution_role,
+        task_role=stack.agent_execution_role,
+    )
+
+    task_definition.add_container(
+        "agent",
+        image=ecs.ContainerImage.from_registry(runtime_image),
+        environment={
+            "AGENT_ID": "{{ agent_id }}",
+            "AGENT_VERSION": "{{ version }}",
+            "MODEL_ID": "{{ agent.model_id }}",
+            "MODEL_PROVIDER": "{{ agent.model_provider }}",
+        },
+    )
+
+    ecs.FargateService(
+        stack,
+        "OrchestratorService",
+        service_name=f"panasa-agent-{agent_id}",
+        cluster=cluster,
+        task_definition=task_definition,
+        desired_count=1,
+        security_groups=[stack.agent_security_group],
+    )

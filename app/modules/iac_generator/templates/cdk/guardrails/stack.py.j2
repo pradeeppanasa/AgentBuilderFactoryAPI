@@ -1,0 +1,41 @@
+"""Guardrails — Bedrock Guardrails (CfnGuardrail; no L2 construct yet)."""
+
+from aws_cdk import aws_bedrock as bedrock
+from aws_cdk import aws_iam as iam
+
+
+def add_guardrails_resources(stack, agent_id: str) -> None:
+    guardrail = bedrock.CfnGuardrail(
+        stack,
+        "AgentGuardrail",
+        name=f"panasa-agent-{agent_id}-guardrail",
+        blocked_input_messaging="This request cannot be processed.",
+        blocked_outputs_messaging="This response cannot be shown.",
+{% if agent.guardrails.pii_detection %}
+        sensitive_information_policy_config=bedrock.CfnGuardrail.SensitiveInformationPolicyConfigProperty(
+            pii_entities_config=[
+                bedrock.CfnGuardrail.PiiEntityConfigProperty(
+                    type="EMAIL",
+                    action="{{ "BLOCK" if agent.guardrails.pii_strip_output else "ANONYMIZE" }}",
+                )
+            ]
+        ),
+{% endif %}
+{% if agent.guardrails.toxicity_filter %}
+        content_policy_config=bedrock.CfnGuardrail.ContentPolicyConfigProperty(
+            filters_config=[
+                bedrock.CfnGuardrail.ContentFilterConfigProperty(
+                    type="HATE", input_strength="HIGH", output_strength="HIGH"
+                )
+            ]
+        ),
+{% endif %}
+    )
+
+    stack.agent_execution_role.add_to_policy(
+        iam.PolicyStatement(
+            effect=iam.Effect.ALLOW,
+            actions=["bedrock:ApplyGuardrail"],
+            resources=[guardrail.attr_guardrail_arn],
+        )
+    )

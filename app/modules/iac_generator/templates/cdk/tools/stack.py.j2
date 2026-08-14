@@ -1,0 +1,44 @@
+"""Per-tool Lambda + IAM (CDK equivalent of the Section 8 Terraform example).
+Per-agent connector isolation (R21): no shared Lambdas across agents.
+"""
+
+from aws_cdk import Duration
+from aws_cdk import aws_iam as iam
+from aws_cdk import aws_lambda as lambda_
+
+
+def add_tools_resources(stack, agent_id: str) -> None:
+{% if not agent.tools %}
+    pass  # No tools configured for this agent.
+{% endif %}
+{% for tool in agent.tools %}
+    {{ tool.tool_id | replace("-", "_") }}_role = iam.Role(
+        stack,
+        "Tool{{ tool.tool_id | replace("-", "_") | capitalize }}Role",
+        role_name=f"{agent_id}-{{ tool.tool_id }}-role",
+        assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+    )
+
+{% if tool.credentials_secret_arn %}
+    {{ tool.tool_id | replace("-", "_") }}_role.add_to_policy(
+        iam.PolicyStatement(
+            effect=iam.Effect.ALLOW,
+            actions=["secretsmanager:GetSecretValue"],
+            resources=["{{ tool.credentials_secret_arn }}"],
+        )
+    )
+{% endif %}
+    lambda_.Function(
+        stack,
+        "Tool{{ tool.tool_id | replace("-", "_") | capitalize }}Function",
+        function_name=f"{agent_id}-{{ tool.tool_id }}",
+        runtime=lambda_.Runtime.PYTHON_3_12,
+        handler="handler.lambda_handler",
+        # Replaced by the customer CI/CD build step.
+        code=lambda_.Code.from_inline(
+            "def lambda_handler(event, context): raise NotImplementedError"
+        ),
+        role={{ tool.tool_id | replace("-", "_") }}_role,
+        timeout=Duration.seconds(30),
+    )
+{% endfor %}

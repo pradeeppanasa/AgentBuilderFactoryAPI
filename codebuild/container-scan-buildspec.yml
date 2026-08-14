@@ -1,0 +1,36 @@
+version: 0.2
+
+# Panasa Agent Builder — SECURITY_SCANNING / container_scan branch (Section
+# 6.2, Trivy). Only meaningful when a container_image change is present
+# (Section 7's container_image rule) — CONTAINER_IMAGE env var is empty on
+# most deployments, in which case this just passes trivially.
+
+env:
+  variables:
+    STAGE_NAME: "SECURITY_SCANNING"
+
+phases:
+  install:
+    commands:
+      - curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+  build:
+    commands:
+      - |
+        if [ -n "${CONTAINER_IMAGE:-}" ]; then
+          trivy image --format json --output /tmp/trivy.json "$CONTAINER_IMAGE" || true
+          CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' /tmp/trivy.json 2>/dev/null || echo 0)
+        else
+          CRITICAL=0
+        fi
+        echo "CONTAINER_CRITICAL=${CRITICAL:-0}" >> /tmp/build-env
+  post_build:
+    commands:
+      - source /tmp/build-env
+      - |
+        if [ "${CONTAINER_CRITICAL:-0}" -gt 0 ]; then
+          bash "$CODEBUILD_SRC_DIR/codebuild/scripts/write_stage_result.sh" "$STAGE_NAME" FAILED \
+            "Container scan: ${CONTAINER_CRITICAL} critical CVE(s)" "critical_cve_found"
+          exit 1
+        else
+          bash "$CODEBUILD_SRC_DIR/codebuild/scripts/write_stage_result.sh" "$STAGE_NAME" PASSED "Container scan: 0 critical"
+        fi

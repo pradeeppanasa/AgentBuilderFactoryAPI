@@ -1,0 +1,43 @@
+"""Base network — default-deny egress security group (CLAUDE.md F6: R17)."""
+
+from aws_cdk import aws_ec2 as ec2
+
+
+def add_base_resources(stack, agent_id: str) -> None:
+    vpc_id = stack.node.try_get_context("vpc_id")
+    vpc = ec2.Vpc.from_lookup(stack, "AgentVpc", vpc_id=vpc_id)
+
+    security_group = ec2.SecurityGroup(
+        stack,
+        "AgentSecurityGroup",
+        vpc=vpc,
+        security_group_name=f"panasa-agent-{agent_id}",
+        description="Default-deny egress; every rule below is explicit (R17)",
+        allow_all_outbound=False,
+    )
+    stack.agent_security_group = security_group
+
+    bedrock_cidr = ec2.Peer.ipv4(stack.node.try_get_context("bedrock_endpoint_cidr"))
+    security_group.add_egress_rule(bedrock_cidr, ec2.Port.tcp(443), "Bedrock model inference")
+
+{% if agent.knowledge_base and agent.knowledge_base.enabled %}
+    opensearch_cidr = ec2.Peer.ipv4(stack.node.try_get_context("opensearch_endpoint_cidr"))
+    security_group.add_egress_rule(opensearch_cidr, ec2.Port.tcp(443), "OpenSearch Knowledge Base")
+{% endif %}
+{% for skill in agent.skills %}
+{% if skill.enabled and skill.skill_id in ["web_search", "url_reader"] %}
+    security_group.add_egress_rule(
+        ec2.Peer.any_ipv4(), ec2.Port.tcp(443), "Skill '{{ skill.skill_id }}' (explicitly allowlisted, R17)"
+    )
+{% endif %}
+{% endfor %}
+{% for tool in agent.tools %}
+{% if tool.endpoint %}
+    tool_{{ tool.tool_id | replace("-", "_") }}_cidr = ec2.Peer.ipv4(
+        stack.node.try_get_context("tool_{{ tool.tool_id | replace("-", "_") }}_cidr")
+    )
+    security_group.add_egress_rule(
+        tool_{{ tool.tool_id | replace("-", "_") }}_cidr, ec2.Port.tcp(443), "Tool: {{ tool.tool_name }}"
+    )
+{% endif %}
+{% endfor %}
