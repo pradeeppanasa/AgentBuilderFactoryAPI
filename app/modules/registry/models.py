@@ -130,6 +130,69 @@ class SkillConfig(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
 
 
+# ── Advanced Config (CLAUDE_Advanced_Config.md Section 3 / Section 37) ─────
+# Additive, not replacing the existing guardrails/knowledge_base/tools/memory/
+# output_format fields above — those already drive the IaC generator, the
+# IaC validator, and a large existing test suite. The spec's own field list
+# (Section 37.11) says these six are what AgentConfiguration gains; nothing
+# there says the older fields must be deleted in the same change, and doing
+# so would break IaC generation/validation for no requested benefit.
+
+
+class ModelAdvancedConfig(BaseModel):
+    temperature: float = 0.7
+    top_p: float = 0.9
+    max_output_tokens: int = 2048
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    stop_sequences: list[str] = Field(default_factory=list)
+    request_timeout_ms: int = 30000
+    retry_count: int = 3
+    streaming: bool = False
+    conversation_history_turns: int = 10
+    max_context_tokens: int = 32000
+    fallback_model_string: str | None = None  # R38 — explicit, never implicit
+    cost_budget_usd: float | None = None
+    latency_budget_ms: int | None = None
+
+
+class MemoryAdvancedConfig(BaseModel):
+    """CLAUDE_Advanced_Config.md Section 37.4 names this class "MemoryConfig"
+    — renamed here to avoid colliding with the existing MemoryConfig above
+    (a different, already-in-use shape: memory_type/persistent_memory_ttl_days/
+    max_session_turns). The AgentConfiguration field name is still
+    `memory_config`, matching the spec exactly; only the Python class name
+    differs."""
+
+    session_enabled: bool = True
+    session_ttl_minutes: int = 60
+    long_term_enabled: bool = False
+    long_term_max_entries: int = 1000
+    long_term_retrieval_top_k: int = 5
+    summary_enabled: bool = False
+    summary_trigger_turns: int = 10
+    summary_model: str | None = None
+
+
+class ToolInstanceConfig(BaseModel):
+    connector_id: str
+    timeout_ms: int = 10000
+    retry_count: int = 1
+    cache_enabled: bool = False
+    cache_ttl_seconds: int = 300
+    error_handling: str = "fail_request"  # fail_request | skip_tool | use_fallback
+    fallback_connector_id: str | None = None
+    parallel_calls_allowed: bool = True
+
+
+class OutputSchemaConfig(BaseModel):
+    format: str = "none"  # none | json | xml | markdown
+    schema_definition: dict[str, Any] | None = None
+    strict_mode: bool = True
+    max_retries: int = 2
+    fallback_on_max_retries: str = "return_error"  # return_raw | return_error
+
+
 class AgentConfiguration(BaseModel):
     # Model
     model_id: str
@@ -188,6 +251,15 @@ class AgentConfiguration(BaseModel):
 
     # Skills (built-in platform capabilities)
     skills: list[SkillConfig] = Field(default_factory=list)
+
+    # ── Advanced Config (Section 37.11) — additive, see the comment above
+    # ModelAdvancedConfig for why these coexist with the older fields above.
+    kb_id: str | None = None
+    guardrail_policy_id: str | None = None
+    model_advanced: ModelAdvancedConfig | None = None
+    memory_config: MemoryAdvancedConfig | None = None
+    tool_instances: list[ToolInstanceConfig] = Field(default_factory=list)
+    output_schema: OutputSchemaConfig | None = None
 
 
 # ── Agent Capability Contract (Amendment A1 / R11) ──────────────────────────

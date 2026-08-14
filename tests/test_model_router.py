@@ -26,9 +26,18 @@ class _FakeChoice:
         self.message = _FakeMessage(content)
 
 
+class _FakeUsage:
+    def __init__(self, prompt_tokens: int, completion_tokens: int) -> None:
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.total_tokens = prompt_tokens + completion_tokens
+
+
 class _FakeResponse:
-    def __init__(self, content: str) -> None:
+    def __init__(self, content: str, usage: _FakeUsage | None = None) -> None:
         self.choices = [_FakeChoice(content)]
+        if usage is not None:
+            self.usage = usage
 
 
 def _config(**overrides: Any) -> AgentConfiguration:
@@ -51,10 +60,11 @@ async def test_call_model_returns_text_and_cost(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(litellm, "acompletion", _fake_acompletion)
     monkeypatch.setattr(litellm, "completion_cost", lambda completion_response: 0.0042)
 
-    text, cost = await call_model(_config(), [{"role": "user", "content": "hi"}])
+    text, cost, usage = await call_model(_config(), [{"role": "user", "content": "hi"}])
 
     assert text == "hello there"
     assert cost == 0.0042
+    assert usage is None
     assert captured["model"] == "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0"
     assert captured["fallbacks"] is None
 
@@ -69,10 +79,11 @@ async def test_call_model_cost_unavailable_returns_none(monkeypatch: pytest.Monk
     monkeypatch.setattr(litellm, "acompletion", _fake_acompletion)
     monkeypatch.setattr(litellm, "completion_cost", _raise_cost)
 
-    text, cost = await call_model(_config(), [{"role": "user", "content": "hi"}])
+    text, cost, usage = await call_model(_config(), [{"role": "user", "content": "hi"}])
 
     assert text == "hi"
     assert cost is None
+    assert usage is None
 
 
 async def test_call_model_builds_azure_and_self_hosted_model_strings(
@@ -97,6 +108,23 @@ async def test_call_model_builds_azure_and_self_hosted_model_strings(
     )
 
     assert captured == ["azure/gpt-4o", "openai/llama-3-70b"]
+
+
+async def test_call_model_extracts_token_usage_when_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _fake_acompletion(**kwargs: Any) -> _FakeResponse:
+        return _FakeResponse("hi", usage=_FakeUsage(prompt_tokens=12, completion_tokens=34))
+
+    monkeypatch.setattr(litellm, "acompletion", _fake_acompletion)
+    monkeypatch.setattr(litellm, "completion_cost", lambda completion_response: None)
+
+    _text, _cost, usage = await call_model(_config(), [{"role": "user", "content": "hi"}])
+
+    assert usage is not None
+    assert usage.input_tokens == 12
+    assert usage.output_tokens == 34
+    assert usage.total_tokens == 46
 
 
 async def test_call_model_rejects_unsupported_provider() -> None:

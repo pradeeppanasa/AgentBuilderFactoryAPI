@@ -16,6 +16,23 @@ litellm==1.96.2
 redis==8.1.0
 aws-xray-sdk==2.15.0
 python-hcl2==8.1.2
+pyyaml==6.0.2
+# Guardrail Layer 1 (app/modules/guardrails/bert_classifier.py) — local ONNX
+# Runtime inference, CLAUDE_Advanced_Config.md Section 3.5. Deliberately NOT
+# `optimum`: every version of optimum (including its "onnxruntime" extra)
+# lists `torch>=1.11` as a mandatory, non-optional dependency in its own
+# package metadata — there is no way to install it without pulling PyTorch
+# into the image, which the no-PyTorch-in-production requirement rules out.
+# onnxruntime (pure C++ inference engine) + tokenizers (HF's standalone Rust
+# tokenizer library) together load and run a pre-exported ONNX model with
+# zero PyTorch/TensorFlow anywhere in the dependency tree. Both imports are
+# lazy (deferred to first classifier.score() call, not module import). The
+# model artifact itself (model.onnx + tokenizer.json + config.json) is never
+# downloaded at runtime — it must be supplied via GUARDRAILS_BERT_MODEL_DIR,
+# populated during image build or by customer-side artifact placement.
+onnxruntime==1.20.1
+tokenizers==0.23.1
+numpy==2.4.6
 
 # Dev / test / lint
 pytest==8.3.4
@@ -26,3 +43,10 @@ fakeredis==2.37.0
 black==24.10.0
 ruff==0.8.4
 mypy==1.14.0
+types-PyYAML==6.0.12.20260724
+# Test-only: builds a tiny synthetic ONNX graph (app/modules/guardrails
+# tests) so guardrail tests exercise real onnxruntime inference without a
+# real model download. Never imported by application code — onnxruntime
+# alone loads/runs .onnx files at runtime; `onnx` is only needed to author
+# graphs, which only the test suite does.
+onnx==1.22.0

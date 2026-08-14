@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     dynamodb_transcripts_table: str = "panasa-transcripts"
     dynamodb_reports_table: str = "panasa-reports"
 
+    # ── Advanced Config: KB / Guardrail Policy / Playground libraries
+    # (CLAUDE_Advanced_Config.md Section 4/8, Section 37.12) ──────────────
+    dynamodb_knowledge_bases_table: str = "panasa-knowledge-bases"
+    dynamodb_guardrail_policies_table: str = "panasa-guardrail-policies"
+    dynamodb_playground_sessions_table: str = "panasa-playground-sessions"
+
     # ── Deployment pipeline ───────────────────────────────────────
     eventbridge_bus_name: str = "panasa-agent-builder"
     step_functions_arn: str | None = None
@@ -108,6 +114,15 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     redis_max_connections: int = 20
     redis_socket_timeout: float = 1.0  # fail fast — never block a request on a cache miss
+
+    # ── Guardrail Layer 1 — local ONNX BERT classifier ────────────────
+    # Base directory containing one pre-exported ONNX model per bert_model
+    # name, e.g. {guardrails_bert_model_dir}/unitary/toxic-bert/{model.onnx,
+    # tokenizer.json, config.json}. Never downloaded at runtime — supplied
+    # during image build or via a customer-side artifact mount. None means
+    # "no model configured": ONNXBertClassifier raises
+    # GuardrailModelUnavailableError on first use, not at import time.
+    guardrails_bert_model_dir: str | None = None
 
     # ── Local dev overrides ───────────────────────────────────────────
     dynamodb_endpoint: str | None = None

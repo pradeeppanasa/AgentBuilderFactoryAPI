@@ -23,16 +23,21 @@ from app.modules.deployment.orchestrator import DeploymentOrchestrator
 from app.modules.deployment.status_store import DeploymentStatusStore
 from app.modules.git_provider.factory import create_git_provider
 from app.modules.git_provider.secrets import fetch_git_token
+from app.modules.guardrails.engine import GuardrailEngine
+from app.modules.guardrails.store import GuardrailPolicyStore
 from app.modules.iac_generator.generator import IaCGenerator
 from app.modules.iac_generator.validator import IaCValidator
+from app.modules.knowledge_base.store import KnowledgeBaseStore
 from app.modules.observability.metrics import MetricsEmitter
 from app.modules.platform.upgrade_orchestrator import PlatformUpgradeOrchestrator
 from app.modules.platform.upgrade_store import PlatformUpgradeStatusStore
 from app.modules.platform.version_service import PlatformVersionService
+from app.modules.playground.store import PlaygroundSessionStore
 from app.modules.registry.store import AgentRegistryStore
 from app.modules.secrets.manager import SecretsManager
 from app.modules.telemetry.emitter import TelemetryConfig, TelemetryEmitter
 from app.shared.aws_clients import (
+    create_bedrock_runtime_client,
     create_cloudwatch_client,
     create_codecommit_client,
     create_ecr_client,
@@ -143,6 +148,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.platform_upgrade_orchestrator = PlatformUpgradeOrchestrator(
         create_stepfunctions_client(settings), settings
     )
+
+    # Advanced Config (CLAUDE_Advanced_Config.md Section 3/4/5, Section 37)
+    knowledge_base_store = KnowledgeBaseStore(dynamodb, settings)
+    await knowledge_base_store.ensure_table()
+    app.state.knowledge_base_store = knowledge_base_store
+
+    guardrail_policy_store = GuardrailPolicyStore(dynamodb, settings)
+    await guardrail_policy_store.ensure_table()
+    app.state.guardrail_policy_store = guardrail_policy_store
+
+    playground_session_store = PlaygroundSessionStore(dynamodb, settings)
+    await playground_session_store.ensure_table()
+    app.state.playground_session_store = playground_session_store
+
+    app.state.guardrail_engine = GuardrailEngine(create_bedrock_runtime_client(settings))
 
     # R16: TELEMETRY_ENABLED defaults false; categories default all-on so
     # flipping the master switch alone re-enables full telemetry. PUT

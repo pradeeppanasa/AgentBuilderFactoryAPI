@@ -93,6 +93,33 @@ locals {
       gsis           = []
       ttl_attribute  = null
     }
+    # Advanced Config (CLAUDE.md Section 37.12) — schemas match
+    # app/modules/knowledge_base/store.py, app/modules/guardrails/store.py,
+    # and app/modules/playground/store.py's ensure_table() key schemas exactly.
+    "panasa-knowledge-bases" = {
+      hash_key       = "tenant_id"
+      range_key      = "kb_id"
+      range_key_type = "S"
+      gsis           = []
+      ttl_attribute  = null
+    }
+    "panasa-guardrail-policies" = {
+      hash_key       = "tenant_id"
+      range_key      = "policy_id"
+      range_key_type = "S"
+      gsis           = []
+      ttl_attribute  = null
+    }
+    "panasa-playground-sessions" = {
+      # Keyed by agent_id, not tenant_id — a playground session is always
+      # accessed in the context of one specific agent (mirrors
+      # panasa-transcripts' shape above), not queried tenant-wide.
+      hash_key       = "agent_id"
+      range_key      = "session_id"
+      range_key_type = "S"
+      gsis           = []
+      ttl_attribute  = null
+    }
   }
 }
 

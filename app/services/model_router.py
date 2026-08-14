@@ -16,6 +16,8 @@ lifespan) in addition to the module-level flag here, belt-and-suspenders.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import litellm
 
 from app.modules.registry.models import AgentConfiguration
@@ -36,15 +38,37 @@ class UnsupportedModelProviderError(ValueError):
         )
 
 
+@dataclass(frozen=True)
+class TokenUsage:
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+
+
+def _extract_usage(response: object) -> TokenUsage | None:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    try:
+        return TokenUsage(
+            input_tokens=int(usage.prompt_tokens),
+            output_tokens=int(usage.completion_tokens),
+            total_tokens=int(usage.total_tokens),
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 async def call_model(
     config: AgentConfiguration,
     messages: list[dict[str, str]],
-) -> tuple[str, float | None]:
-    """Returns (response_text, cost_or_None).
+) -> tuple[str, float | None, TokenUsage | None]:
+    """Returns (response_text, cost_or_None, usage_or_None).
 
     cost is float | None — some providers/models don't return cost data via
-    litellm.completion_cost. The call must succeed even when cost can't be
-    computed; never raise solely because cost is unavailable.
+    litellm.completion_cost. usage is TokenUsage | None for the same reason
+    (not every provider/mock response carries a `.usage` attribute). Neither
+    missing value should ever raise — the call must succeed regardless.
     """
     if config.model_provider not in PROVIDER_PREFIX:
         raise UnsupportedModelProviderError(config.model_provider)
@@ -71,4 +95,4 @@ async def call_model(
     except Exception:
         cost = None
 
-    return text, cost
+    return text, cost, _extract_usage(response)

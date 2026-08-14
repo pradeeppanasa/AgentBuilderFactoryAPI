@@ -26,6 +26,16 @@ dependencies = [
     "redis==8.1.0",
     "aws-xray-sdk==2.15.0",
     "python-hcl2==8.1.2",
+    "pyyaml==6.0.2",
+    # Guardrail Layer 1 (app/modules/guardrails/bert_classifier.py) — ONNX
+    # Runtime only, deliberately not `optimum` (its own package metadata
+    # lists torch>=1.11 as a mandatory dependency in every version, even the
+    # "onnxruntime" extra — incompatible with no-PyTorch-in-production).
+    # onnxruntime + tokenizers together are a complete, torch-free ONNX BERT
+    # inference stack. See requirements.txt for the full rationale.
+    "onnxruntime==1.20.1",
+    "tokenizers==0.23.1",
+    "numpy==2.4.6",
 ]
 
 [dependency-groups]
@@ -38,6 +48,11 @@ dev = [
     "black==24.10.0",
     "ruff==0.8.4",
     "mypy==1.14.0",
+    "types-PyYAML==6.0.12.20260724",
+    # Test-only: authors a tiny synthetic ONNX graph so guardrail tests run
+    # real onnxruntime inference without a real model download. Never
+    # imported by application code.
+    "onnx==1.22.0",
 ]
 
 [tool.black]

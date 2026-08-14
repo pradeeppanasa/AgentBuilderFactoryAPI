@@ -12,6 +12,7 @@ from app.modules.auth.dependencies import require_role
 from app.modules.auth.schemas import CurrentUser
 from app.modules.connectors.catalog import ConnectorCatalogStore
 from app.modules.connectors.models import ConnectorRecord, ExecutorType
+from app.modules.connectors.openapi_import import OpenAPIParseError, parse_openapi_document
 from app.modules.connectors.tester import ConnectorTester, ConnectorTestResult
 
 router = APIRouter(prefix="/connectors", tags=["connectors"])
@@ -38,6 +39,16 @@ class ConnectorTestRequest(BaseModel):
     endpoint_params: dict[str, str] = {}
     credentials: dict[str, str] = {}
     test_payload: dict[str, Any] | None = None
+
+
+class ImportOpenAPIRequest(BaseModel):
+    schema_document: dict[str, Any] | str
+    """An OpenAPI 3.0 document — either parsed JSON or a raw JSON/YAML string
+    (upload or paste, Section 3.6 Method B)."""
+
+
+class ImportOpenAPIResponse(BaseModel):
+    created: list[ConnectorRecord]
 
 
 @router.get("", response_model=ConnectorListResponse)
@@ -67,6 +78,38 @@ async def create_connector(
         endpoint_template=payload.endpoint_template,
         credentials_required=payload.credentials_required,
     )
+
+
+@router.post(
+    "/import-openapi", response_model=ImportOpenAPIResponse, status_code=status.HTTP_201_CREATED
+)
+async def import_openapi_connectors(
+    payload: ImportOpenAPIRequest,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    current_user: Annotated[CurrentUser, Depends(require_role(*_WRITE_ROLES))],
+    store: Annotated[ConnectorCatalogStore, Depends(get_connector_catalog_store)],
+) -> ImportOpenAPIResponse:
+    try:
+        seeds = parse_openapi_document(payload.schema_document)
+    except OpenAPIParseError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    created: list[ConnectorRecord] = []
+    for seed in seeds:
+        created.append(
+            await store.create_connector(
+                tenant_id=tenant_id,
+                name=seed.name,
+                executor_type="http",
+                description=seed.description,
+                created_by=current_user.email,
+                input_schema=seed.input_schema,
+                output_schema=seed.output_schema,
+                endpoint_template=seed.endpoint_template,
+                credentials_required=seed.credentials_required,
+            )
+        )
+    return ImportOpenAPIResponse(created=created)
 
 
 @router.get("/{connector_id}", response_model=ConnectorRecord)

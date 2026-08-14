@@ -128,7 +128,7 @@ wait_for "Postgres" 30 1 \
   "docker exec postgres pg_isready -U panasa -d panasa_agent_builder"
 
 wait_for "LocalStack (S3 + Secrets Manager)" 30 2 \
-  "curl -sf http://localhost:4566/_localstack/health | grep -q '\"s3\": \"available\"'"
+  "\"$VENV_PY\" -m scripts._check_localstack"
 
 wait_for "DynamoDB Local" 30 1 \
   "\"$VENV_PY\" -m scripts._check_dynamodb"

@@ -22,12 +22,16 @@ from app.modules.connectors.tester import ConnectorTester
 from app.modules.deployment.orchestrator import DeploymentOrchestrator
 from app.modules.deployment.status_store import DeploymentStatusStore
 from app.modules.git_provider.base import GitProvider
+from app.modules.guardrails.engine import GuardrailEngine
+from app.modules.guardrails.store import GuardrailPolicyStore
 from app.modules.iac_generator.generator import IaCGenerator
 from app.modules.iac_generator.validator import IaCValidator
+from app.modules.knowledge_base.store import KnowledgeBaseStore
 from app.modules.observability.metrics import MetricsEmitter
 from app.modules.platform.upgrade_orchestrator import PlatformUpgradeOrchestrator
 from app.modules.platform.upgrade_store import PlatformUpgradeStatusStore
 from app.modules.platform.version_service import PlatformVersionService
+from app.modules.playground.store import PlaygroundSessionStore
 from app.modules.registry.store import AgentRegistryStore
 from app.modules.secrets.manager import SecretsManager
 from app.modules.telemetry.emitter import TelemetryConfig, TelemetryEmitter
@@ -128,3 +132,23 @@ async def get_telemetry_config(request: Request) -> TelemetryConfig:
 async def get_telemetry_emitter(request: Request) -> TelemetryEmitter:
     emitter: TelemetryEmitter = request.app.state.telemetry_emitter
     return emitter
+
+
+async def get_knowledge_base_store(request: Request) -> KnowledgeBaseStore:
+    store: KnowledgeBaseStore = request.app.state.knowledge_base_store
+    return store
+
+
+async def get_guardrail_policy_store(request: Request) -> GuardrailPolicyStore:
+    store: GuardrailPolicyStore = request.app.state.guardrail_policy_store
+    return store
+
+
+async def get_guardrail_engine(request: Request) -> GuardrailEngine:
+    engine: GuardrailEngine = request.app.state.guardrail_engine
+    return engine
+
+
+async def get_playground_session_store(request: Request) -> PlaygroundSessionStore:
+    store: PlaygroundSessionStore = request.app.state.playground_session_store
+    return store
