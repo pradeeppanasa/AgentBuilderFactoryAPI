@@ -35,7 +35,9 @@ async def _generate_and_open_pr(
     if version_record is None:
         raise StageFailure(f"Version {version} of agent {agent_id!r} not found")
 
-    result = await iac_generator.generate(agent_id, version, version_record.configuration)
+    result = await iac_generator.generate(
+        agent_id, tenant_id, version, version_record.configuration
+    )
     await registry_store.record_iac_artifact(
         tenant_id=tenant_id,
         agent_id=agent_id,

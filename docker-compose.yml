@@ -13,6 +13,11 @@ services:
       - IAC_OUTPUT_BUCKET=panasa-iac-artifacts-local
       - DATABASE_URL=postgresql+asyncpg://panasa:panasa@postgres:5432/panasa_agent_builder
       - REDIS_URL=redis://redis:6379/0
+      # DynamoDB Local/LocalStack don't validate these, but boto3 refuses to
+      # sign ANY request (even to a local emulator) without something
+      # present — there's no IAM role to fall back to outside real AWS.
+      - AWS_ACCESS_KEY_ID=local
+      - AWS_SECRET_ACCESS_KEY=local
     depends_on:
       - dynamodb-local
       - localstack
@@ -27,7 +32,12 @@ services:
       - "8001:8000"
 
   localstack:
-    image: localstack/localstack:latest
+    # :latest now requires a paid LocalStack account (confirmed: it exits at
+    # startup with "License activation failed" / exit code 55, even for
+    # community-tier services like S3/SecretsManager). 3.8 predates that
+    # enforcement and starts anonymously — pin deliberately, same reasoning
+    # as the Dockerfile's uv pin.
+    image: localstack/localstack:3.8
     container_name: localstack
     ports:
       - "4566:4566"
@@ -39,13 +49,23 @@ services:
     image: postgres:16-alpine
     container_name: postgres
     ports:
-      - "5432:5432"
+      # Mapped to 5433, not 5432: this machine already has a native Windows
+      # PostgreSQL service bound to 5432, which silently intercepts host
+      # connections meant for this container (docker exec still reaches the
+      # container fine over its internal loopback — only host->5432 TCP is
+      # hijacked). Left the native service alone and moved this instead.
+      - "5433:5432"
     environment:
       - POSTGRES_USER=panasa
       - POSTGRES_PASSWORD=panasa
       - POSTGRES_DB=panasa_agent_builder
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U panasa -d panasa_agent_builder"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   redis:
     image: redis:7-alpine

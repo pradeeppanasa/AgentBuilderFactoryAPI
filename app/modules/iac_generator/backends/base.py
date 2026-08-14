@@ -21,11 +21,14 @@ class IaCBackend(ABC):
     def render(
         self,
         agent_id: str,
+        tenant_id: str,
         version: int,
         config: AgentConfiguration,
         resolved_modules: list[str],
     ) -> dict[str, str]:
         """Return {relative_file_path: rendered_content} for every file this
         backend produces for the given resolved modules. Paths are relative
-        to the artifact root (what ends up in the zip)."""
+        to the artifact root (what ends up in the zip). tenant_id is only
+        consumed by the Terraform backend today (per-resource tagging, Phase
+        18's IaC validation suite) — CDK templates don't use it yet."""
         raise NotImplementedError

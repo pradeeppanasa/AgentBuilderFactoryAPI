@@ -25,6 +25,7 @@ dependencies = [
     "litellm==1.96.2",
     "redis==8.1.0",
     "aws-xray-sdk==2.15.0",
+    "python-hcl2==8.1.2",
 ]
 
 [dependency-groups]

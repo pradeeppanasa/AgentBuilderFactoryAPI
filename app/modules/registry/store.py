@@ -23,6 +23,7 @@ from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
 
 from app.config import Settings
+from app.modules.iac_generator.validation_models import IaCValidationReport
 from app.modules.registry.contract_generator import CapabilityContractGenerator
 from app.modules.registry.dependency_validator import CircularDependencyValidator
 from app.modules.registry.models import (
@@ -222,14 +223,21 @@ class AgentRegistryStore:
         return await self._versioner.list_all(agent_id)
 
     async def record_iac_artifact(
-        self, tenant_id: str, agent_id: str, version: int, iac_version: str, iac_s3_key: str
+        self,
+        tenant_id: str,
+        agent_id: str,
+        version: int,
+        iac_version: str,
+        iac_s3_key: str,
+        iac_validation_report: IaCValidationReport | None = None,
     ) -> None:
         await self._require_agent(tenant_id, agent_id)
         if await self._versioner.get(agent_id, version) is None:
             raise VersionNotFoundError(agent_id, version)
-        await self._versioner.record_derived_fields(
-            agent_id, version, iac_version=iac_version, iac_s3_key=iac_s3_key
-        )
+        fields: dict[str, Any] = {"iac_version": iac_version, "iac_s3_key": iac_s3_key}
+        if iac_validation_report is not None:
+            fields["iac_validation_report"] = iac_validation_report.model_dump(mode="json")
+        await self._versioner.record_derived_fields(agent_id, version, **fields)
 
     async def record_evaluation_result(
         self, tenant_id: str, agent_id: str, version: int, evaluation_result: EvaluationResult

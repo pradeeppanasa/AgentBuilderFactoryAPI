@@ -33,11 +33,17 @@ class TerraformBackend(IaCBackend):
     def render(
         self,
         agent_id: str,
+        tenant_id: str,
         version: int,
         config: AgentConfiguration,
         resolved_modules: list[str],
     ) -> dict[str, str]:
-        context = {"agent_id": agent_id, "version": version, "agent": config}
+        context = {
+            "agent_id": agent_id,
+            "tenant_id": tenant_id,
+            "version": version,
+            "agent": config,
+        }
         files: dict[str, str] = {}
 
         for module in resolved_modules:

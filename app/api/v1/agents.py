@@ -21,6 +21,7 @@ from app.dependencies import (
     get_deployment_status_store,
     get_git_provider,
     get_iac_generator,
+    get_iac_validator,
     get_metrics_emitter,
     get_registry_store,
     get_tenant_id,
@@ -34,6 +35,8 @@ from app.modules.deployment.orchestrator import DeploymentOrchestrator
 from app.modules.deployment.status_store import DeploymentStatusStore
 from app.modules.git_provider.base import GitProvider
 from app.modules.iac_generator.generator import IaCGenerator
+from app.modules.iac_generator.validation_models import IaCValidationReport
+from app.modules.iac_generator.validator import IaCValidator
 from app.modules.observability.metrics import MetricsEmitter
 from app.modules.registry.diff import ConfigDiff, compute_config_diff
 from app.modules.registry.models import (
@@ -181,6 +184,7 @@ class GenerateIaCResponse(BaseModel):
     iac_version: str
     s3_key: str
     modules: list[str]
+    validation_report: IaCValidationReport
 
 
 class DeployResponse(BaseModel):
@@ -481,7 +485,7 @@ async def _trigger_deployment(
     branch = f"panasa/agent-{agent_id}-v{version}-{deployment_id}"
 
     iac_result = await iac_generator.generate(
-        agent_id=agent_id, version=version, config=configuration
+        agent_id=agent_id, tenant_id=tenant_id, version=version, config=configuration
     )
     await store.record_iac_artifact(
         tenant_id=tenant_id,
@@ -624,6 +628,7 @@ async def generate_iac(
     _current_user: Annotated[CurrentUser, Depends(require_role(*_WRITE_ROLES))],
     store: Annotated[AgentRegistryStore, Depends(get_registry_store)],
     iac_generator: Annotated[IaCGenerator, Depends(get_iac_generator)],
+    iac_validator: Annotated[IaCValidator, Depends(get_iac_validator)],
 ) -> GenerateIaCResponse:
     record = await store.get_agent(tenant_id, agent_id)
     if record is None:
@@ -640,16 +645,36 @@ async def generate_iac(
 
     result = await iac_generator.generate(
         agent_id=agent_id,
+        tenant_id=tenant_id,
         version=record.current_version,
         config=version_record.configuration,
     )
+    validation_report = await iac_validator.validate(
+        agent_id=agent_id,
+        tenant_id=tenant_id,
+        version=record.current_version,
+        config=version_record.configuration,
+        files=result.files,
+        tool=result.tool,
+    )
+    # R40: persisted either way (a failed report is exactly what a developer
+    # needs to look up later — "why did v3's IaC fail last Tuesday"), but
+    # never handed to the caller as part of a 200/success response. No
+    # partially-validated bundle is ever returned as usable.
     await store.record_iac_artifact(
         tenant_id=tenant_id,
         agent_id=agent_id,
         version=record.current_version,
         iac_version=result.iac_version,
         iac_s3_key=result.s3_key,
+        iac_validation_report=validation_report,
     )
+
+    if not validation_report.passed:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=validation_report.model_dump(mode="json"),
+        )
 
     return GenerateIaCResponse(
         agent_id=agent_id,
@@ -658,6 +683,7 @@ async def generate_iac(
         iac_version=result.iac_version,
         s3_key=result.s3_key,
         modules=result.modules,
+        validation_report=validation_report,
     )
 
 

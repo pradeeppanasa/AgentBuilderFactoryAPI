@@ -10,6 +10,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.modules.iac_generator.validation_models import IaCValidationReport
+
 AgentType = Literal["conversational", "task", "rag", "multi-step", "orchestrator"]
 
 AgentStatus = Literal[
@@ -302,6 +304,11 @@ class AgentVersionRecord(BaseModel):
     # Derived artifacts (populated after pipeline runs — later phases)
     iac_version: str | None = None
     iac_s3_key: str | None = None
+    iac_validation_report: IaCValidationReport | None = None
+    """Set only by POST /agents/{id}/generate-iac (CLAUDE.md Section 6's IaC
+    validation suite) — not by the deploy flow's own IaC generation, whose
+    real gate is the deployment pipeline's own SECURITY_SCANNING/
+    TERRAFORM_VALIDATE stages (F0/F2/R05)."""
     deployment_id: str | None = None
     security_result: SecurityResult | None = None
     evaluation_result: EvaluationResult | None = None

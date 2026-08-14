@@ -23,12 +23,14 @@ from app.modules.deployment.orchestrator import DeploymentOrchestrator
 from app.modules.deployment.status_store import DeploymentStatusStore
 from app.modules.git_provider.base import GitProvider
 from app.modules.iac_generator.generator import IaCGenerator
+from app.modules.iac_generator.validator import IaCValidator
 from app.modules.observability.metrics import MetricsEmitter
 from app.modules.platform.upgrade_orchestrator import PlatformUpgradeOrchestrator
 from app.modules.platform.upgrade_store import PlatformUpgradeStatusStore
 from app.modules.platform.version_service import PlatformVersionService
 from app.modules.registry.store import AgentRegistryStore
 from app.modules.secrets.manager import SecretsManager
+from app.modules.telemetry.emitter import TelemetryConfig, TelemetryEmitter
 
 
 async def get_tenant_id(current_user: Annotated[CurrentUser, Depends(get_current_user)]) -> str:
@@ -43,6 +45,11 @@ async def get_registry_store(request: Request) -> AgentRegistryStore:
 async def get_iac_generator(request: Request) -> IaCGenerator:
     generator: IaCGenerator = request.app.state.iac_generator
     return generator
+
+
+async def get_iac_validator(request: Request) -> IaCValidator:
+    validator: IaCValidator = request.app.state.iac_validator
+    return validator
 
 
 async def get_git_provider(request: Request) -> GitProvider:
@@ -111,3 +118,13 @@ async def get_platform_upgrade_store(request: Request) -> PlatformUpgradeStatusS
 async def get_platform_upgrade_orchestrator(request: Request) -> PlatformUpgradeOrchestrator:
     orchestrator: PlatformUpgradeOrchestrator = request.app.state.platform_upgrade_orchestrator
     return orchestrator
+
+
+async def get_telemetry_config(request: Request) -> TelemetryConfig:
+    config: TelemetryConfig = request.app.state.telemetry_config
+    return config
+
+
+async def get_telemetry_emitter(request: Request) -> TelemetryEmitter:
+    emitter: TelemetryEmitter = request.app.state.telemetry_emitter
+    return emitter

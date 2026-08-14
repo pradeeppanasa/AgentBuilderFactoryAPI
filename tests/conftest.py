@@ -24,6 +24,24 @@ from moto import mock_aws
 
 _TMP_DB_DIR = tempfile.mkdtemp(prefix="panasa-test-db-")
 os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_TMP_DB_DIR}/test.db"
+# Forced empty, not just left alone: a developer's real .env (e.g. from
+# scripts/local-setup.sh) sets DYNAMODB_ENDPOINT/SECRETS_MANAGER_ENDPOINT/
+# S3_ENDPOINT to point at a real local Docker stack. pydantic-settings reads
+# .env directly regardless of os.environ, so without this override the app
+# would silently redirect boto3 at that REAL stack instead of moto's mocks —
+# reproduced: it fetches the real LocalStack "jwt-secret" (a different value
+# than TEST_JWT_SECRET below), and every JWT signature check then fails with
+# 401. `settings.*_endpoint: str | None` treats "" as falsy, same as None,
+# so the app's client factories skip adding a custom endpoint_url entirely
+# and boto3 hits moto's normally-intercepted default AWS hostnames.
+os.environ["DYNAMODB_ENDPOINT"] = ""
+os.environ["SECRETS_MANAGER_ENDPOINT"] = ""
+os.environ["S3_ENDPOINT"] = ""
+# Same reasoning: a real .env sets LANGFUSE_HOST=http://langfuse:3000 (a
+# Docker-internal-only hostname). Left alone, check_observability() makes a
+# real httpx call that hangs until ConnectTimeout instead of resolving to
+# "disabled" — reproduced in test_health.py, which asserts "disabled".
+os.environ["LANGFUSE_HOST"] = ""
 os.environ.setdefault("JWT_SECRET_ARN", "jwt-secret")
 os.environ.setdefault("IAC_OUTPUT_BUCKET", "panasa-iac-artifacts-test")
 os.environ.setdefault("AUDIT_S3_BUCKET", "panasa-audit-test")

@@ -13,6 +13,12 @@ env:
 phases:
   install:
     commands:
+      # R43: pinned everywhere terraform is installed (this buildspec,
+      # Dockerfile, scripts/local-setup.sh) — never :latest/whatever the
+      # build image happens to ship, and the version must match exactly.
+      - curl -fsSL -o /tmp/terraform.zip https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_linux_amd64.zip
+      - unzip -q /tmp/terraform.zip -d /usr/local/bin
+      - rm /tmp/terraform.zip
       - terraform -version
       - jq --version
   build:

@@ -1,0 +1,12 @@
+{# Shared across every module template — CLAUDE.md Section 6 IaC validation
+   suite requires every taggable resource to carry agent_id/tenant_id/version/
+   managed_by tags. Assumes the call site is a top-level resource body (2-space
+   indent) — every call site in this template set is. #}
+{% macro panasa_tags(agent_id, tenant_id, version) %}
+  tags = {
+    agent_id   = "{{ agent_id }}"
+    tenant_id  = "{{ tenant_id }}"
+    version    = "{{ version }}"
+    managed_by = "panasa"
+  }
+{%- endmacro %}

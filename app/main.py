@@ -24,12 +24,14 @@ from app.modules.deployment.status_store import DeploymentStatusStore
 from app.modules.git_provider.factory import create_git_provider
 from app.modules.git_provider.secrets import fetch_git_token
 from app.modules.iac_generator.generator import IaCGenerator
+from app.modules.iac_generator.validator import IaCValidator
 from app.modules.observability.metrics import MetricsEmitter
 from app.modules.platform.upgrade_orchestrator import PlatformUpgradeOrchestrator
 from app.modules.platform.upgrade_store import PlatformUpgradeStatusStore
 from app.modules.platform.version_service import PlatformVersionService
 from app.modules.registry.store import AgentRegistryStore
 from app.modules.secrets.manager import SecretsManager
+from app.modules.telemetry.emitter import TelemetryConfig, TelemetryEmitter
 from app.shared.aws_clients import (
     create_cloudwatch_client,
     create_codecommit_client,
@@ -118,6 +120,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     s3_client = create_s3_client(settings)
     app.state.s3_client = s3_client
     app.state.iac_generator = IaCGenerator(s3_client, settings)
+    app.state.iac_validator = IaCValidator()
 
     app.state.redis_client = create_redis_client(settings)
 
@@ -140,6 +143,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.platform_upgrade_orchestrator = PlatformUpgradeOrchestrator(
         create_stepfunctions_client(settings), settings
     )
+
+    # R16: TELEMETRY_ENABLED defaults false; categories default all-on so
+    # flipping the master switch alone re-enables full telemetry. PUT
+    # /platform/telemetry-config mutates this same object in place — the
+    # emitter must see the change without a re-wire, see emitter.py's
+    # TelemetryConfig docstring.
+    telemetry_config = TelemetryConfig(enabled=settings.telemetry_enabled)
+    app.state.telemetry_config = telemetry_config
+    app.state.telemetry_emitter = TelemetryEmitter(settings, telemetry_config)
 
     log.info("runtime.startup", mode=settings.deployment_mode, version=settings.platform_version)
     yield

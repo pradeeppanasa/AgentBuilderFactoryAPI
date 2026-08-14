@@ -40,10 +40,12 @@ class CDKBackend(IaCBackend):
     def render(
         self,
         agent_id: str,
+        tenant_id: str,
         version: int,
         config: AgentConfiguration,
         resolved_modules: list[str],
     ) -> dict[str, str]:
+        # tenant_id: not yet consumed here — see IaCBackend.render's docstring.
         context = {"agent_id": agent_id, "version": version, "agent": config}
         files: dict[str, str] = {}
 

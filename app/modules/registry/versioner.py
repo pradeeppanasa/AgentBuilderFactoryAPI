@@ -21,7 +21,13 @@ from app.modules.registry.contract_generator import CapabilityContractGenerator
 from app.modules.registry.models import AgentConfiguration, AgentType, AgentVersionRecord
 from app.shared.dynamodb_types import decimal_to_native
 
-_JSON_FIELDS = {"configuration", "capability_contract", "security_result", "evaluation_result"}
+_JSON_FIELDS = {
+    "configuration",
+    "capability_contract",
+    "security_result",
+    "evaluation_result",
+    "iac_validation_report",
+}
 
 # Fields explicitly documented (Section 4.2) as "populated after pipeline
 # runs" — the one exception to R08's "never update an existing version
@@ -36,6 +42,7 @@ _JSON_FIELDS = {"configuration", "capability_contract", "security_result", "eval
 _MUTABLE_DERIVED_FIELDS = {
     "iac_version",
     "iac_s3_key",
+    "iac_validation_report",
     "deployment_id",
     "terraform_plan_summary",
     "deployment_result",

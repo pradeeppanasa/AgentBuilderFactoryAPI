@@ -14,6 +14,7 @@ from app.dependencies import (
     get_platform_version_service,
     get_redis_client,
     get_s3_client,
+    get_telemetry_config,
 )
 from app.modules.auth.dependencies import require_role
 from app.modules.auth.schemas import CurrentUser
@@ -32,6 +33,7 @@ from app.modules.platform.upgrade_orchestrator import (
 )
 from app.modules.platform.upgrade_store import PlatformUpgradeStatusStore
 from app.modules.platform.version_service import PlatformVersionInfo, PlatformVersionService
+from app.modules.telemetry.emitter import TelemetryCategoryToggles, TelemetryConfig
 
 router = APIRouter(prefix="/platform", tags=["platform"])
 
@@ -99,6 +101,13 @@ class UpgradeResponse(BaseModel):
     from_version: str
     target_version: str
     execution_arn: str
+
+
+class PlatformUpgradeListResponse(BaseModel):
+    items: list[PlatformUpgradeRecord]
+
+
+_RECENT_UPGRADES_LIMIT = 5
 
 
 @router.get("/version", response_model=PlatformVersionInfo)
@@ -171,6 +180,23 @@ async def trigger_upgrade(
     )
 
 
+@router.get("/upgrades", response_model=PlatformUpgradeListResponse)
+async def list_recent_upgrades(
+    _current_user: Annotated[CurrentUser, Depends(require_role())],
+    upgrade_store: Annotated[PlatformUpgradeStatusStore, Depends(get_platform_upgrade_store)],
+) -> PlatformUpgradeListResponse:
+    """5 most recent upgrades, newest first — lets the UI recover an
+    in-progress upgrade's polling handle after a page refresh.
+
+    PlatformUpgradeRecord has no top-level started_at (only per-stage
+    UpgradeStageResult.started_at) — triggered_at is the record-level
+    equivalent, and upgrade_store.list_upgrades() already sorts by it
+    descending.
+    """
+    upgrades = await upgrade_store.list_upgrades()
+    return PlatformUpgradeListResponse(items=upgrades[:_RECENT_UPGRADES_LIMIT])
+
+
 @router.get("/upgrades/{upgrade_id}", response_model=PlatformUpgradeRecord)
 async def get_upgrade(
     upgrade_id: str,
@@ -184,3 +210,40 @@ async def get_upgrade(
             detail=f"Platform upgrade {upgrade_id!r} not found",
         )
     return record
+
+
+# ── Telemetry config (Phase 16, Section 5.6/12/A7/R30) ──────────────────
+# GET is unauthenticated, like /version /health /models above — the config
+# itself (on/off + which categories) is not sensitive. PUT is admin-only:
+# it changes what leaves the VPC, same bar as triggering a platform upgrade.
+
+
+class TelemetryConfigUpdateRequest(BaseModel):
+    enabled: bool | None = None
+    """Omit to leave the master switch unchanged."""
+    categories: TelemetryCategoryToggles | None = None
+    """Omit to leave per-category toggles unchanged; provide a full
+    TelemetryCategoryToggles to replace all four at once."""
+
+
+@router.get("/telemetry-config", response_model=TelemetryConfig)
+async def get_telemetry_config_route(
+    telemetry_config: Annotated[TelemetryConfig, Depends(get_telemetry_config)],
+) -> TelemetryConfig:
+    return telemetry_config
+
+
+@router.put("/telemetry-config", response_model=TelemetryConfig)
+async def update_telemetry_config(
+    payload: TelemetryConfigUpdateRequest,
+    _current_user: Annotated[CurrentUser, Depends(require_role())],
+    telemetry_config: Annotated[TelemetryConfig, Depends(get_telemetry_config)],
+) -> TelemetryConfig:
+    # Mutate the shared instance in place (not a replacement) — TelemetryEmitter
+    # holds a reference to this same object and must see the change on its
+    # very next emit() call with no re-wiring (see emitter.py's docstring).
+    if payload.enabled is not None:
+        telemetry_config.enabled = payload.enabled
+    if payload.categories is not None:
+        telemetry_config.categories = payload.categories
+    return telemetry_config

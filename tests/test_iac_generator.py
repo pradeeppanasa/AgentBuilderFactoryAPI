@@ -53,28 +53,28 @@ def _one_tool() -> dict[str, Any]:
 def test_terraform_no_kb_generates_no_opensearch() -> None:
     config = _config()
     modules = resolve_required_modules(config)
-    files = terraform_backend.render("agent-1", 1, config, modules)
+    files = terraform_backend.render("agent-1", "tenant-a", 1, config, modules)
     assert not any("opensearch" in content.lower() for content in files.values())
 
 
 def test_terraform_kb_enabled_generates_opensearch() -> None:
     config = _config(knowledge_base={"enabled": True, "kb_name": "docs"})
     modules = resolve_required_modules(config)
-    files = terraform_backend.render("agent-1", 1, config, modules)
+    files = terraform_backend.render("agent-1", "tenant-a", 1, config, modules)
     assert any("aws_opensearchserverless_collection" in content for content in files.values())
 
 
 def test_terraform_no_tools_generates_no_lambda() -> None:
     config = _config(tools=[])
     modules = resolve_required_modules(config)
-    files = terraform_backend.render("agent-1", 1, config, modules)
+    files = terraform_backend.render("agent-1", "tenant-a", 1, config, modules)
     assert not any("aws_lambda_function" in content for content in files.values())
 
 
 def test_terraform_tools_configured_generates_lambda_per_tool() -> None:
     config = _config(tools=[_one_tool(), {**_one_tool(), "tool_id": "slack", "tool_name": "Slack"}])
     modules = resolve_required_modules(config)
-    files = terraform_backend.render("agent-1", 1, config, modules)
+    files = terraform_backend.render("agent-1", "tenant-a", 1, config, modules)
     joined = "\n".join(files.values())
     assert joined.count('resource "aws_lambda_function"') == 2
     assert "tool_jira" in joined
@@ -84,7 +84,7 @@ def test_terraform_tools_configured_generates_lambda_per_tool() -> None:
 def test_terraform_output_files_are_scoped_to_agent_and_module() -> None:
     config = _config(tools=[_one_tool()])
     modules = resolve_required_modules(config)
-    files = terraform_backend.render("agent-42", 3, config, modules)
+    files = terraform_backend.render("agent-42", "tenant-a", 3, config, modules)
     assert all(path.startswith("terraform/agents/agent-42/") for path in files)
     assert any("/tools/" in path for path in files)
 
@@ -95,21 +95,21 @@ def test_terraform_output_files_are_scoped_to_agent_and_module() -> None:
 def test_cdk_no_kb_generates_no_opensearch() -> None:
     config = _config()
     modules = resolve_required_modules(config)
-    files = cdk_backend.render("agent-1", 1, config, modules)
+    files = cdk_backend.render("agent-1", "tenant-a", 1, config, modules)
     assert not any("opensearch" in content.lower() for content in files.values())
 
 
 def test_cdk_kb_enabled_generates_opensearch() -> None:
     config = _config(knowledge_base={"enabled": True, "kb_name": "docs"})
     modules = resolve_required_modules(config)
-    files = cdk_backend.render("agent-1", 1, config, modules)
+    files = cdk_backend.render("agent-1", "tenant-a", 1, config, modules)
     assert any("opensearchserverless.CfnCollection" in content for content in files.values())
 
 
 def test_cdk_no_tools_generates_no_lambda_function() -> None:
     config = _config(tools=[])
     modules = resolve_required_modules(config)
-    files = cdk_backend.render("agent-1", 1, config, modules)
+    files = cdk_backend.render("agent-1", "tenant-a", 1, config, modules)
     # "tools" module isn't resolved at all when there are no tools.
     assert not any(path.endswith("tools_stack.py") for path in files)
     assert not any("lambda_.Function" in content for content in files.values())
@@ -118,7 +118,7 @@ def test_cdk_no_tools_generates_no_lambda_function() -> None:
 def test_cdk_tools_configured_generates_lambda_per_tool() -> None:
     config = _config(tools=[_one_tool(), {**_one_tool(), "tool_id": "slack", "tool_name": "Slack"}])
     modules = resolve_required_modules(config)
-    files = cdk_backend.render("agent-1", 1, config, modules)
+    files = cdk_backend.render("agent-1", "tenant-a", 1, config, modules)
     joined = "\n".join(files.values())
     assert joined.count("lambda_.Function(") == 2
 
@@ -137,7 +137,7 @@ def test_cdk_generated_python_is_syntactically_valid() -> None:
         audit_enabled=True,
     )
     modules = resolve_required_modules(config)
-    files = cdk_backend.render("agent-1", 1, config, modules)
+    files = cdk_backend.render("agent-1", "tenant-a", 1, config, modules)
 
     py_files = {path: content for path, content in files.items() if path.endswith(".py")}
     assert py_files, "expected at least one generated Python file"
@@ -148,7 +148,7 @@ def test_cdk_generated_python_is_syntactically_valid() -> None:
 def test_cdk_app_entrypoint_only_imports_resolved_modules() -> None:
     config = _config(tools=[])  # no KB, no tools, no human review, default audit_enabled=True
     modules = resolve_required_modules(config)
-    files = cdk_backend.render("agent-7", 1, config, modules)
+    files = cdk_backend.render("agent-7", "tenant-a", 1, config, modules)
     app_py = files["cdk/agents/agent-7/app.py"]
     assert "add_audit_resources" in app_py
     assert "add_rag_resources" not in app_py
@@ -169,7 +169,7 @@ async def test_generator_uploads_zip_and_returns_metadata() -> None:
     generator = IaCGenerator(s3_client, settings)
     config = _config(tools=[_one_tool()])
 
-    result = await generator.generate("agent-99", 2, config)
+    result = await generator.generate("agent-99", "tenant-a", 2, config)
 
     assert result.tool == "terraform"
     assert result.iac_version == "1.0.2"
@@ -187,7 +187,7 @@ async def test_generator_switches_backend_via_settings(monkeypatch: pytest.Monke
     s3_client = boto3.client("s3", region_name="eu-west-2")
     generator = IaCGenerator(s3_client, settings)
 
-    result = await generator.generate("agent-100", 1, _config())
+    result = await generator.generate("agent-100", "tenant-a", 1, _config())
 
     assert result.tool == "cdk"
     assert result.s3_key.startswith("iac/cdk/agent-100/v1/")
@@ -203,4 +203,4 @@ async def test_generator_raises_when_bucket_not_configured(monkeypatch: pytest.M
     generator = IaCGenerator(s3_client, settings)
 
     with pytest.raises(RuntimeError, match="IAC_OUTPUT_BUCKET"):
-        await generator.generate("agent-1", 1, _config())
+        await generator.generate("agent-1", "tenant-a", 1, _config())
