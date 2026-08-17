@@ -17,13 +17,16 @@ from fastapi import Depends, Request
 from app.modules.audit.writer import AuditWriter
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
+from app.modules.bedrock_credentials.store import BedrockCredentialStore
 from app.modules.connectors.catalog import ConnectorCatalogStore
 from app.modules.connectors.tester import ConnectorTester
 from app.modules.deployment.orchestrator import DeploymentOrchestrator
 from app.modules.deployment.status_store import DeploymentStatusStore
 from app.modules.git_provider.base import GitProvider
 from app.modules.guardrails.engine import GuardrailEngine
+from app.modules.guardrails.provisioner import BedrockGuardrailProvisioner
 from app.modules.guardrails.store import GuardrailPolicyStore
+from app.modules.hitl.store import HitlReviewStore
 from app.modules.iac_generator.generator import IaCGenerator
 from app.modules.iac_generator.validator import IaCValidator
 from app.modules.knowledge_base.store import KnowledgeBaseStore
@@ -31,9 +34,12 @@ from app.modules.observability.metrics import MetricsEmitter
 from app.modules.platform.upgrade_orchestrator import PlatformUpgradeOrchestrator
 from app.modules.platform.upgrade_store import PlatformUpgradeStatusStore
 from app.modules.platform.version_service import PlatformVersionService
+from app.modules.platform_settings.store import PlatformSettingsStore
 from app.modules.playground.store import PlaygroundSessionStore
+from app.modules.projects.store import ProjectStore
 from app.modules.registry.store import AgentRegistryStore
 from app.modules.secrets.manager import SecretsManager
+from app.modules.skills.store import SkillStore
 from app.modules.telemetry.emitter import TelemetryConfig, TelemetryEmitter
 
 
@@ -149,6 +155,36 @@ async def get_guardrail_engine(request: Request) -> GuardrailEngine:
     return engine
 
 
+async def get_bedrock_guardrail_provisioner(request: Request) -> BedrockGuardrailProvisioner:
+    provisioner: BedrockGuardrailProvisioner = request.app.state.bedrock_guardrail_provisioner
+    return provisioner
+
+
 async def get_playground_session_store(request: Request) -> PlaygroundSessionStore:
     store: PlaygroundSessionStore = request.app.state.playground_session_store
+    return store
+
+
+async def get_bedrock_credential_store(request: Request) -> BedrockCredentialStore:
+    store: BedrockCredentialStore = request.app.state.bedrock_credential_store
+    return store
+
+
+async def get_project_store(request: Request) -> ProjectStore:
+    store: ProjectStore = request.app.state.project_store
+    return store
+
+
+async def get_skill_store(request: Request) -> SkillStore:
+    store: SkillStore = request.app.state.skill_store
+    return store
+
+
+async def get_hitl_review_store(request: Request) -> HitlReviewStore:
+    store: HitlReviewStore = request.app.state.hitl_review_store
+    return store
+
+
+async def get_platform_settings_store(request: Request) -> PlatformSettingsStore:
+    store: PlatformSettingsStore = request.app.state.platform_settings_store
     return store

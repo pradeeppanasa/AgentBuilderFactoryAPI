@@ -12,8 +12,15 @@ locals {
       hash_key       = "tenant_id"
       range_key      = "agent_id"
       range_key_type = "S"
-      gsis           = []
-      ttl_attribute  = null
+      # Section 38 — lets /api/v1/projects/{project_id}/agents/* list agents
+      # by project without a tenant-wide scan. project_id is optional (only
+      # set for project-scoped agents), so this is a sparse index — see
+      # app/modules/registry/store.py's _agent_item() for why project_id
+      # must be OMITTED (not written as null) on items that lack it.
+      gsis = [
+        { name = "project-index", hash_key = "project_id", hash_key_type = "S", range_key = null, range_key_type = null },
+      ]
+      ttl_attribute = null
     }
     "panasa-agent-versions" = {
       hash_key       = "agent_id"
@@ -71,8 +78,14 @@ locals {
       ttl_attribute  = null
     }
     "panasa-skills" = {
-      hash_key       = "skill_id"
-      range_key      = "scope"
+      # Section 38.3 (2026-08-17) — repurposed for the reusable
+      # prompt-capability Skill actually implemented in
+      # app/modules/skills/store.py; Section 4.9/29's built-in
+      # platform-capability Skill concept (hash_key=skill_id,
+      # range_key=scope) was never implemented in this codebase, so
+      # there is no real schema to preserve here.
+      hash_key       = "tenant_id"
+      range_key      = "skill_id"
       range_key_type = "S"
       gsis           = []
       ttl_attribute  = null
@@ -116,6 +129,44 @@ locals {
       # panasa-transcripts' shape above), not queried tenant-wide.
       hash_key       = "agent_id"
       range_key      = "session_id"
+      range_key_type = "S"
+      gsis           = []
+      ttl_attribute  = null
+    }
+    "panasa-bedrock-credentials" = {
+      # Section 37.15 (2026-08-16) — STS AssumeRole credential bindings.
+      # Schema matches app/modules/bedrock_credentials/store.py's
+      # ensure_table() key schema exactly.
+      hash_key       = "tenant_id"
+      range_key      = "credential_id"
+      range_key_type = "S"
+      gsis           = []
+      ttl_attribute  = null
+    }
+    # Section 38.2/38.7 — schema matches app/modules/projects/store.py's
+    # ensure_table() key schema exactly.
+    "panasa-projects" = {
+      hash_key       = "tenant_id"
+      range_key      = "project_id"
+      range_key_type = "S"
+      gsis           = []
+      ttl_attribute  = null
+    }
+    # Section 38.7/38.8 — schema matches app/modules/hitl/store.py's
+    # ensure_table() key schema exactly.
+    "panasa-hitl-reviews" = {
+      hash_key       = "tenant_id"
+      range_key      = "review_id"
+      range_key_type = "S"
+      gsis           = []
+      ttl_attribute  = null
+    }
+    # Section 39/R45, R45-7/8 — one settings item per tenant (fixed
+    # setting_id="GLOBAL" range key). Schema matches
+    # app/modules/platform_settings/store.py's ensure_table() exactly.
+    "panasa-platform-settings" = {
+      hash_key       = "tenant_id"
+      range_key      = "setting_id"
       range_key_type = "S"
       gsis           = []
       ttl_attribute  = null

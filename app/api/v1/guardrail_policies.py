@@ -1,8 +1,15 @@
-"""Guardrail policy library (CLAUDE_Advanced_Config.md Section 4.2 / 5 / 7).
+"""Guardrail policy library (CLAUDE.md Section 37.7/37.10/37.11 — the
+2026-08-16 full nested schema expansion).
 
 Reads open to every role; writes (create/update/delete) admin-only —
 `require_role()` with no extra roles, same "admin implicitly always
 allowed, empty set = admin-only" pattern as platform upgrades.
+
+On create/update, the API auto-provisions the real Bedrock guardrail
+resource behind the policy (Section 37.7: "Auto-provision Bedrock guardrail
+on save") via BedrockGuardrailProvisioner, storing the returned
+guardrailId/version before returning — skipped entirely when
+bedrock_enabled is False, since there's nothing useful to provision.
 """
 
 from __future__ import annotations
@@ -12,14 +19,27 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, model_validator
 
-from app.dependencies import get_guardrail_policy_store, get_registry_store, get_tenant_id
+from app.dependencies import (
+    get_bedrock_guardrail_provisioner,
+    get_guardrail_policy_store,
+    get_registry_store,
+    get_tenant_id,
+)
 from app.modules.auth.dependencies import require_role
 from app.modules.auth.schemas import CurrentUser
 from app.modules.guardrails.models import (
     MAX_BERT_ESCALATE_THRESHOLD,
     MIN_BERT_BLOCK_THRESHOLD,
+    BedrockContentFilters,
+    BertConfig,
+    BlockedMessages,
+    ComplianceConfig,
     GuardrailPolicy,
+    KeywordPolicy,
+    PiiConfig,
+    TopicConfig,
 )
+from app.modules.guardrails.provisioner import BedrockGuardrailProvisioner
 from app.modules.guardrails.store import GuardrailPolicyNotFoundError, GuardrailPolicyStore
 from app.modules.registry.store import AgentRegistryStore
 
@@ -32,62 +52,88 @@ class GuardrailPolicyListResponse(BaseModel):
     items: list[GuardrailPolicy]
 
 
-def _validate_thresholds(bert_block_threshold: float, bert_escalate_threshold: float) -> None:
-    if bert_block_threshold < MIN_BERT_BLOCK_THRESHOLD:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"bert_block_threshold cannot be set below {MIN_BERT_BLOCK_THRESHOLD}",
+class ThresholdFieldError(BaseModel):
+    field: str
+    message: str
+
+
+def _threshold_errors(
+    block_threshold: float, escalate_threshold: float
+) -> list[ThresholdFieldError]:
+    errors: list[ThresholdFieldError] = []
+    if block_threshold < MIN_BERT_BLOCK_THRESHOLD:
+        errors.append(
+            ThresholdFieldError(
+                field="bert.block_threshold",
+                message=f"cannot be set below {MIN_BERT_BLOCK_THRESHOLD}",
+            )
         )
-    if bert_escalate_threshold > MAX_BERT_ESCALATE_THRESHOLD:
+    if escalate_threshold > MAX_BERT_ESCALATE_THRESHOLD:
+        errors.append(
+            ThresholdFieldError(
+                field="bert.escalate_threshold",
+                message=f"cannot be set above {MAX_BERT_ESCALATE_THRESHOLD}",
+            )
+        )
+    if block_threshold <= escalate_threshold:
+        errors.append(
+            ThresholdFieldError(
+                field="bert.block_threshold",
+                message="must be greater than bert.escalate_threshold",
+            )
+        )
+    return errors
+
+
+def _validate_thresholds(block_threshold: float, escalate_threshold: float) -> None:
+    errors = _threshold_errors(block_threshold, escalate_threshold)
+    if errors:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"bert_escalate_threshold cannot be set above {MAX_BERT_ESCALATE_THRESHOLD}",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=[e.model_dump() for e in errors],
         )
 
 
 class CreateGuardrailPolicyRequest(BaseModel):
     name: str
     description: str
-    input_enabled: bool = True
-    bert_enabled: bool = True
-    bert_model: str = "unitary/toxic-bert"
-    bert_block_threshold: float = 0.85
-    bert_escalate_threshold: float = 0.40
-    bedrock_guardrail_id: str | None = None
-    bedrock_guardrail_version: str = "DRAFT"
-    output_enabled: bool = True
-    output_pii_redaction: bool = True
-    output_pii_entities: list[str] = Field(
-        default_factory=lambda: ["NAME", "EMAIL", "PHONE", "SSN", "CREDIT_CARD", "ADDRESS"]
-    )
-    output_topic_blocklist: list[str] = Field(default_factory=list)
-    output_profanity_filter: bool = True
-    output_max_tokens: int | None = None
+
+    bert: BertConfig = Field(default_factory=BertConfig)
+
+    bedrock_enabled: bool = True
+    bedrock_credential_id: str | None = None
+    bedrock_content_filters: BedrockContentFilters = Field(default_factory=BedrockContentFilters)
+
+    pii: PiiConfig = Field(default_factory=PiiConfig)
+    topics: TopicConfig = Field(default_factory=TopicConfig)
+    keywords: KeywordPolicy = Field(default_factory=KeywordPolicy)
+    compliance: ComplianceConfig = Field(default_factory=ComplianceConfig)
+    blocked_messages: BlockedMessages = Field(default_factory=BlockedMessages)
 
     @model_validator(mode="after")
     def _check_thresholds(self) -> CreateGuardrailPolicyRequest:
-        _validate_thresholds(self.bert_block_threshold, self.bert_escalate_threshold)
+        _validate_thresholds(self.bert.block_threshold, self.bert.escalate_threshold)
         return self
 
 
 class UpdateGuardrailPolicyRequest(BaseModel):
-    """Partial update — omitted fields keep their current value."""
+    """Whole-section replace, not a deep field-by-field merge: a provided
+    nested section (e.g. `bert`) replaces that entire section, matching the
+    UI's single "Save" button submitting the full form state (Section
+    37.14) rather than a per-field PATCH. Omitted top-level fields keep
+    their current value."""
 
     name: str | None = None
     description: str | None = None
-    input_enabled: bool | None = None
-    bert_enabled: bool | None = None
-    bert_model: str | None = None
-    bert_block_threshold: float | None = None
-    bert_escalate_threshold: float | None = None
-    bedrock_guardrail_id: str | None = None
-    bedrock_guardrail_version: str | None = None
-    output_enabled: bool | None = None
-    output_pii_redaction: bool | None = None
-    output_pii_entities: list[str] | None = None
-    output_topic_blocklist: list[str] | None = None
-    output_profanity_filter: bool | None = None
-    output_max_tokens: int | None = None
+    bert: BertConfig | None = None
+    bedrock_enabled: bool | None = None
+    bedrock_credential_id: str | None = None
+    bedrock_content_filters: BedrockContentFilters | None = None
+    pii: PiiConfig | None = None
+    topics: TopicConfig | None = None
+    keywords: KeywordPolicy | None = None
+    compliance: ComplianceConfig | None = None
+    blocked_messages: BlockedMessages | None = None
 
 
 async def _agents_referencing_policy(
@@ -105,6 +151,20 @@ async def _agents_referencing_policy(
             return referencing
 
 
+async def _provision_bedrock_guardrail(
+    provisioner: BedrockGuardrailProvisioner, tenant_id: str, policy: GuardrailPolicy
+) -> GuardrailPolicy:
+    if not policy.bedrock_enabled:
+        return policy
+    guardrail_id, guardrail_version = await provisioner.provision(tenant_id, policy)
+    return policy.model_copy(
+        update={
+            "bedrock_guardrail_id": guardrail_id,
+            "bedrock_guardrail_version": guardrail_version,
+        }
+    )
+
+
 @router.get("", response_model=GuardrailPolicyListResponse)
 async def list_guardrail_policies(
     tenant_id: Annotated[str, Depends(get_tenant_id)],
@@ -120,25 +180,31 @@ async def create_guardrail_policy(
     tenant_id: Annotated[str, Depends(get_tenant_id)],
     current_user: Annotated[CurrentUser, Depends(require_role())],
     store: Annotated[GuardrailPolicyStore, Depends(get_guardrail_policy_store)],
+    provisioner: Annotated[BedrockGuardrailProvisioner, Depends(get_bedrock_guardrail_provisioner)],
 ) -> GuardrailPolicy:
-    return await store.create(
+    created = await store.create(
         tenant_id=tenant_id,
         name=payload.name,
         description=payload.description,
         created_by=current_user.email,
-        input_enabled=payload.input_enabled,
-        bert_enabled=payload.bert_enabled,
-        bert_model=payload.bert_model,
-        bert_block_threshold=payload.bert_block_threshold,
-        bert_escalate_threshold=payload.bert_escalate_threshold,
-        bedrock_guardrail_id=payload.bedrock_guardrail_id,
-        bedrock_guardrail_version=payload.bedrock_guardrail_version,
-        output_enabled=payload.output_enabled,
-        output_pii_redaction=payload.output_pii_redaction,
-        output_pii_entities=payload.output_pii_entities,
-        output_topic_blocklist=payload.output_topic_blocklist,
-        output_profanity_filter=payload.output_profanity_filter,
-        output_max_tokens=payload.output_max_tokens,
+        bert=payload.bert,
+        bedrock_enabled=payload.bedrock_enabled,
+        bedrock_credential_id=payload.bedrock_credential_id,
+        bedrock_content_filters=payload.bedrock_content_filters,
+        pii=payload.pii,
+        topics=payload.topics,
+        keywords=payload.keywords,
+        compliance=payload.compliance,
+        blocked_messages=payload.blocked_messages,
+    )
+    provisioned = await _provision_bedrock_guardrail(provisioner, tenant_id, created)
+    if provisioned is created:
+        return created
+    return await store.update(
+        tenant_id,
+        provisioned.policy_id,
+        bedrock_guardrail_id=provisioned.bedrock_guardrail_id,
+        bedrock_guardrail_version=provisioned.bedrock_guardrail_version,
     )
 
 
@@ -165,6 +231,7 @@ async def update_guardrail_policy(
     tenant_id: Annotated[str, Depends(get_tenant_id)],
     _current_user: Annotated[CurrentUser, Depends(require_role())],
     store: Annotated[GuardrailPolicyStore, Depends(get_guardrail_policy_store)],
+    provisioner: Annotated[BedrockGuardrailProvisioner, Depends(get_bedrock_guardrail_provisioner)],
 ) -> GuardrailPolicy:
     existing = await store.get(tenant_id, policy_id)
     if existing is None:
@@ -172,15 +239,32 @@ async def update_guardrail_policy(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Guardrail policy {policy_id!r} not found",
         )
-    updates = payload.model_dump(exclude_unset=True)
-    _validate_thresholds(
-        updates.get("bert_block_threshold", existing.bert_block_threshold),
-        updates.get("bert_escalate_threshold", existing.bert_escalate_threshold),
-    )
+    # Deliberately NOT payload.model_dump(exclude_unset=True): that dumps
+    # nested sub-models (bert, pii, ...) to plain dicts, and
+    # store.update()'s record.model_copy(update=...) does not re-validate
+    # `update` values — the resulting GuardrailPolicy would end up with
+    # e.g. `.bert` as a raw dict instead of a BertConfig instance. Using
+    # the already-validated model instances directly keeps every field
+    # properly typed.
+    updates = {field: getattr(payload, field) for field in payload.model_fields_set}
+
+    effective_bert = payload.bert if payload.bert is not None else existing.bert
+    _validate_thresholds(effective_bert.block_threshold, effective_bert.escalate_threshold)
+
     try:
-        return await store.update(tenant_id, policy_id, **updates)
+        updated = await store.update(tenant_id, policy_id, **updates)
     except GuardrailPolicyNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    provisioned = await _provision_bedrock_guardrail(provisioner, tenant_id, updated)
+    if provisioned is updated:
+        return updated
+    return await store.update(
+        tenant_id,
+        policy_id,
+        bedrock_guardrail_id=provisioned.bedrock_guardrail_id,
+        bedrock_guardrail_version=provisioned.bedrock_guardrail_version,
+    )
 
 
 @router.delete("/{policy_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
@@ -190,6 +274,9 @@ async def delete_guardrail_policy(
     _current_user: Annotated[CurrentUser, Depends(require_role())],
     store: Annotated[GuardrailPolicyStore, Depends(get_guardrail_policy_store)],
     registry_store: Annotated[AgentRegistryStore, Depends(get_registry_store)],
+    provisioner: Annotated[
+        BedrockGuardrailProvisioner, Depends(get_bedrock_guardrail_provisioner)
+    ],
 ) -> None:
     record = await store.get(tenant_id, policy_id)
     if record is None:
@@ -206,4 +293,5 @@ async def delete_guardrail_policy(
                 f"{', '.join(referencing)}"
             ),
         )
+    await provisioner.deprovision(tenant_id, record)
     await store.delete(tenant_id, policy_id)

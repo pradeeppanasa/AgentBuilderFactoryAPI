@@ -88,3 +88,89 @@ class FailingBedrockGuardrailClient:
 
     def apply_guardrail(self, **kwargs: Any) -> dict[str, Any]:
         raise RuntimeError("simulated Bedrock outage")
+
+
+class FakeBedrockControlPlaneClient:
+    """Stands in for the boto3 `bedrock` (control-plane) client's
+    create_guardrail/update_guardrail calls — moto 5.0.28 doesn't implement
+    either (confirmed: raises NotImplementedError), so this is the only way
+    to test app.modules.guardrails.provisioner.BedrockGuardrailProvisioner
+    without a real AWS call."""
+
+    def __init__(self, *, guardrail_id: str = "gr-fake-123", version: str = "DRAFT") -> None:
+        self._guardrail_id = guardrail_id
+        self._version = version
+        self.create_calls: list[dict[str, Any]] = []
+        self.update_calls: list[dict[str, Any]] = []
+        self.delete_calls: list[dict[str, Any]] = []
+
+    def create_guardrail(self, **kwargs: Any) -> dict[str, Any]:
+        self.create_calls.append(kwargs)
+        arn = f"arn:aws:bedrock:eu-west-2:123456789012:guardrail/{self._guardrail_id}"
+        return {
+            "guardrailId": self._guardrail_id,
+            "guardrailArn": arn,
+            "version": self._version,
+            "createdAt": "2026-08-16T00:00:00Z",
+        }
+
+    def update_guardrail(self, **kwargs: Any) -> dict[str, Any]:
+        self.update_calls.append(kwargs)
+        guardrail_id = kwargs["guardrailIdentifier"]
+        arn = f"arn:aws:bedrock:eu-west-2:123456789012:guardrail/{guardrail_id}"
+        return {
+            "guardrailId": guardrail_id,
+            "guardrailArn": arn,
+            "version": self._version,
+            "updatedAt": "2026-08-16T00:00:00Z",
+        }
+
+    def delete_guardrail(self, **kwargs: Any) -> dict[str, Any]:
+        self.delete_calls.append(kwargs)
+        return {}
+
+
+class FailingBedrockControlPlaneClient:
+    """create_guardrail/update_guardrail/delete_guardrail all raise —
+    exercises BedrockGuardrailProvisioner.deprovision()'s best-effort
+    swallow-and-log path (it must never propagate an AWS-side failure)."""
+
+    def create_guardrail(self, **kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("simulated Bedrock control-plane outage")
+
+    def update_guardrail(self, **kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("simulated Bedrock control-plane outage")
+
+    def delete_guardrail(self, **kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("simulated Bedrock control-plane outage")
+
+
+class FakeSTSClient:
+    """Stands in for the boto3 `sts` client's assume_role call — records
+    every call and returns fixed, deterministic temporary credentials
+    (never real AWS credentials) so BedrockGuardrailProvisioner's
+    credential-resolution path (Section 37.15 STS AssumeRole design) is
+    testable without a real AWS call."""
+
+    def __init__(
+        self,
+        *,
+        access_key_id: str = "ASIAFAKEACCESSKEY",
+        secret_access_key: str = "fake-secret-access-key",  # noqa: S107
+        session_token: str = "fake-session-token",  # noqa: S107
+    ) -> None:
+        self._access_key_id = access_key_id
+        self._secret_access_key = secret_access_key
+        self._session_token = session_token
+        self.assume_role_calls: list[dict[str, Any]] = []
+
+    def assume_role(self, **kwargs: Any) -> dict[str, Any]:
+        self.assume_role_calls.append(kwargs)
+        return {
+            "Credentials": {
+                "AccessKeyId": self._access_key_id,
+                "SecretAccessKey": self._secret_access_key,
+                "SessionToken": self._session_token,
+                "Expiration": "2026-08-16T01:00:00Z",
+            }
+        }

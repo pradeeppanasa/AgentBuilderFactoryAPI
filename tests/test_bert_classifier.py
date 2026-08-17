@@ -21,7 +21,7 @@ from app.modules.guardrails.bert_classifier import (
     GuardrailInferenceError,
     GuardrailModelUnavailableError,
     ONNXBertClassifier,
-    _is_toxic_label,
+    _label_matches_keyword,
 )
 from tests.guardrail_onnx_fixtures import MODEL_NAME, build_synthetic_model_dir
 
@@ -41,8 +41,50 @@ from tests.guardrail_onnx_fixtures import MODEL_NAME, build_synthetic_model_dir
         ("obscene", False),
     ],
 )
-def test_is_toxic_label_excludes_negated_labels(label: str, expected: bool) -> None:
-    assert _is_toxic_label(label) is expected
+def test_label_matches_keyword_excludes_negated_labels(label: str, expected: bool) -> None:
+    assert _label_matches_keyword(label, "toxic") is expected
+
+
+@pytest.mark.parametrize(
+    ("label", "keyword", "expected"),
+    [
+        ("nsfw", "nsfw", True),
+        ("sfw", "nsfw", False),
+        ("non_nsfw", "nsfw", False),
+        ("injection", "injection", True),
+        ("prompt_injection", "injection", True),
+        ("legit", "injection", False),
+        ("gibberish", "gibberish", True),
+        ("clean", "gibberish", False),
+    ],
+)
+def test_label_matches_keyword_is_generic_across_checks(
+    label: str, keyword: str, expected: bool
+) -> None:
+    assert _label_matches_keyword(label, keyword) is expected
+
+
+def test_real_onnx_inference_works_for_a_non_toxicity_keyword(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Proves ONNXBertClassifier's target_keyword parameterization (added
+    for the NSFW/prompt-injection/gibberish checks) genuinely works
+    end-to-end against a real onnxruntime session — not just against the
+    original toxicity-only fixture."""
+    from tests.guardrail_onnx_fixtures import build_synthetic_model_dir_for
+
+    build_synthetic_model_dir_for(
+        tmp_path,
+        "some-org/nsfw-model",
+        positive_word="nsfw",
+        negative_word="clean",
+        positive_label="nsfw",
+    )
+    monkeypatch.setattr(settings, "guardrails_bert_model_dir", str(tmp_path))
+    classifier = ONNXBertClassifier("some-org/nsfw-model", target_keyword="nsfw")
+
+    assert classifier.score("this message is clean") < 0.1
+    assert classifier.score("this message is nsfw") > 0.9
 
 
 @pytest.fixture
@@ -164,7 +206,7 @@ def test_inference_failure_after_successful_load_raises_clean_error(
 def test_fallback_without_config_json_still_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No config.json -> _resolve_toxic_label_indices falls back to every
+    """No config.json -> _resolve_target_label_indices falls back to every
     output index (max-of-all) rather than crashing. This is a degraded mode
     (it can't identify which logit is "toxic"), which is exactly why
     production model artifacts must ship config.json alongside model.onnx —

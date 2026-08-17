@@ -1,0 +1,205 @@
+"""API tests for /api/v1/admin/settings/* (CLAUDE.md Section 39/R45,
+R45-7/8 — Admin Observability Settings API + panasa-platform-settings).
+
+Every route here is admin-only, including the GET routes (unlike the
+Knowledge Base / Guardrail Policy / Skills libraries, where reads are open
+to every role) — see admin_settings.py's module docstring. Secret values
+(Langfuse secret key, Datadog API key) are never round-tripped on GET, only
+"****" (set) or null (unset); moto mocks Secrets Manager directly so no
+fakes are needed here (unlike the Bedrock guardrail control-plane calls
+elsewhere in this suite).
+"""
+
+from __future__ import annotations
+
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+TENANT_A = "tenant-a"
+TENANT_B = "tenant-b"
+
+
+def _bearer(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def test_default_observability_config_has_always_on_stack(make_user_and_token) -> None:
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/v1/admin/settings/observability", headers=_bearer(admin_token)
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["default_stack"] == {
+            "cloudwatch": "active",
+            "xray": "active",
+            "otel_sdk": "deferred",
+        }
+        assert body["otel"]["endpoint"] is None
+        assert body["langfuse"] == {
+            "enabled": False,
+            "public_key": None,
+            "secret_key": None,
+            "host": None,
+        }
+        assert body["datadog"] == {"enabled": False, "api_key": None, "site": None}
+
+
+async def test_save_and_read_back_otel_endpoint(make_user_and_token) -> None:
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        saved = client.patch(
+            "/api/v1/admin/settings/otel-endpoint",
+            json={"endpoint": "http://collector.internal:4317"},
+            headers=_bearer(admin_token),
+        )
+        assert saved.status_code == 200
+        assert saved.json()["endpoint"] == "http://collector.internal:4317"
+
+        fetched = client.get(
+            "/api/v1/admin/settings/observability", headers=_bearer(admin_token)
+        )
+        assert fetched.json()["otel"]["endpoint"] == "http://collector.internal:4317"
+
+
+async def test_save_langfuse_config_masks_secret_on_read(make_user_and_token) -> None:
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        saved = client.patch(
+            "/api/v1/admin/settings/integrations/langfuse",
+            json={
+                "enabled": True,
+                "public_key": "pk-live-abc",
+                "secret_key": "sk-live-super-secret",
+                "host": "https://langfuse.internal.example.com",
+            },
+            headers=_bearer(admin_token),
+        )
+        assert saved.status_code == 200
+        body = saved.json()
+        assert body["enabled"] is True
+        assert body["public_key"] == "pk-live-abc"
+        assert body["secret_key"] == "****"
+        assert body["host"] == "https://langfuse.internal.example.com"
+        assert "sk-live-super-secret" not in saved.text
+
+        fetched = client.get(
+            "/api/v1/admin/settings/integrations/langfuse", headers=_bearer(admin_token)
+        )
+        fetched_body = fetched.json()
+        assert fetched_body["secret_key"] == "****"
+        assert "sk-live-super-secret" not in fetched.text
+
+
+async def test_omitting_secret_key_on_update_does_not_clear_it(make_user_and_token) -> None:
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        client.patch(
+            "/api/v1/admin/settings/integrations/langfuse",
+            json={"enabled": True, "secret_key": "sk-original"},
+            headers=_bearer(admin_token),
+        )
+
+        updated = client.patch(
+            "/api/v1/admin/settings/integrations/langfuse",
+            json={"enabled": True, "host": "https://new-host.example.com"},
+            headers=_bearer(admin_token),
+        )
+        assert updated.status_code == 200
+        body = updated.json()
+        # secret_key omitted from the request — must remain set, not cleared.
+        assert body["secret_key"] == "****"
+        assert body["host"] == "https://new-host.example.com"
+
+
+async def test_save_datadog_config_masks_api_key_on_read(make_user_and_token) -> None:
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        saved = client.patch(
+            "/api/v1/admin/settings/integrations/datadog",
+            json={"enabled": True, "api_key": "dd-api-key-xyz", "site": "datadoghq.eu"},
+            headers=_bearer(admin_token),
+        )
+        assert saved.status_code == 200
+        body = saved.json()
+        assert body["enabled"] is True
+        assert body["api_key"] == "****"
+        assert body["site"] == "datadoghq.eu"
+        assert "dd-api-key-xyz" not in saved.text
+
+        fetched = client.get(
+            "/api/v1/admin/settings/integrations/datadog", headers=_bearer(admin_token)
+        )
+        assert fetched.json()["api_key"] == "****"
+
+
+async def test_settings_are_tenant_isolated(make_user_and_token) -> None:
+    _, admin_a_token = await make_user_and_token(TENANT_A, role="admin")
+    _, admin_b_token = await make_user_and_token(TENANT_B, role="admin")
+
+    with TestClient(app) as client:
+        client.patch(
+            "/api/v1/admin/settings/otel-endpoint",
+            json={"endpoint": "http://tenant-a-collector:4317"},
+            headers=_bearer(admin_a_token),
+        )
+
+        tenant_b_view = client.get(
+            "/api/v1/admin/settings/observability", headers=_bearer(admin_b_token)
+        )
+        assert tenant_b_view.json()["otel"]["endpoint"] is None
+
+
+async def test_non_admin_cannot_read_or_write_settings(make_user_and_token) -> None:
+    _, dev_token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        assert (
+            client.get(
+                "/api/v1/admin/settings/observability", headers=_bearer(dev_token)
+            ).status_code
+            == 403
+        )
+        assert (
+            client.patch(
+                "/api/v1/admin/settings/otel-endpoint",
+                json={"endpoint": "http://x:4317"},
+                headers=_bearer(dev_token),
+            ).status_code
+            == 403
+        )
+        assert (
+            client.get(
+                "/api/v1/admin/settings/integrations/langfuse", headers=_bearer(dev_token)
+            ).status_code
+            == 403
+        )
+        assert (
+            client.patch(
+                "/api/v1/admin/settings/integrations/langfuse",
+                json={"enabled": True},
+                headers=_bearer(dev_token),
+            ).status_code
+            == 403
+        )
+        assert (
+            client.get(
+                "/api/v1/admin/settings/integrations/datadog", headers=_bearer(dev_token)
+            ).status_code
+            == 403
+        )
+        assert (
+            client.patch(
+                "/api/v1/admin/settings/integrations/datadog",
+                json={"enabled": True},
+                headers=_bearer(dev_token),
+            ).status_code
+            == 403
+        )

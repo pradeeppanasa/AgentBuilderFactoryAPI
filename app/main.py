@@ -17,6 +17,7 @@ from app.middleware.xray import XRayMiddleware
 from app.modules.audit.writer import AuditWriter
 from app.modules.auth.db import create_db_engine, create_session_factory
 from app.modules.auth.secrets import fetch_jwt_secret
+from app.modules.bedrock_credentials.store import BedrockCredentialStore
 from app.modules.connectors.catalog import ConnectorCatalogStore
 from app.modules.connectors.tester import ConnectorTester
 from app.modules.deployment.orchestrator import DeploymentOrchestrator
@@ -24,7 +25,9 @@ from app.modules.deployment.status_store import DeploymentStatusStore
 from app.modules.git_provider.factory import create_git_provider
 from app.modules.git_provider.secrets import fetch_git_token
 from app.modules.guardrails.engine import GuardrailEngine
+from app.modules.guardrails.provisioner import BedrockGuardrailProvisioner
 from app.modules.guardrails.store import GuardrailPolicyStore
+from app.modules.hitl.store import HitlReviewStore
 from app.modules.iac_generator.generator import IaCGenerator
 from app.modules.iac_generator.validator import IaCValidator
 from app.modules.knowledge_base.store import KnowledgeBaseStore
@@ -32,17 +35,23 @@ from app.modules.observability.metrics import MetricsEmitter
 from app.modules.platform.upgrade_orchestrator import PlatformUpgradeOrchestrator
 from app.modules.platform.upgrade_store import PlatformUpgradeStatusStore
 from app.modules.platform.version_service import PlatformVersionService
+from app.modules.platform_settings.store import PlatformSettingsStore
 from app.modules.playground.store import PlaygroundSessionStore
+from app.modules.projects.store import ProjectStore
 from app.modules.registry.store import AgentRegistryStore
 from app.modules.secrets.manager import SecretsManager
+from app.modules.skills.store import SkillStore
 from app.modules.telemetry.emitter import TelemetryConfig, TelemetryEmitter
 from app.shared.aws_clients import (
+    create_bedrock_client,
+    create_bedrock_client_with_credentials,
     create_bedrock_runtime_client,
     create_cloudwatch_client,
     create_codecommit_client,
     create_ecr_client,
     create_eventbridge_client,
     create_stepfunctions_client,
+    create_sts_client,
 )
 from app.shared.dynamodb import create_dynamodb_resource
 from app.shared.logging import configure_logging, get_logger
@@ -162,7 +171,37 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await playground_session_store.ensure_table()
     app.state.playground_session_store = playground_session_store
 
+    bedrock_credential_store = BedrockCredentialStore(dynamodb, settings)
+    await bedrock_credential_store.ensure_table()
+    app.state.bedrock_credential_store = bedrock_credential_store
+
+    # Section 38 — Projects
+    project_store = ProjectStore(dynamodb, settings)
+    await project_store.ensure_table()
+    app.state.project_store = project_store
+
+    # Section 38.3 — Skills catalog
+    skill_store = SkillStore(dynamodb, settings)
+    await skill_store.ensure_table()
+    app.state.skill_store = skill_store
+
+    # Section 38.7/38.8 — HITL review queue
+    hitl_review_store = HitlReviewStore(dynamodb, settings)
+    await hitl_review_store.ensure_table()
+    app.state.hitl_review_store = hitl_review_store
+
+    # Section 39/R45, R45-7/8 — Admin observability settings
+    platform_settings_store = PlatformSettingsStore(dynamodb, settings)
+    await platform_settings_store.ensure_table()
+    app.state.platform_settings_store = platform_settings_store
+
     app.state.guardrail_engine = GuardrailEngine(create_bedrock_runtime_client(settings))
+    app.state.bedrock_guardrail_provisioner = BedrockGuardrailProvisioner(
+        create_bedrock_client(settings),
+        sts_client=create_sts_client(settings),
+        credential_store=bedrock_credential_store,
+        client_factory=lambda creds: create_bedrock_client_with_credentials(settings, creds),
+    )
 
     # R16: TELEMETRY_ENABLED defaults false; categories default all-on so
     # flipping the master switch alone re-enables full telemetry. PUT

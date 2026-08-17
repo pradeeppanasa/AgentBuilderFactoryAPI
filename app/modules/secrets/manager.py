@@ -59,6 +59,15 @@ class SecretsManager:
             raise
         log.info("secret.updated", secret_arn=secret_arn)
 
+    async def create_or_update_secret(self, name: str, value: str, existing_arn: str | None) -> str:
+        """Idempotent write for settings-style secrets that get re-saved many
+        times: update in place if an ARN from a prior save is already known,
+        otherwise create fresh. Never returns/logs `value`."""
+        if existing_arn is not None:
+            await self.update_secret(existing_arn, value)
+            return existing_arn
+        return await self.create_secret(name, value)
+
     async def get_secret_value(self, secret_arn: str) -> str:
         try:
             response = await asyncio.to_thread(self._client.get_secret_value, SecretId=secret_arn)

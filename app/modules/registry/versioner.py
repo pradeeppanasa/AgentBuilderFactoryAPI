@@ -47,6 +47,7 @@ _MUTABLE_DERIVED_FIELDS = {
     "terraform_plan_summary",
     "deployment_result",
     "evaluation_result",
+    "project_lifecycle_status",  # Section 38.11
 }
 
 
@@ -141,6 +142,15 @@ class AgentVersioner:
             UpdateExpression=update_expression,
             ExpressionAttributeNames={f"#{name}": name for name in fields},
             ExpressionAttributeValues=values,
+        )
+
+    async def delete(self, agent_id: str, version: int) -> None:
+        """Section 38.11 hard-delete — only ever called for an already-
+        archived, zero-reference agent (enforced by the API layer); R08's
+        "never mutate an existing version" is about mutation, not this
+        genuinely-irreversible admin operation."""
+        await asyncio.to_thread(
+            self._versions_table.delete_item, Key={"agent_id": agent_id, "version": version}
         )
 
     async def get(self, agent_id: str, version: int) -> AgentVersionRecord | None:

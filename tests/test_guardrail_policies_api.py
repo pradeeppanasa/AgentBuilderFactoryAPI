@@ -1,14 +1,23 @@
-"""API tests for /api/v1/platform/guardrail-policies (CLAUDE_Advanced_Config.md
-Section 4.2 / 5 / 7, CLAUDE.md Section 37.10/37.11).
+"""API tests for /api/v1/platform/guardrail-policies (CLAUDE.md Section
+37.7/37.10/37.11 — 2026-08-16 nested schema expansion).
 
-Reads open to every role; writes (create/update/delete) admin-only.
+Reads open to every role; writes (create/update/delete) admin-only. The
+Bedrock auto-provisioning dependency is overridden with
+FakeBedrockControlPlaneClient (tests/fakes.py) — moto 5.0.28 doesn't
+implement create_guardrail/update_guardrail.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
+import pytest
 from fastapi.testclient import TestClient
 
+from app.dependencies import get_bedrock_guardrail_provisioner
 from app.main import app
+from app.modules.guardrails.provisioner import BedrockGuardrailProvisioner
+from tests.fakes import FakeBedrockControlPlaneClient
 
 TENANT_A = "tenant-a"
 TENANT_B = "tenant-b"
@@ -18,7 +27,21 @@ def _bearer(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-async def test_admin_can_create_and_get_policy(make_user_and_token) -> None:
+@pytest.fixture(autouse=True)
+def fake_bedrock_provisioner() -> Iterator[FakeBedrockControlPlaneClient]:
+    client = FakeBedrockControlPlaneClient()
+    app.dependency_overrides[get_bedrock_guardrail_provisioner] = (
+        lambda: BedrockGuardrailProvisioner(client)
+    )
+    try:
+        yield client
+    finally:
+        del app.dependency_overrides[get_bedrock_guardrail_provisioner]
+
+
+async def test_admin_can_create_and_get_policy(
+    make_user_and_token, fake_bedrock_provisioner: FakeBedrockControlPlaneClient
+) -> None:
     _, admin_token = await make_user_and_token(TENANT_A, role="admin")
 
     with TestClient(app) as client:
@@ -28,13 +51,63 @@ async def test_admin_can_create_and_get_policy(make_user_and_token) -> None:
             headers=_bearer(admin_token),
         )
         assert created.status_code == 201
-        policy_id = created.json()["policy_id"]
+        body = created.json()
+        assert body["bert"]["block_threshold"] == 0.85
+        assert body["bedrock_guardrail_id"] == "gr-fake-123"
+        assert body["bedrock_guardrail_version"] == "DRAFT"
+        policy_id = body["policy_id"]
 
         fetched = client.get(
             f"/api/v1/platform/guardrail-policies/{policy_id}", headers=_bearer(admin_token)
         )
         assert fetched.status_code == 200
-        assert fetched.json()["bert_block_threshold"] == 0.85
+        assert fetched.json()["bedrock_guardrail_id"] == "gr-fake-123"
+
+    assert len(fake_bedrock_provisioner.create_calls) == 1
+    assert fake_bedrock_provisioner.create_calls[0]["name"] == policy_id
+
+
+async def test_create_skips_provisioning_when_bedrock_disabled(
+    make_user_and_token, fake_bedrock_provisioner: FakeBedrockControlPlaneClient
+) -> None:
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/platform/guardrail-policies",
+            json={"name": "No Bedrock", "description": "d", "bedrock_enabled": False},
+            headers=_bearer(admin_token),
+        )
+
+    assert created.status_code == 201
+    assert created.json()["bedrock_guardrail_id"] is None
+    assert fake_bedrock_provisioner.create_calls == []
+
+
+async def test_update_calls_update_guardrail_not_create(
+    make_user_and_token, fake_bedrock_provisioner: FakeBedrockControlPlaneClient
+) -> None:
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/platform/guardrail-policies",
+            json={"name": "Editable", "description": "d"},
+            headers=_bearer(admin_token),
+        )
+        policy_id = created.json()["policy_id"]
+
+        updated = client.put(
+            f"/api/v1/platform/guardrail-policies/{policy_id}",
+            json={"description": "updated description"},
+            headers=_bearer(admin_token),
+        )
+
+    assert updated.status_code == 200
+    assert updated.json()["description"] == "updated description"
+    assert len(fake_bedrock_provisioner.create_calls) == 1  # from create
+    assert len(fake_bedrock_provisioner.update_calls) == 1  # from the PUT
+    assert fake_bedrock_provisioner.update_calls[0]["guardrailIdentifier"] == "gr-fake-123"
 
 
 async def test_developer_cannot_create_policy(make_user_and_token) -> None:
@@ -73,10 +146,12 @@ async def test_create_rejects_block_threshold_below_floor(make_user_and_token) -
     with TestClient(app) as client:
         response = client.post(
             "/api/v1/platform/guardrail-policies",
-            json={"name": "TooLoose", "description": "d", "bert_block_threshold": 0.5},
+            json={"name": "TooLoose", "description": "d", "bert": {"block_threshold": 0.5}},
             headers=_bearer(admin_token),
         )
-    assert response.status_code == 400
+    assert response.status_code == 422
+    fields = {e["field"] for e in response.json()["detail"]}
+    assert "bert.block_threshold" in fields
 
 
 async def test_create_rejects_escalate_threshold_above_ceiling(make_user_and_token) -> None:
@@ -85,32 +160,53 @@ async def test_create_rejects_escalate_threshold_above_ceiling(make_user_and_tok
     with TestClient(app) as client:
         response = client.post(
             "/api/v1/platform/guardrail-policies",
-            json={"name": "TooEager", "description": "d", "bert_escalate_threshold": 0.9},
+            json={"name": "TooEager", "description": "d", "bert": {"escalate_threshold": 0.9}},
             headers=_bearer(admin_token),
         )
-    assert response.status_code == 400
+    assert response.status_code == 422
+    fields = {e["field"] for e in response.json()["detail"]}
+    assert "bert.escalate_threshold" in fields
 
 
-async def test_update_policy_partial(make_user_and_token) -> None:
+async def test_create_rejects_block_not_greater_than_escalate(make_user_and_token) -> None:
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/platform/guardrail-policies",
+            json={
+                "name": "Inverted",
+                "description": "d",
+                "bert": {"block_threshold": 0.75, "escalate_threshold": 0.75},
+            },
+            headers=_bearer(admin_token),
+        )
+    assert response.status_code == 422
+
+
+async def test_update_partial_replaces_whole_bert_section(make_user_and_token) -> None:
     _, admin_token = await make_user_and_token(TENANT_A, role="admin")
 
     with TestClient(app) as client:
         created = client.post(
             "/api/v1/platform/guardrail-policies",
-            json={"name": "Editable", "description": "d"},
+            json={"name": "Sectioned", "description": "d"},
             headers=_bearer(admin_token),
         )
         policy_id = created.json()["policy_id"]
 
         updated = client.put(
             f"/api/v1/platform/guardrail-policies/{policy_id}",
-            json={"description": "updated description"},
+            json={"bert": {"block_threshold": 0.90, "escalate_threshold": 0.50}},
             headers=_bearer(admin_token),
         )
-        assert updated.status_code == 200
-        body = updated.json()
-        assert body["description"] == "updated description"
-        assert body["name"] == "Editable"
+    assert updated.status_code == 200
+    body = updated.json()
+    assert body["bert"]["block_threshold"] == 0.90
+    # replacing the section resets sub-fields not explicitly re-sent, back
+    # to BertConfig's own defaults (check_toxicity=True etc.) — a whole-
+    # section replace, not a field merge.
+    assert body["bert"]["check_toxicity"] is True
 
 
 async def test_update_rejects_threshold_violation_using_merged_values(make_user_and_token) -> None:
@@ -126,10 +222,37 @@ async def test_update_rejects_threshold_violation_using_merged_values(make_user_
 
         response = client.put(
             f"/api/v1/platform/guardrail-policies/{policy_id}",
-            json={"bert_block_threshold": 0.6},
+            json={"bert": {"block_threshold": 0.6}},
             headers=_bearer(admin_token),
         )
-    assert response.status_code == 400
+    assert response.status_code == 422
+
+
+async def test_nested_pii_topics_keywords_persist(make_user_and_token) -> None:
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/platform/guardrail-policies",
+            json={
+                "name": "Full",
+                "description": "d",
+                "pii": {"email": {"action": "BLOCK"}},
+                "topics": {"banned_topics": ["politics"]},
+                "keywords": {"rules": [{"pattern": "jailbreak", "action": "BLOCK"}]},
+                "compliance": {"frameworks": ["GDPR", "HIPAA"]},
+                "blocked_messages": {"content_blocked": "Nope."},
+            },
+            headers=_bearer(admin_token),
+        )
+
+    assert created.status_code == 201
+    body = created.json()
+    assert body["pii"]["email"]["action"] == "BLOCK"
+    assert body["topics"]["banned_topics"] == ["politics"]
+    assert body["keywords"]["rules"][0]["pattern"] == "jailbreak"
+    assert set(body["compliance"]["frameworks"]) == {"GDPR", "HIPAA"}
+    assert body["blocked_messages"]["content_blocked"] == "Nope."
 
 
 async def test_delete_blocked_when_referenced_by_agent(make_user_and_token) -> None:

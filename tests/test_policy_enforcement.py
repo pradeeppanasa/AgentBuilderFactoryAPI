@@ -8,7 +8,7 @@ from app.config import settings
 from app.modules.deployment.models import DeploymentRecord, initial_stages
 from app.modules.deployment.status_store import DeploymentStatusStore
 from app.modules.registry.models import AgentConfiguration
-from app.modules.registry.store import AgentRegistryStore
+from app.modules.registry.store import AgentRegistryStore, _agent_item
 from app.modules.security.models import SecurityFinding
 from app.modules.security.policy_enforcement import enforce_policy_gate
 
@@ -50,7 +50,7 @@ async def _seed_agent_and_deployment(
             settings.dynamodb_agents_table
         )
         live_record = record.model_copy(update={"live_version": live_version, "status": "ACTIVE"})
-        agents_table.put_item(Item=live_record.model_dump(mode="json"))
+        agents_table.put_item(Item=_agent_item(live_record))
 
     await deployment_status_store.create_deployment(
         DeploymentRecord(

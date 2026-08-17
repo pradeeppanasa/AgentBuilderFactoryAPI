@@ -44,6 +44,10 @@ router = APIRouter(prefix="/agents", tags=["playground"])
 _READ_ROLES = ("developer", "analyst", "auditor")
 
 _BLOCKED_REPLY = "This message was blocked by a guardrail policy."
+"""Defensive fallback only — `blocked` can only become True when `policy`
+is not None, so `policy.blocked_messages.content_blocked` is used in
+practice. Kept for the type checker and in case that invariant ever
+changes."""
 
 
 class PlaygroundOverrides(BaseModel):
@@ -237,7 +241,9 @@ async def run_playground_turn(
                 reply_text = output_decision.sanitised_text
 
     if blocked:
-        reply_text = _BLOCKED_REPLY
+        reply_text = (
+            policy.blocked_messages.content_blocked if policy is not None else _BLOCKED_REPLY
+        )
 
     retrieval_start = time.perf_counter()
     kb_retrievals = _run_kb_retrieval(config.kb_id)

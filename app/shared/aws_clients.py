@@ -41,3 +41,32 @@ def create_bedrock_runtime_client(settings: Settings) -> Any:
     call" in the sense R27 prohibits direct boto3 access to. LiteLLM also
     has no equivalent wrapper for this API."""
     return boto3.client("bedrock-runtime", region_name=settings.aws_region)
+
+
+def create_bedrock_client(settings: Settings) -> Any:
+    """Control-plane client — CreateGuardrail/UpdateGuardrail/DeleteGuardrail
+    (app.modules.guardrails.provisioner), distinct from
+    create_bedrock_runtime_client's data-plane ApplyGuardrail. Uses the
+    Runtime's own ambient IAM role — the *default* client a
+    BedrockGuardrailProvisioner falls back to when a GuardrailPolicy has no
+    `bedrock_credential_id` set. See create_bedrock_client_with_credentials
+    for the cross-account (STS AssumeRole) case."""
+    return boto3.client("bedrock", region_name=settings.aws_region)
+
+
+def create_sts_client(settings: Settings) -> Any:
+    """Section 37.15 (2026-08-16) — resolves a GuardrailPolicy's
+    bedrock_credential_id into temporary credentials via sts:AssumeRole.
+    See app.modules.bedrock_credentials.models.BedrockCredentialRecord's
+    docstring for why role assumption was chosen over static access keys."""
+    return boto3.client("sts", region_name=settings.aws_region)
+
+
+def create_bedrock_client_with_credentials(settings: Settings, credentials: dict[str, str]) -> Any:
+    """Builds a `bedrock` control-plane client from temporary STS
+    credentials (aws_access_key_id/aws_secret_access_key/aws_session_token)
+    instead of the ambient IAM role — used by
+    app.modules.guardrails.provisioner.BedrockGuardrailProvisioner's
+    client_factory when a policy's bedrock_credential_id resolves via
+    AssumeRole to a different AWS account/role."""
+    return boto3.client("bedrock", region_name=settings.aws_region, **credentials)

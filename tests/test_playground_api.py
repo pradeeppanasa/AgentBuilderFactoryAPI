@@ -17,10 +17,15 @@ import litellm
 import pytest
 from fastapi.testclient import TestClient
 
-from app.dependencies import get_guardrail_engine
+from app.dependencies import get_bedrock_guardrail_provisioner, get_guardrail_engine
 from app.main import app
 from app.modules.guardrails.engine import GuardrailEngine
-from tests.fakes import FakeBedrockGuardrailClient, FakeToxicityClassifier
+from app.modules.guardrails.provisioner import BedrockGuardrailProvisioner
+from tests.fakes import (
+    FakeBedrockControlPlaneClient,
+    FakeBedrockGuardrailClient,
+    FakeToxicityClassifier,
+)
 
 TENANT_A = "tenant-a"
 
@@ -64,12 +69,35 @@ def _fake_llm(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture
 def guardrail_engine_with_fakes() -> Iterator[tuple[GuardrailEngine, FakeBedrockGuardrailClient]]:
     bedrock = FakeBedrockGuardrailClient()
-    engine = GuardrailEngine(bedrock, classifier_factory=lambda _m: FakeToxicityClassifier(0.5))
+    # 0.5 lands in the toxicity check's default escalate band (0.40-0.85),
+    # which is what this fixture's one caller wants — but nsfw/injection/
+    # gibberish are exercised by test_guardrail_engine.py separately, not
+    # here, so the policy this fixture is used with must disable them
+    # explicitly (see test_playground_blocks_input_via_guardrail_policy)
+    # or a uniform 0.5 score would also trip prompt_injection's much lower
+    # default threshold (0.30) before ever reaching Bedrock.
+    engine = GuardrailEngine(bedrock, classifier_factory=lambda _m, _k: FakeToxicityClassifier(0.5))
     app.dependency_overrides[get_guardrail_engine] = lambda: engine
     try:
         yield engine, bedrock
     finally:
         del app.dependency_overrides[get_guardrail_engine]
+
+
+@pytest.fixture
+def fake_bedrock_provisioner() -> Iterator[None]:
+    """Overrides the Bedrock auto-provisioning dependency so creating a
+    guardrail policy in these tests never makes a real (moto-unsupported)
+    create_guardrail call — see test_guardrail_policies_api.py's identical
+    fixture."""
+    client = FakeBedrockControlPlaneClient()
+    app.dependency_overrides[get_bedrock_guardrail_provisioner] = lambda: (
+        BedrockGuardrailProvisioner(client)
+    )
+    try:
+        yield
+    finally:
+        del app.dependency_overrides[get_bedrock_guardrail_provisioner]
 
 
 async def _create_agent(client: TestClient, token: str, **config_overrides: Any) -> str:
@@ -142,7 +170,7 @@ async def test_playground_session_round_trips_turns(make_user_and_token) -> None
 
 
 async def test_playground_blocks_input_via_guardrail_policy(
-    make_user_and_token, guardrail_engine_with_fakes
+    make_user_and_token, guardrail_engine_with_fakes, fake_bedrock_provisioner: None
 ) -> None:
     _, admin_token = await make_user_and_token(TENANT_A, role="admin")
     engine, bedrock = guardrail_engine_with_fakes
@@ -151,10 +179,22 @@ async def test_playground_blocks_input_via_guardrail_policy(
     with TestClient(app) as client:
         policy = client.post(
             "/api/v1/platform/guardrail-policies",
-            json={"name": "Blocking", "description": "d", "bedrock_guardrail_id": "gr-1"},
+            json={
+                "name": "Blocking",
+                "description": "d",
+                # Only exercise toxicity's escalate-to-Bedrock path here —
+                # the fixed 0.5 fake score would also trip prompt_injection's
+                # much lower default threshold (0.30) otherwise.
+                "bert": {
+                    "check_nsfw": False,
+                    "check_prompt_injection": False,
+                    "check_gibberish": False,
+                },
+            },
             headers=_bearer(admin_token),
         )
         policy_id = policy.json()["policy_id"]
+        assert policy.json()["bedrock_guardrail_id"] is not None  # auto-provisioned
 
         agent_id = await _create_agent(client, admin_token, guardrail_policy_id=policy_id)
 
@@ -167,7 +207,9 @@ async def test_playground_blocks_input_via_guardrail_policy(
     assert response.status_code == 200
     body = response.json()
     assert body["blocked"] is True
-    assert body["message"] == "This message was blocked by a guardrail policy."
+    # Now sourced from the policy's own configured message (defaults shown
+    # here), not a hardcoded playground-only string — see playground.py.
+    assert body["message"] == "This content has been blocked by the content policy."
     assert any(d["action"] == "block" for d in body["metrics"]["guardrail_decisions"])
 
 

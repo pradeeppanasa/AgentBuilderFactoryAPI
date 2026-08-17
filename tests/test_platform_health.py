@@ -86,8 +86,20 @@ async def test_check_observability_disabled_when_unconfigured() -> None:
 
 
 async def test_check_observability_error_when_unreachable() -> None:
-    stub_settings = settings.model_copy(update={"langfuse_host": "http://127.0.0.1:1"})
+    stub_settings = settings.model_copy(
+        update={"langfuse_enabled": True, "langfuse_host": "http://127.0.0.1:1"}
+    )
     assert await check_observability(stub_settings) == "error"
+
+
+async def test_check_observability_disabled_when_host_set_but_flag_off() -> None:
+    """R45: Langfuse is optional and off by default — a host left over from
+    a previous config must not make the health check attempt a connection
+    unless langfuse_enabled is explicitly True."""
+    stub_settings = settings.model_copy(
+        update={"langfuse_enabled": False, "langfuse_host": "http://langfuse:3000"}
+    )
+    assert await check_observability(stub_settings) == "disabled"
 
 
 async def test_check_observability_ok_when_reachable(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -107,5 +119,7 @@ async def test_check_observability_ok_when_reachable(monkeypatch: pytest.MonkeyP
             return None
 
     monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
-    stub_settings = settings.model_copy(update={"langfuse_host": "http://langfuse:3000"})
+    stub_settings = settings.model_copy(
+        update={"langfuse_enabled": True, "langfuse_host": "http://langfuse:3000"}
+    )
     assert await check_observability(stub_settings) == "ok"

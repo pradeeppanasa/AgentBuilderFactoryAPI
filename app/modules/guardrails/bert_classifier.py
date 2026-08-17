@@ -1,6 +1,12 @@
-"""ONNX Runtime toxicity classifier — Guardrail Layer 1
-(CLAUDE_Advanced_Config.md Section 3.5 Layer 1 — "local inference (runs
-inside VPC — R30)").
+"""ONNX Runtime BERT-family classifier — Guardrail Layer 1 (CLAUDE.md
+Section 37.7/37.15 Layer 1 — "local inference (runs inside VPC — R30)").
+
+Generic across all four Layer 1 checks (toxicity, NSFW, prompt injection,
+gibberish) — each is a separate model directory + a `target_keyword` used
+to pick out the positive-class output label from the model's own
+config.json id2label mapping (e.g. "toxic" for the toxicity model, "nsfw"
+for the NSFW model). One class, four instances, matching
+GuardrailEngine._classifier_for's existing per-model-name caching.
 
 Deliberately NOT PyTorch/`optimum`: every version of `optimum` (including
 its "onnxruntime" extra) lists `torch>=1.11` as a mandatory, non-optional
@@ -44,18 +50,18 @@ from app.shared.logging import get_logger
 
 log = get_logger()
 
-# Matches "toxic", "severe_toxic", "toxicity", etc. but deliberately
-# excludes "non_toxic" / "non-toxic" / "nontoxic" / "not_toxic" — a naive
-# substring check ("toxic" in label) also matches those negated label
-# names, since "toxic" is literally a substring of "non_toxic". Caught by
-# tests/test_bert_classifier.py's real ONNX inference test against a
-# synthetic {"0": "non_toxic", "1": "toxic"} config — a fake/fixed-score
-# classifier double would never have exercised this matching logic at all.
-_NEGATED_TOXIC = re.compile(r"(?:non|not)[-_]?toxic", re.IGNORECASE)
-
-
-def _is_toxic_label(label: str) -> bool:
-    return "toxic" in label.lower() and not _NEGATED_TOXIC.search(label)
+def _label_matches_keyword(label: str, keyword: str) -> bool:
+    """Matches "toxic", "severe_toxic", "toxicity", etc. for keyword="toxic"
+    but deliberately excludes "non_toxic" / "non-toxic" / "nontoxic" /
+    "not_toxic" — a naive substring check ("toxic" in label) also matches
+    those negated label names, since "toxic" is literally a substring of
+    "non_toxic". Caught by tests/test_bert_classifier.py's real ONNX
+    inference test against a synthetic {"0": "non_toxic", "1": "toxic"}
+    config — a fake/fixed-score classifier double would never have
+    exercised this matching logic at all. Generalises the same discipline
+    to every keyword (nsfw, injection, gibberish)."""
+    negated = re.compile(rf"(?:non|not)[-_]?{re.escape(keyword)}", re.IGNORECASE)
+    return keyword.lower() in label.lower() and not negated.search(label)
 
 
 class ToxicityClassifier(Protocol):
@@ -78,14 +84,19 @@ class GuardrailInferenceError(RuntimeError):
 
 class ONNXBertClassifier:
     """Loads `{base_dir}/{model_name}/{model.onnx, tokenizer.json,
-    config.json}` and scores text via a real ONNX Runtime session."""
+    config.json}` and scores text via a real ONNX Runtime session.
+    `target_keyword` selects which output label counts as the "positive"
+    class for this check (e.g. "toxic", "nsfw", "injection", "gibberish");
+    defaults to "toxic" for backward compatibility with the original
+    single-check design."""
 
-    def __init__(self, model_name: str) -> None:
+    def __init__(self, model_name: str, target_keyword: str = "toxic") -> None:
         self._model_name = model_name
+        self._target_keyword = target_keyword
         self._session: Any = None
         self._tokenizer: Any = None
         self._np: Any = None
-        self._toxic_label_indices: list[int] = []
+        self._target_label_indices: list[int] = []
 
     def _model_dir(self) -> Path:
         base_dir = settings.guardrails_bert_model_dir
@@ -129,19 +140,24 @@ class ONNXBertClassifier:
                 f"Failed to load ONNX model/tokenizer from {model_dir}: {exc}"
             ) from exc
 
-        log.info("guardrails.bert.onnx_model_loaded", model_dir=str(model_dir))
+        log.info(
+            "guardrails.bert.onnx_model_loaded",
+            model_dir=str(model_dir),
+            target_keyword=self._target_keyword,
+        )
         self._session = session
         self._tokenizer = tokenizer
         self._np = np
-        self._toxic_label_indices = self._resolve_toxic_label_indices(model_dir, session)
+        self._target_label_indices = self._resolve_target_label_indices(model_dir, session)
         return session, tokenizer, np
 
-    def _resolve_toxic_label_indices(self, model_dir: Path, session: Any) -> list[int]:
+    def _resolve_target_label_indices(self, model_dir: Path, session: Any) -> list[int]:
         """Reads id2label from config.json (standard HF export layout) to
-        find which output logits correspond to a "toxic"-named label — same
-        substring-match discipline the previous transformers-pipeline-based
-        implementation used. Falls back to every output index (max-of-all)
-        when no config.json/id2label is present."""
+        find which output logits correspond to a `target_keyword`-named
+        label — same substring-match discipline the previous
+        transformers-pipeline-based implementation used. Falls back to
+        every output index (max-of-all) when no config.json/id2label is
+        present, or when no label matches the keyword."""
         num_outputs = self._output_width(session)
         config_path = model_dir / "config.json"
         if not config_path.is_file():
@@ -156,8 +172,12 @@ class ONNXBertClassifier:
         if not isinstance(id2label, dict):
             return list(range(num_outputs))
 
-        toxic_indices = [int(idx) for idx, label in id2label.items() if _is_toxic_label(str(label))]
-        return toxic_indices or list(range(num_outputs))
+        target_indices = [
+            int(idx)
+            for idx, label in id2label.items()
+            if _label_matches_keyword(str(label), self._target_keyword)
+        ]
+        return target_indices or list(range(num_outputs))
 
     @staticmethod
     def _output_width(session: Any) -> int:
@@ -189,11 +209,12 @@ class ONNXBertClassifier:
                 feed["token_type_ids"] = np.zeros_like(input_ids)
 
             (logits,) = session.run(None, feed)
-            # unitary/toxic-bert is a multi-label classifier (sigmoid per
-            # label, not a single softmax) — matches its real HF config.
+            # unitary/toxic-bert (and the other 3 reference models) are
+            # multi-label classifiers (sigmoid per label, not a single
+            # softmax) — matches their real HF configs.
             probs = 1.0 / (1.0 + np.exp(-logits[0]))
 
-            candidates = self._toxic_label_indices or list(range(len(probs)))
+            candidates = self._target_label_indices or list(range(len(probs)))
             return float(max(probs[i] for i in candidates))
         except Exception as exc:
             raise GuardrailInferenceError(

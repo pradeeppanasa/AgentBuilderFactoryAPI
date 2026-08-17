@@ -28,7 +28,7 @@ import pytest
 from app.config import settings
 from app.modules.guardrails.bert_classifier import ONNXBertClassifier
 from app.modules.guardrails.engine import GuardrailEngine
-from app.modules.guardrails.models import GuardrailPolicy
+from app.modules.guardrails.models import BertConfig, GuardrailPolicy
 from tests.fakes import FakeBedrockGuardrailClient
 from tests.guardrail_onnx_fixtures import build_synthetic_model_dir
 
@@ -51,6 +51,13 @@ def _policy(**overrides: object) -> GuardrailPolicy:
         "created_by": "tester@example.com",
         "created_at": now,
         "updated_at": now,
+        # This file only builds a real ONNX artifact for the toxicity
+        # model (build_synthetic_model_dir) — the other 3 checks default
+        # to enabled and would raise GuardrailModelUnavailableError
+        # against a model directory that was never built here.
+        "bert": BertConfig(
+            check_nsfw=False, check_prompt_injection=False, check_gibberish=False
+        ),
     }
     data.update(overrides)
     return GuardrailPolicy(**data)

@@ -30,6 +30,15 @@ AgentStatus = Literal[
 
 VersionStatus = Literal["DRAFT", "TESTING", "BLOCKED", "LIVE", "SUPERSEDED", "ROLLED_BACK"]
 
+ProjectLifecycleStatus = Literal["draft", "published", "deprecated", "archived"]
+"""Section 38.11's archival lifecycle. Deliberately a separate axis from
+`AgentStatus`/`VersionStatus` above, which drive the 12-stage automated
+deployment pipeline (F1/F12) already built and tested across Phases 2-17 —
+those are untouched by Section 38. This field is populated only for agents
+created/managed through the project-scoped routes
+(`/api/v1/projects/{project_id}/agents/...`); flat `/api/v1/agents/...`
+agents leave it None and are unaffected."""
+
 
 # ── Nested configuration (Section 4.3) ──────────────────────────────────────
 
@@ -114,6 +123,16 @@ class OrchestrationConfig(BaseModel):
     max_delegation_depth: int = 2  # Default 2, maximum 5 (A4)
     pipeline_config: PipelineConfig | None = None
 
+    # ── Section 38.5 — additive alongside the fields above. sub_agents/
+    # is_manager/routing_strategy remain authoritative for the existing A2A
+    # routing engine (Section 18/26) and circular-dependency validation
+    # (A5) — sub_agent_ids is a simplified id-only list a project-scoped
+    # agent can populate without the full SubAgentRef shape.
+    parent_orchestrator_id: str | None = None
+    sub_agent_ids: list[str] = Field(default_factory=list)
+    execution_mode: str | None = None  # e.g. "sync" | "async"
+    hitl_enabled: bool = False
+
 
 class MCPServerConfig(BaseModel):
     server_id: str
@@ -193,6 +212,45 @@ class OutputSchemaConfig(BaseModel):
     fallback_on_max_retries: str = "return_error"  # return_raw | return_error
 
 
+# ── Section 38.5 — Advanced Agent Configuration (Projects) ─────────────────
+# Additive, same treatment as the Section 37 block above: nothing here
+# replaces an existing field or model.
+
+
+class TriggerConfig(BaseModel):
+    """How a project-scoped agent can be invoked. Distinct from the
+    infrastructure-backed ScheduleRecord/TriggerRecord (Section 19,
+    EventBridge-backed) — this is a declarative summary carried on the
+    agent's own configuration, not a provisioned AWS resource."""
+
+    trigger_type: str = "manual"  # manual | schedule | webhook | event
+    schedule_cron: str | None = None
+    webhook_enabled: bool = False
+
+
+class AccessConfig(BaseModel):
+    """Who can see/use a project-scoped agent."""
+
+    visibility: str = "private"  # private | project | public
+    allowed_user_emails: list[str] = Field(default_factory=list)
+    allowed_roles: list[str] = Field(default_factory=list)
+
+
+class HitlConfig(BaseModel):
+    """Routes agent invocations needing a human decision into the
+    panasa-hitl-reviews queue (Section 38.8). Distinct from the existing
+    `HumanReviewConfig` above (Section 4.3/8), which drives the Step
+    Functions + SNS "human_loop" IaC module for the automated deployment
+    pipeline's own approval gates — this is the newer, simpler, in-app
+    review queue a project-scoped agent's *runtime invocations* can opt
+    into. Both coexist; neither replaces the other."""
+
+    enabled: bool = False
+    trigger_conditions: list[str] = Field(default_factory=list)
+    reviewer_emails: list[str] = Field(default_factory=list)
+    timeout_hours: int = 24
+
+
 class AgentConfiguration(BaseModel):
     # Model
     model_id: str
@@ -260,6 +318,34 @@ class AgentConfiguration(BaseModel):
     memory_config: MemoryAdvancedConfig | None = None
     tool_instances: list[ToolInstanceConfig] = Field(default_factory=list)
     output_schema: OutputSchemaConfig | None = None
+
+    # ── Section 38.5 (Advanced Agent Configuration / Projects) ──────────
+    # "Identity" fields (name/description/agent_type/tags/project_id/
+    # owner_email) already live on AgentRecord, not here — see
+    # AgentRecord.project_id/owner_email instead of duplicating them onto
+    # AgentConfiguration. "Versioning" fields (version/status/changelog)
+    # likewise map onto AgentRecord.current_version /
+    # AgentRecord.project_lifecycle_status / AgentVersionRecord.
+    # change_description — no new fields needed for those either.
+
+    # Persona
+    persona_name: str | None = None
+    greeting_message: str | None = None
+    response_tone: str | None = None  # e.g. professional | friendly | technical
+
+    # Conversation
+    max_turns: int | None = None
+    session_timeout_minutes: int | None = None
+
+    # Skill catalog references (Section 38.3's reusable prompt-capability
+    # Skill, panasa-skills) — distinct from `skills: list[SkillConfig]`
+    # above (Section 29's built-in platform capabilities, e.g.
+    # code_execution/web_search).
+    skill_ids: list[str] = Field(default_factory=list)
+
+    trigger: TriggerConfig | None = None
+    access: AccessConfig | None = None
+    hitl: HitlConfig | None = None
 
 
 # ── Agent Capability Contract (Amendment A1 / R11) ──────────────────────────
@@ -351,6 +437,16 @@ class AgentRecord(BaseModel):
     updated_at: str
     tags: dict[str, str] = Field(default_factory=dict)
 
+    # ── Section 38 (Projects) — additive. None for every agent created via
+    # the flat /api/v1/agents routes (Section 5.1); populated only for
+    # agents created/managed via /api/v1/projects/{project_id}/agents/...
+    project_id: str | None = None
+    project_lifecycle_status: ProjectLifecycleStatus | None = None
+    """Section 38.11's draft/published/deprecated/archived lifecycle — a
+    separate axis from `status` above (which drives the unrelated 12-stage
+    deployment pipeline, F1/F12). See the ProjectLifecycleStatus docstring."""
+    owner_email: str | None = None  # Section 38.5 — business owner
+
 
 class AgentVersionRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -389,3 +485,10 @@ class AgentVersionRecord(BaseModel):
 
     # Rollback linkage
     rolled_back_from_version: int | None = None
+
+    # Section 38.11 — per-version draft/published/deprecated/archived
+    # status for project-scoped agents (None for flat /api/v1/agents
+    # versions). Mutated via AgentRegistryStore.publish_agent/archive_agent/
+    # rollback_project_agent — a mutable derived field like iac_version
+    # etc. above, not part of the immutable configuration snapshot.
+    project_lifecycle_status: ProjectLifecycleStatus | None = None

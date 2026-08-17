@@ -41,6 +41,26 @@ class Settings(BaseSettings):
     dynamodb_knowledge_bases_table: str = "panasa-knowledge-bases"
     dynamodb_guardrail_policies_table: str = "panasa-guardrail-policies"
     dynamodb_playground_sessions_table: str = "panasa-playground-sessions"
+    # Section 37.15 (2026-08-16) — STS AssumeRole credential bindings for
+    # Bedrock guardrail provisioning across accounts.
+    dynamodb_bedrock_credentials_table: str = "panasa-bedrock-credentials"
+
+    # ── Projects / Skills / HITL (CLAUDE.md Section 38) ────────────────────
+    dynamodb_projects_table: str = "panasa-projects"
+    # dynamodb_skills_table (defined above) is repurposed here for Section
+    # 38.3's reusable prompt-capability Skill — Section 4.9/29's built-in
+    # platform-capability Skill concept was never implemented in this
+    # codebase, so there is no real collision, only a shared table name.
+    dynamodb_hitl_reviews_table: str = "panasa-hitl-reviews"
+
+    # ── Admin observability settings (Section 39/R45, R45-7/8) ─────────────
+    dynamodb_platform_settings_table: str = "panasa-platform-settings"
+
+    # ── Task Planner (Section 38.6/38.7 — A2-3) ────────────────────────────
+    # Factory-internal call (Section 5.11/22 rule): uses the Runtime's own
+    # Bedrock access, never the generated agent's own model config.
+    task_planner_model_id: str = "anthropic.claude-3-5-haiku-20241022-v1:0"
+    task_planner_max_tokens: int = 2048
 
     # ── Deployment pipeline ───────────────────────────────────────
     eventbridge_bus_name: str = "panasa-agent-builder"
@@ -87,6 +107,11 @@ class Settings(BaseSettings):
 
     # ── Observability ──────────────────────────────────────────────────
     log_level: str = "INFO"
+    # R45: Langfuse is an optional, customer-routed backend — never a
+    # required runtime dependency. Explicit flag (rather than gating purely
+    # on langfuse_host being set) so `.env.example` documents the opt-in
+    # nature directly, matching Section 3/32's LANGFUSE_ENABLED=false.
+    langfuse_enabled: bool = False
     langfuse_host: str | None = None
     langfuse_public_key: str | None = None
     langfuse_secret_key: str | None = None

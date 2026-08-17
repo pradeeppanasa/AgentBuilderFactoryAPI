@@ -33,6 +33,7 @@ from app.modules.registry.models import (
     AgentType,
     AgentVersionRecord,
     EvaluationResult,
+    ProjectLifecycleStatus,
 )
 from app.modules.registry.versioner import AgentVersioner
 from app.shared.dynamodb_types import decimal_to_native
@@ -66,6 +67,21 @@ def _decode_cursor(cursor: str) -> dict[str, Any]:
     return decoded
 
 
+_PROJECT_INDEX = "project-index"
+
+
+def _agent_item(record: AgentRecord) -> dict[str, Any]:
+    """AgentRecord -> DynamoDB item. `project_id` is the project-index GSI's
+    hash key — DynamoDB rejects a PutItem where a GSI key attribute is
+    present with a NULL type, so it must be OMITTED (not written as
+    null/None) for the many agents that have no project_id (every flat
+    /api/v1/agents agent, Section 5.1 — project scoping is Section 38-only)."""
+    item = record.model_dump(mode="json")
+    if item.get("project_id") is None:
+        item.pop("project_id", None)
+    return item
+
+
 class AgentRegistryStore:
     def __init__(self, dynamodb_resource: Any, settings: Settings) -> None:
         self._dynamodb = dynamodb_resource
@@ -89,6 +105,14 @@ class AgentRegistryStore:
                 attribute_definitions=[
                     {"AttributeName": "tenant_id", "AttributeType": "S"},
                     {"AttributeName": "agent_id", "AttributeType": "S"},
+                    {"AttributeName": "project_id", "AttributeType": "S"},
+                ],
+                global_secondary_indexes=[
+                    {
+                        "IndexName": _PROJECT_INDEX,
+                        "KeySchema": [{"AttributeName": "project_id", "KeyType": "HASH"}],
+                        "Projection": {"ProjectionType": "ALL"},
+                    }
                 ],
             ),
             self._ensure_table(
@@ -109,15 +133,19 @@ class AgentRegistryStore:
         table_name: str,
         key_schema: list[dict[str, str]],
         attribute_definitions: list[dict[str, str]],
+        global_secondary_indexes: list[dict[str, Any]] | None = None,
     ) -> None:
         def _create() -> None:
             try:
-                table = self._dynamodb.create_table(
-                    TableName=table_name,
-                    KeySchema=key_schema,
-                    AttributeDefinitions=attribute_definitions,
-                    BillingMode="PAY_PER_REQUEST",
-                )
+                kwargs: dict[str, Any] = {
+                    "TableName": table_name,
+                    "KeySchema": key_schema,
+                    "AttributeDefinitions": attribute_definitions,
+                    "BillingMode": "PAY_PER_REQUEST",
+                }
+                if global_secondary_indexes:
+                    kwargs["GlobalSecondaryIndexes"] = global_secondary_indexes
+                table = self._dynamodb.create_table(**kwargs)
                 table.wait_until_exists()
             except ClientError as exc:
                 if exc.response["Error"]["Code"] != "ResourceInUseException":
@@ -136,6 +164,8 @@ class AgentRegistryStore:
         agent_type: AgentType,
         configuration: AgentConfiguration,
         created_by: str,
+        project_id: str | None = None,
+        owner_email: str | None = None,
     ) -> tuple[AgentRecord, AgentVersionRecord]:
         await self._validate_no_circular_dependency(
             tenant_id, agent_id=None, configuration=configuration
@@ -161,6 +191,9 @@ class AgentRegistryStore:
             updated_by=created_by,
             updated_at=now,
             tags={},
+            project_id=project_id,
+            project_lifecycle_status="draft" if project_id is not None else None,
+            owner_email=owner_email,
         )
         version_record = self._versioner.build_version(
             agent_id=agent_id,
@@ -172,7 +205,7 @@ class AgentRegistryStore:
             change_description="Initial version",
         )
 
-        await asyncio.to_thread(self._agents_table.put_item, Item=record.model_dump(mode="json"))
+        await asyncio.to_thread(self._agents_table.put_item, Item=_agent_item(record))
         await self._versioner.write(version_record)
         return record, version_record
 
@@ -265,7 +298,7 @@ class AgentRegistryStore:
             update={"status": "DEPLOYING", "updated_by": updated_by, "updated_at": _now()}
         )
         await asyncio.to_thread(
-            self._agents_table.put_item, Item=updated_record.model_dump(mode="json")
+            self._agents_table.put_item, Item=_agent_item(updated_record)
         )
         return updated_record
 
@@ -286,7 +319,7 @@ class AgentRegistryStore:
             update={"status": new_status, "updated_by": updated_by, "updated_at": _now()}
         )
         await asyncio.to_thread(
-            self._agents_table.put_item, Item=updated_record.model_dump(mode="json")
+            self._agents_table.put_item, Item=_agent_item(updated_record)
         )
         return updated_record
 
@@ -307,7 +340,7 @@ class AgentRegistryStore:
             }
         )
         await asyncio.to_thread(
-            self._agents_table.put_item, Item=updated_record.model_dump(mode="json")
+            self._agents_table.put_item, Item=_agent_item(updated_record)
         )
         return updated_record
 
@@ -324,7 +357,7 @@ class AgentRegistryStore:
             update={"status": new_status, "updated_by": updated_by, "updated_at": _now()}
         )
         await asyncio.to_thread(
-            self._agents_table.put_item, Item=updated_record.model_dump(mode="json")
+            self._agents_table.put_item, Item=_agent_item(updated_record)
         )
         return updated_record
 
@@ -350,6 +383,28 @@ class AgentRegistryStore:
         if "LastEvaluatedKey" in response:
             next_cursor = _encode_cursor(response["LastEvaluatedKey"])
         return records, next_cursor
+
+    async def list_agents_by_project(self, tenant_id: str, project_id: str) -> list[AgentRecord]:
+        """Section 38 — agents scoped to a project. Queries the
+        project-index GSI (hash key = project_id only) and filters by
+        tenant_id in the same call (R01) since the GSI itself isn't
+        tenant-scoped — matches DeploymentStatusStore's deployment-id-index
+        pattern."""
+        response = await asyncio.to_thread(
+            self._agents_table.query,
+            IndexName=_PROJECT_INDEX,
+            KeyConditionExpression=Key("project_id").eq(project_id),
+            FilterExpression=Attr("tenant_id").eq(tenant_id),
+        )
+        return [AgentRecord(**decimal_to_native(item)) for item in response.get("Items", [])]
+
+    async def get_agent_in_project(
+        self, tenant_id: str, project_id: str, agent_id: str
+    ) -> AgentRecord | None:
+        record = await self.get_agent(tenant_id, agent_id)
+        if record is None or record.project_id != project_id:
+            return None
+        return record
 
     # ── Update / rollback (both create a new version — never overwrite) ─
 
@@ -434,7 +489,7 @@ class AgentRegistryStore:
 
         await self._versioner.write(version_record)
         await asyncio.to_thread(
-            self._agents_table.put_item, Item=updated_record.model_dump(mode="json")
+            self._agents_table.put_item, Item=_agent_item(updated_record)
         )
         return updated_record, version_record
 
@@ -449,9 +504,130 @@ class AgentRegistryStore:
             update={"status": "DEPRECATED", "updated_by": updated_by, "updated_at": _now()}
         )
         await asyncio.to_thread(
-            self._agents_table.put_item, Item=updated_record.model_dump(mode="json")
+            self._agents_table.put_item, Item=_agent_item(updated_record)
         )
         return updated_record
+
+    # ── Project lifecycle (Section 38.11) — draft/published/deprecated/
+    # archived. Distinct from soft_delete_agent above (which sets the
+    # unrelated pipeline `status` to DEPRECATED) — these methods only ever
+    # touch `project_lifecycle_status`, never `status`/`live_version`.
+
+    async def set_project_draft_after_edit(
+        self, tenant_id: str, agent_id: str, actor: str
+    ) -> AgentRecord:
+        """Section 38.11: "Edit published agent: auto-create new draft
+        version. Never mutate a published record in place." Called by the
+        API layer right after update_agent() creates the new version —
+        applied unconditionally (not only when the prior status was
+        "published") so an edited version is never live until explicitly
+        (re)published."""
+        record = await self._require_agent(tenant_id, agent_id)
+        await self._versioner.record_derived_fields(
+            agent_id, record.current_version, project_lifecycle_status="draft"
+        )
+        updated_record = record.model_copy(
+            update={"project_lifecycle_status": "draft", "updated_by": actor, "updated_at": _now()}
+        )
+        await asyncio.to_thread(self._agents_table.put_item, Item=_agent_item(updated_record))
+        return updated_record
+
+    async def publish_agent(self, tenant_id: str, agent_id: str, actor: str) -> AgentRecord:
+        """Publishes the agent's current version. If a different version was
+        previously published, it is marked "deprecated" (no data deleted) —
+        matches the "deprecated set automatically on republish" rule."""
+        record = await self._require_agent(tenant_id, agent_id)
+
+        previous_published = await self._find_version_with_status(agent_id, "published")
+        if previous_published is not None and previous_published.version != record.current_version:
+            await self._versioner.record_derived_fields(
+                agent_id, previous_published.version, project_lifecycle_status="deprecated"
+            )
+
+        await self._versioner.record_derived_fields(
+            agent_id, record.current_version, project_lifecycle_status="published"
+        )
+        updated_record = record.model_copy(
+            update={
+                "project_lifecycle_status": "published",
+                "updated_by": actor,
+                "updated_at": _now(),
+            }
+        )
+        await asyncio.to_thread(self._agents_table.put_item, Item=_agent_item(updated_record))
+        return updated_record
+
+    async def archive_agent(self, tenant_id: str, agent_id: str, actor: str) -> AgentRecord:
+        """Archives the agent. All data is kept — this is never a delete."""
+        record = await self._require_agent(tenant_id, agent_id)
+        await self._versioner.record_derived_fields(
+            agent_id, record.current_version, project_lifecycle_status="archived"
+        )
+        updated_record = record.model_copy(
+            update={
+                "project_lifecycle_status": "archived",
+                "updated_by": actor,
+                "updated_at": _now(),
+            }
+        )
+        await asyncio.to_thread(self._agents_table.put_item, Item=_agent_item(updated_record))
+        return updated_record
+
+    async def rollback_project_agent(
+        self, tenant_id: str, agent_id: str, target_version: int, actor: str
+    ) -> AgentRecord:
+        """Section 38.11: "set target version to published, set current
+        published to deprecated. No data deleted." — an in-place status
+        flip on existing immutable version records plus repointing
+        `current_version`, NOT a new version (unlike the pipeline's own
+        rollback_agent, which always creates version N+1 per R23)."""
+        record = await self._require_agent(tenant_id, agent_id)
+        target = await self._versioner.get(agent_id, target_version)
+        if target is None:
+            raise VersionNotFoundError(agent_id, target_version)
+        if target_version == record.current_version:
+            raise InvalidRollbackError(
+                f"Version {target_version} is already the current version of {agent_id!r}"
+            )
+
+        await self._versioner.record_derived_fields(
+            agent_id, record.current_version, project_lifecycle_status="deprecated"
+        )
+        await self._versioner.record_derived_fields(
+            agent_id, target_version, project_lifecycle_status="published"
+        )
+        updated_record = record.model_copy(
+            update={
+                "current_version": target_version,
+                "project_lifecycle_status": "published",
+                "updated_by": actor,
+                "updated_at": _now(),
+            }
+        )
+        await asyncio.to_thread(self._agents_table.put_item, Item=_agent_item(updated_record))
+        return updated_record
+
+    async def hard_delete_agent(self, tenant_id: str, agent_id: str) -> None:
+        """Section 38.11: only ever called by the API layer after verifying
+        project_lifecycle_status == "archived" and zero references — a
+        genuinely irreversible delete of the AgentRecord and every one of
+        its AgentVersionRecords."""
+        record = await self._require_agent(tenant_id, agent_id)
+        versions = await self._versioner.list_all(agent_id)
+        for version in versions:
+            await self._versioner.delete(agent_id, version.version)
+        await asyncio.to_thread(
+            self._agents_table.delete_item,
+            Key={"tenant_id": tenant_id, "agent_id": record.agent_id},
+        )
+
+    async def _find_version_with_status(
+        self, agent_id: str, project_lifecycle_status: ProjectLifecycleStatus
+    ) -> AgentVersionRecord | None:
+        for version in await self._versioner.list_all(agent_id):
+            if version.project_lifecycle_status == project_lifecycle_status:
+                return version
+        return None
 
     # ── Circular dependency validation (A5) ─────────────────────────────
 

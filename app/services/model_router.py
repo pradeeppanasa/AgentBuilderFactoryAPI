@@ -96,3 +96,31 @@ async def call_model(
         cost = None
 
     return text, cost, _extract_usage(response)
+
+
+async def call_factory_model(
+    model_id: str,
+    system_prompt: str,
+    user_message: str,
+    max_tokens: int,
+    temperature: float = 0.2,
+) -> str:
+    """Factory-internal LLM call (Section 5.11/22): "The prompt generation
+    call uses the Factory Runtime's own LLM access (Bedrock). It never
+    touches the generated agent's model." Used by the Task Planner and any
+    future prompt-generation endpoint — anything that needs an LLM call
+    before an AgentConfiguration exists. Always Bedrock, always via LiteLLM
+    (R27) — no per-call provider choice, unlike `call_model` above.
+    """
+    response = await litellm.acompletion(
+        model=f"{PROVIDER_PREFIX['bedrock']}{model_id}",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        max_tokens=max_tokens,
+        temperature=temperature,
+        num_retries=3,
+    )
+    text: str = response.choices[0].message.content
+    return text

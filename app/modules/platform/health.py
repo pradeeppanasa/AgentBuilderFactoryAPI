@@ -62,7 +62,7 @@ def check_model_router() -> str:
 
 
 async def check_observability(settings: Settings) -> str:
-    if not settings.langfuse_host:
+    if not settings.langfuse_enabled or not settings.langfuse_host:
         return "disabled"
     try:
         async with httpx.AsyncClient(timeout=_OBSERVABILITY_TIMEOUT_SECONDS) as client:
