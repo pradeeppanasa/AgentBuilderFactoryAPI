@@ -61,6 +61,139 @@ async def test_create_list_get_update_project(make_user_and_token) -> None:
         assert updated.json()["description"] == "d"  # untouched field preserved
 
 
+async def test_create_project_response_shape(make_user_and_token) -> None:
+    """Matches panasa-agent-builder-ui/src/types/project.ts exactly —
+    status/agent_ids/owner_email/tags/guardrail_policy_id must all be
+    present, not just name/description/project_id."""
+    dev_user, dev_token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/projects",
+            json={
+                "name": "KYB Initiative",
+                "description": "d",
+                "tags": ["kyb", "compliance"],
+            },
+            headers=_bearer(dev_token),
+        )
+        assert created.status_code == 201
+        body = created.json()
+        assert body["status"] == "active"
+        assert body["agent_ids"] == []
+        assert body["owner_email"] == dev_user.email
+        assert body["tags"] == ["kyb", "compliance"]
+        assert body["guardrail_policy_id"] is None
+
+
+async def test_creating_project_agent_appends_to_agent_ids(make_user_and_token) -> None:
+    _, dev_token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        project_id = client.post(
+            "/api/v1/projects",
+            json={"name": "P", "description": "d"},
+            headers=_bearer(dev_token),
+        ).json()["project_id"]
+
+        agent_id = client.post(
+            f"/api/v1/projects/{project_id}/agents",
+            json={
+                "name": "Agent A",
+                "description": "d",
+                "business_purpose": "p",
+                "agent_type": "standard",
+                "configuration": _config(),
+            },
+            headers=_bearer(dev_token),
+        ).json()["agent_id"]
+
+        project = client.get(f"/api/v1/projects/{project_id}", headers=_bearer(dev_token)).json()
+        assert project["agent_ids"] == [agent_id]
+
+
+async def test_hard_deleting_project_agent_removes_from_agent_ids(make_user_and_token) -> None:
+    _, dev_token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        project_id = client.post(
+            "/api/v1/projects",
+            json={"name": "P", "description": "d"},
+            headers=_bearer(dev_token),
+        ).json()["project_id"]
+
+        agent_id = client.post(
+            f"/api/v1/projects/{project_id}/agents",
+            json={
+                "name": "Agent A",
+                "description": "d",
+                "business_purpose": "p",
+                "agent_type": "standard",
+                "configuration": _config(),
+            },
+            headers=_bearer(dev_token),
+        ).json()["agent_id"]
+
+        client.post(
+            f"/api/v1/projects/{project_id}/agents/{agent_id}/archive", headers=_bearer(dev_token)
+        )
+        deleted = client.delete(
+            f"/api/v1/projects/{project_id}/agents/{agent_id}", headers=_bearer(dev_token)
+        )
+        assert deleted.status_code == 204
+
+        project = client.get(f"/api/v1/projects/{project_id}", headers=_bearer(dev_token)).json()
+        assert project["agent_ids"] == []
+
+
+async def test_update_project_tags_and_guardrail_policy(make_user_and_token) -> None:
+    _, dev_token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        project_id = client.post(
+            "/api/v1/projects",
+            json={"name": "P", "description": "d"},
+            headers=_bearer(dev_token),
+        ).json()["project_id"]
+
+        updated = client.put(
+            f"/api/v1/projects/{project_id}",
+            json={"tags": ["new-tag"], "guardrail_policy_id": "policy-123"},
+            headers=_bearer(dev_token),
+        )
+        assert updated.status_code == 200
+        body = updated.json()
+        assert body["tags"] == ["new-tag"]
+        assert body["guardrail_policy_id"] == "policy-123"
+
+
+async def test_archive_and_restore_project_via_status_update(make_user_and_token) -> None:
+    _, dev_token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        project_id = client.post(
+            "/api/v1/projects",
+            json={"name": "P", "description": "d"},
+            headers=_bearer(dev_token),
+        ).json()["project_id"]
+
+        archived = client.put(
+            f"/api/v1/projects/{project_id}",
+            json={"status": "archived"},
+            headers=_bearer(dev_token),
+        )
+        assert archived.status_code == 200
+        assert archived.json()["status"] == "archived"
+
+        restored = client.put(
+            f"/api/v1/projects/{project_id}",
+            json={"status": "active"},
+            headers=_bearer(dev_token),
+        )
+        assert restored.status_code == 200
+        assert restored.json()["status"] == "active"
+
+
 async def test_get_unknown_project_returns_404(make_user_and_token) -> None:
     _, dev_token = await make_user_and_token(TENANT_A, role="developer")
 
@@ -103,7 +236,7 @@ async def test_delete_project_blocked_while_it_has_agents(make_user_and_token) -
                 "name": "Agent A",
                 "description": "d",
                 "business_purpose": "p",
-                "agent_type": "task",
+                "agent_type": "standard",
                 "configuration": _config(),
             },
             headers=_bearer(dev_token),
@@ -114,6 +247,7 @@ async def test_delete_project_blocked_while_it_has_agents(make_user_and_token) -
         body = denied.json()["detail"]
         assert body["referenced_by"][0]["type"] == "agent"
         assert body["referenced_by"][0]["project"] == project_id
+        assert body["referenced_by"][0]["status"] == "draft"
 
 
 async def test_delete_empty_project_succeeds(make_user_and_token) -> None:
@@ -147,7 +281,7 @@ def _create_project_and_agent(client: TestClient, token: str) -> tuple[str, str]
             "name": "Agent A",
             "description": "d",
             "business_purpose": "p",
-            "agent_type": "task",
+            "agent_type": "standard",
             "configuration": _config(),
             "owner_email": "owner@example.com",
         },
@@ -174,7 +308,7 @@ async def test_create_project_agent_starts_as_draft(make_user_and_token) -> None
                 "name": "Agent A",
                 "description": "d",
                 "business_purpose": "p",
-                "agent_type": "task",
+                "agent_type": "standard",
                 "configuration": _config(),
             },
             headers=_bearer(dev_token),
@@ -202,7 +336,7 @@ async def test_create_agent_requires_existing_project(make_user_and_token) -> No
                 "name": "Agent A",
                 "description": "d",
                 "business_purpose": "p",
-                "agent_type": "task",
+                "agent_type": "standard",
                 "configuration": _config(),
             },
             headers=_bearer(dev_token),

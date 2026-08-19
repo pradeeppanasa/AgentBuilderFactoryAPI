@@ -56,11 +56,40 @@ class Settings(BaseSettings):
     # ── Admin observability settings (Section 39/R45, R45-7/8) ─────────────
     dynamodb_platform_settings_table: str = "panasa-platform-settings"
 
+    # ── Observability — Runs Feature, Phase 1 ───────────────────────────────
+    dynamodb_runs_table: str = "panasa-runs"
+
     # ── Task Planner (Section 38.6/38.7 — A2-3) ────────────────────────────
     # Factory-internal call (Section 5.11/22 rule): uses the Runtime's own
     # Bedrock access, never the generated agent's own model config.
     task_planner_model_id: str = "anthropic.claude-3-5-haiku-20241022-v1:0"
     task_planner_max_tokens: int = 2048
+
+    # ── Playground mock mode (dev/test only) ───────────────────────────────
+    # Global opt-in for POST /agents/{id}/playground?mock=true's per-request
+    # flag — lets a whole dev environment (e.g. local Docker Compose, where
+    # AWS_ACCESS_KEY_ID=local can't authenticate to real Bedrock) skip the
+    # LLM/guardrail Bedrock calls entirely without every caller passing the
+    # query param. Never set true in prototype/enterprise deployments.
+    mock_llm: bool = False
+
+    # QA A-05 — same rationale as mock_llm above, but for guardrail policy
+    # save's Bedrock CreateGuardrail/UpdateGuardrail auto-provisioning
+    # (Section 37.7), which fails with UnrecognizedClientException against
+    # local dev's placeholder AWS credentials. Never set true in
+    # prototype/enterprise deployments.
+    mock_bedrock_guardrails: bool = False
+
+    # Observability Runs Feature Phase 1 — there is no real Generated Agent
+    # Runtime deployed anywhere in this Stage 1 environment (R46: only Local
+    # Validation ever runs — no real `terraform apply`), so there is no real
+    # run telemetry to show. Gates POST /agents/{id}/runs/seed-demo, which
+    # inserts four synthetic RunRecords (success/failed/running/scheduler)
+    # so the Runs list/detail/filters can be exercised end to end. Seeded
+    # runs carry no "test data" marker — indistinguishable from a real run
+    # in the UI, by design. Never set true in prototype/enterprise
+    # deployments serving real traffic.
+    seed_runs_enabled: bool = False
 
     # ── Deployment pipeline ───────────────────────────────────────
     eventbridge_bus_name: str = "panasa-agent-builder"
@@ -76,6 +105,13 @@ class Settings(BaseSettings):
     # ── Terraform backend (enterprise only) ────────────────────────
     tf_state_bucket: str | None = None
     tf_state_lock_table: str | None = None
+
+    # ── Development Terraform Validation Modes ─────────────────────────────
+    # "local" (Stage 1, Section 35) is always available and 100% AWS-
+    # independent. The "panasa_vpc"/"customer_vpc" modes are admin/developer-
+    # only placeholders for later stages — default False keeps them hidden
+    # on any deployment where an operator hasn't deliberately opted in.
+    dev_validation_extended_modes_enabled: bool = False
 
     # ── Platform ──────────────────────────────────────────────────────
     platform_version: str = "1.0.0"

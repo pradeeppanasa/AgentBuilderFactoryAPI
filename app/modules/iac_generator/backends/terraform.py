@@ -12,6 +12,7 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from app.modules.iac_generator.backends.base import IaCBackend
+from app.modules.iac_generator.naming import bedrock_guardrail_name
 from app.modules.registry.models import AgentConfiguration
 
 _TEMPLATES_ROOT = Path(__file__).parent.parent / "templates" / "terraform"
@@ -29,6 +30,11 @@ class TerraformBackend(IaCBackend):
             lstrip_blocks=True,
             keep_trailing_newline=True,
         )
+        # QA I-02 — templates call bedrock_guardrail_name(agent_id) instead
+        # of interpolating "panasa-{{ agent_id }}-guardrail" literally, so
+        # long agent_ids get truncated instead of exceeding AWS's 50-char
+        # Bedrock Guardrail name limit.
+        self._env.globals["bedrock_guardrail_name"] = bedrock_guardrail_name
 
     def render(
         self,

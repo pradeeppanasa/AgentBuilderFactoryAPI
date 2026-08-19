@@ -20,6 +20,7 @@ class ReferencingResource(BaseModel):
     id: str
     name: str
     project: str | None = None
+    status: str | None = None
 
 
 def raise_if_referenced(referencing: list[ReferencingResource]) -> None:

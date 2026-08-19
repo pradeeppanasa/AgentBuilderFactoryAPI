@@ -251,7 +251,7 @@ async def test_phase17_full_lifecycle_e2e(make_user_and_token, fake_git: FakeGit
                 "name": "KYC Agent",
                 "description": "Know Your Customer verification agent",
                 "business_purpose": "Automate KYC document verification for onboarding",
-                "agent_type": "task",
+                "agent_type": "standard",
                 "configuration": _kyc_configuration(),
             },
             headers=headers,

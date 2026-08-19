@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from botocore.exceptions import ClientError
+
 from app.modules.git_provider.base import GitProvider
 
 
@@ -143,6 +145,35 @@ class FailingBedrockControlPlaneClient:
 
     def delete_guardrail(self, **kwargs: Any) -> dict[str, Any]:
         raise RuntimeError("simulated Bedrock control-plane outage")
+
+
+class InvalidCredentialsBedrockControlPlaneClient:
+    """create_guardrail/update_guardrail raise a real botocore ClientError
+    shaped like AWS's actual response to an unrecognized/invalid access
+    key — QA A-05's exact reported failure mode, distinct from
+    FailingBedrockControlPlaneClient's generic RuntimeError above."""
+
+    def create_guardrail(self, **kwargs: Any) -> dict[str, Any]:
+        raise ClientError(
+            {
+                "Error": {
+                    "Code": "UnrecognizedClientException",
+                    "Message": "The security token included in the request is invalid.",
+                }
+            },
+            "CreateGuardrail",
+        )
+
+    def update_guardrail(self, **kwargs: Any) -> dict[str, Any]:
+        raise ClientError(
+            {
+                "Error": {
+                    "Code": "UnrecognizedClientException",
+                    "Message": "The security token included in the request is invalid.",
+                }
+            },
+            "UpdateGuardrail",
+        )
 
 
 class FakeSTSClient:

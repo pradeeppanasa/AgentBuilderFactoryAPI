@@ -10,6 +10,7 @@ doesn't model bedrock-runtime's ApplyGuardrail API.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from typing import Any
 
@@ -107,7 +108,7 @@ async def _create_agent(client: TestClient, token: str, **config_overrides: Any)
             "name": "Playground Agent",
             "description": "d",
             "business_purpose": "p",
-            "agent_type": "conversational",
+            "agent_type": "standard",
             "configuration": {
                 "model_id": "anthropic.claude-3-5-sonnet-20241022-v2:0",
                 "model_provider": "bedrock",
@@ -144,6 +145,147 @@ async def test_playground_turn_without_guardrail_policy(make_user_and_token) -> 
     assert body["metrics"]["tool_calls"] == []
     assert body["metrics"]["kb_retrievals"] is None
     assert body["metrics"]["memory"]["session_entries"] == 2
+
+
+async def test_playground_model_call_failure_returns_502_with_detail(
+    make_user_and_token, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """call_model has no error handling of its own — an LLM-side failure
+    (e.g. Bedrock auth rejecting local dev's placeholder credentials) must
+    never surface as a bare, detail-less 500."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        agent_id = await _create_agent(client, token)
+
+        async def _fake_acompletion_raises(**kwargs: Any) -> None:
+            raise litellm.exceptions.AuthenticationError(
+                message="Invalid Authentication",
+                llm_provider="bedrock",
+                model="anthropic.claude-3-5-sonnet-20241022-v2:0",
+            )
+
+        monkeypatch.setattr(litellm, "acompletion", _fake_acompletion_raises)
+
+        response = client.post(
+            f"/api/v1/agents/{agent_id}/playground",
+            json={"message": "hi there"},
+            headers=_bearer(token),
+        )
+
+    assert response.status_code == 502
+    detail = response.json()["detail"]
+    assert detail["error"] == "llm_auth_failed"
+    assert "credentials are invalid" in detail["message"]
+    assert detail["provider"] == "bedrock"
+    assert detail["model_id"] == "anthropic.claude-3-5-sonnet-20241022-v2:0"
+
+
+async def test_playground_mock_mode_never_calls_the_model(
+    make_user_and_token, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wizard Redesign QA A-02/U-10 — ?mock=true must short-circuit before
+    ever touching litellm, so the playground is exercisable without real
+    Bedrock credentials (e.g. against local dev's placeholder AWS creds)."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        agent_id = await _create_agent(client, token)
+
+        async def _fail_if_called(**kwargs: Any) -> None:
+            raise AssertionError("mock mode must never call litellm.acompletion")
+
+        monkeypatch.setattr(litellm, "acompletion", _fail_if_called)
+
+        response = client.post(
+            f"/api/v1/agents/{agent_id}/playground?mock=true",
+            json={"message": "hi there"},
+            headers=_bearer(token),
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["blocked"] is False
+    assert body["message"] == "Mock response — LLM not called."
+    assert body["metrics"]["tokens"]["input_tokens"] == 120
+    assert body["metrics"]["tokens"]["output_tokens"] == 64
+    assert body["metrics"]["estimated_cost_usd"] == 0.0
+    assert body["metrics"]["guardrail_decisions"] == []
+
+
+async def test_playground_mock_mode_shapes_reply_from_agents_own_output_schema(
+    make_user_and_token, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLAUDE.md Section 39.7 (A-02 clarified): the mock reply must be shaped
+    from *this agent's own* configured output_schema, not one fixed generic
+    string regardless of agent type — and never hardcoded to any one
+    domain's fields (e.g. KYC-specific keys) since /playground is shared
+    across every agent."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    async def _fail_if_called(**kwargs: Any) -> None:
+        raise AssertionError("mock mode must never call litellm.acompletion")
+
+    monkeypatch.setattr(litellm, "acompletion", _fail_if_called)
+
+    with TestClient(app) as client:
+        agent_id = await _create_agent(
+            client,
+            token,
+            output_schema={
+                "format": "json",
+                "schema_definition": {
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string", "enum": ["VERIFIED", "UNVERIFIED"]},
+                        "confidence": {"type": "number"},
+                        "flags": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            },
+        )
+
+        response = client.post(
+            f"/api/v1/agents/{agent_id}/playground?mock=true",
+            json={"message": "hi there"},
+            headers=_bearer(token),
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    parsed = json.loads(body["message"])
+    assert parsed == {"status": "VERIFIED", "confidence": 0.0, "flags": []}
+
+
+async def test_playground_mock_mode_never_calls_the_llm(
+    make_user_and_token, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wizard Redesign QA A-02/U-10 — ?mock=true must short-circuit before
+    any Bedrock call, so it works with local dev's placeholder credentials."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    async def _fail_if_called(**kwargs: Any) -> None:
+        raise AssertionError("litellm.acompletion must not be called in mock mode")
+
+    monkeypatch.setattr(litellm, "acompletion", _fail_if_called)
+
+    with TestClient(app) as client:
+        agent_id = await _create_agent(client, token)
+
+        response = client.post(
+            f"/api/v1/agents/{agent_id}/playground?mock=true",
+            json={"message": "hi there"},
+            headers=_bearer(token),
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["blocked"] is False
+    assert body["message"] == "Mock response — LLM not called."
+    assert body["metrics"]["tokens"]["input_tokens"] == 120
+    assert body["metrics"]["tokens"]["output_tokens"] == 64
+    assert body["metrics"]["estimated_cost_usd"] == 0.0
+    assert body["metrics"]["guardrail_decisions"] == []
 
 
 async def test_playground_session_round_trips_turns(make_user_and_token) -> None:

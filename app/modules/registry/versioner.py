@@ -18,7 +18,12 @@ from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
 
 from app.modules.registry.contract_generator import CapabilityContractGenerator
-from app.modules.registry.models import AgentConfiguration, AgentType, AgentVersionRecord
+from app.modules.registry.models import (
+    AgentConfiguration,
+    AgentType,
+    AgentVersionRecord,
+    normalise_agent_type,
+)
 from app.shared.dynamodb_types import decimal_to_native
 
 _JSON_FIELDS = {
@@ -42,6 +47,7 @@ _JSON_FIELDS = {
 _MUTABLE_DERIVED_FIELDS = {
     "iac_version",
     "iac_s3_key",
+    "iac_modules",
     "iac_validation_report",
     "deployment_id",
     "terraform_plan_summary",
@@ -194,4 +200,11 @@ class AgentVersioner:
         for field in _JSON_FIELDS:
             if data.get(field):
                 data[field] = json.loads(data[field])
+        # A version's capability_contract embeds its own agent_type snapshot
+        # (Amendment A1) — retired values (Section 38.6) need the same
+        # read-time normalisation as AgentRecord.agent_type, or an old
+        # version record fails to parse entirely.
+        contract = data.get("capability_contract")
+        if isinstance(contract, dict) and "agent_type" in contract:
+            contract["agent_type"] = normalise_agent_type(contract["agent_type"])
         return AgentVersionRecord(**data)

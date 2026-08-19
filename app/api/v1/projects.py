@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from app.dependencies import get_project_store, get_registry_store, get_tenant_id
 from app.modules.auth.dependencies import require_role
 from app.modules.auth.schemas import CurrentUser
-from app.modules.projects.models import ProjectRecord
+from app.modules.projects.models import ProjectRecord, ProjectStatus
 from app.modules.projects.store import ProjectNotFoundError, ProjectStore
 from app.modules.registry.models import (
     AgentConfiguration,
@@ -52,11 +52,16 @@ class ProjectListResponse(BaseModel):
 class CreateProjectRequest(BaseModel):
     name: str
     description: str
+    tags: list[str] = []
+    guardrail_policy_id: str | None = None
 
 
 class UpdateProjectRequest(BaseModel):
     name: str | None = None
     description: str | None = None
+    tags: list[str] | None = None
+    guardrail_policy_id: str | None = None
+    status: ProjectStatus | None = None
 
 
 async def _agents_referencing_project(
@@ -64,7 +69,13 @@ async def _agents_referencing_project(
 ) -> list[ReferencingResource]:
     agents = await registry_store.list_agents_by_project(tenant_id, project_id)
     return [
-        ReferencingResource(type="agent", id=a.agent_id, name=a.name, project=project_id)
+        ReferencingResource(
+            type="agent",
+            id=a.agent_id,
+            name=a.name,
+            project=project_id,
+            status=a.project_lifecycle_status,
+        )
         for a in agents
     ]
 
@@ -90,6 +101,8 @@ async def create_project(
         name=payload.name,
         description=payload.description,
         created_by=current_user.email,
+        tags=payload.tags,
+        guardrail_policy_id=payload.guardrail_policy_id,
     )
 
 
@@ -123,6 +136,9 @@ async def update_project(
             updated_by=current_user.email,
             name=payload.name,
             description=payload.description,
+            tags=payload.tags,
+            guardrail_policy_id=payload.guardrail_policy_id,
+            status=payload.status,
         )
     except ProjectNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -305,6 +321,8 @@ async def create_project_agent(
     except CircularDependencyError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
+    await project_store.add_agent_id(tenant_id, project_id, record.agent_id)
+
     return CreateProjectAgentResponse(
         agent_id=record.agent_id,
         project_id=project_id,
@@ -377,6 +395,7 @@ async def delete_project_agent(
     tenant_id: Annotated[str, Depends(get_tenant_id)],
     _current_user: Annotated[CurrentUser, Depends(require_role(*_WRITE_ROLES))],
     registry_store: Annotated[AgentRegistryStore, Depends(get_registry_store)],
+    project_store: Annotated[ProjectStore, Depends(get_project_store)],
 ) -> None:
     record = await _require_project_agent(registry_store, tenant_id, project_id, agent_id)
 
@@ -391,6 +410,7 @@ async def delete_project_agent(
 
     raise_if_referenced(await _agents_referencing_agent(registry_store, tenant_id, agent_id))
     await registry_store.hard_delete_agent(tenant_id, agent_id)
+    await project_store.remove_agent_id(tenant_id, project_id, agent_id)
 
 
 @router.post(

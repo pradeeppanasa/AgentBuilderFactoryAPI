@@ -22,7 +22,7 @@ from typing import Any
 
 from app.modules.iac_generator.backends.terraform import TerraformBackend
 from app.modules.iac_generator.conditional import resolve_required_modules
-from app.modules.iac_generator.validator import IaCValidator
+from app.modules.iac_generator.validator import IaCValidator, _parse_terraform_validate_diagnostics
 from app.modules.registry.models import AgentConfiguration
 
 _AGENT_ID = "kyc-agent-001"
@@ -266,6 +266,110 @@ async def test_naming_convention_catches_unprefixed_resource() -> None:
     assert not check.passed
     assert "my-bucket-with-no-prefix" in check.detail
     assert not report.passed
+
+
+async def test_naming_convention_accepts_truncated_guardrail_name_for_long_agent_id() -> None:
+    """QA I-02 — a real agent_id long enough that panasa-{agent_id}-guardrail
+    exceeds AWS Bedrock's 50-char guardrail name limit (e.g. a slugified
+    long agent name + random suffix) must still pass naming_convention
+    against the truncated name the template actually renders, not be
+    flagged as a violation for not using the literal full agent_id."""
+    long_agent_id = "kyc-document-verification-agent-3181e1"  # 39 chars
+    assert len(f"panasa-{long_agent_id}-guardrail") > 50  # sanity: this is the real overflow case
+
+    config = _config()
+    modules = resolve_required_modules(config)
+    files = _backend.render(long_agent_id, _TENANT_ID, _VERSION, config, modules)
+    report = await _validator.validate(
+        agent_id=long_agent_id,
+        tenant_id=_TENANT_ID,
+        version=_VERSION,
+        config=config,
+        files=files,
+        tool="terraform",
+    )
+
+    naming_check = _checks_by_name(report)["naming_convention"]
+    assert naming_check.passed, naming_check.detail
+
+    guardrail_tf = files[f"terraform/agents/{long_agent_id}/guardrails/guardrails.tf"]
+    assert 'name                      = "panasa-' in guardrail_tf
+    # The rendered name itself must respect the real AWS limit.
+    for line in guardrail_tf.splitlines():
+        if line.strip().startswith("name") and "guardrail" in line:
+            rendered_name = line.split("=", 1)[1].strip().strip('"')
+            assert len(rendered_name) <= 50
+            break
+    else:
+        raise AssertionError("guardrail name line not found in rendered template")
+
+
+def test_parse_terraform_validate_diagnostics_extracts_human_message() -> None:
+    """QA U-16 — raw `terraform validate -json` output must never reach the
+    end user verbatim; extract summary/detail per diagnostic instead."""
+    raw_json = (
+        '{"format_version":"1.0","valid":false,"error_count":1,"warning_count":0,'
+        '"diagnostics":[{"severity":"error",'
+        '"summary":"Invalid Attribute Value Length",'
+        '"detail":"expected length of name to be in the range (1 - 50), got panasa-x-guardrail",'
+        '"range":{"filename":"guardrails.tf","start":{"line":5}}}]}'
+    )
+    message = _parse_terraform_validate_diagnostics(raw_json, "")
+    assert "Invalid Attribute Value Length" in message
+    assert "expected length of name to be in the range" in message
+    assert "guardrails.tf" in message
+    # The raw JSON structure itself must not leak through.
+    assert '"severity"' not in message
+    assert '"diagnostics"' not in message
+
+
+def test_parse_terraform_validate_diagnostics_falls_back_on_unparseable_output() -> None:
+    message = _parse_terraform_validate_diagnostics("not json at all", "some stderr")
+    assert "not json at all" in message
+    assert "some stderr" in message
+
+
+async def test_dynamodb_pitr_passes_when_no_tables_present() -> None:
+    """Wizard Redesign QA A-03 — agent-level generate-iac never renders its
+    own aws_dynamodb_table resources (the real application tables are the
+    factory's own bootstrap Terraform), so this trivially passes for every
+    real agent bundle — matching the same sparse-check pattern already used
+    by iam_least_privilege_lambda_roles when an agent has no Lambda roles."""
+    report = await _render_and_validate(_config())
+    check = _checks_by_name(report)["dynamodb_pitr"]
+    assert check.passed
+    assert "no aws_dynamodb_table" in check.detail.lower()
+
+
+async def test_dynamodb_pitr_catches_table_without_pitr() -> None:
+    report = await _validate_raw(
+        """
+        resource "aws_dynamodb_table" "bad" {
+          name     = "panasa-agent-x-some-table"
+          hash_key = "id"
+        }
+        """
+    )
+    check = _checks_by_name(report)["dynamodb_pitr"]
+    assert not check.passed
+    assert "aws_dynamodb_table.bad" in check.detail
+    assert not report.passed
+
+
+async def test_dynamodb_pitr_passes_when_enabled() -> None:
+    report = await _validate_raw(
+        """
+        resource "aws_dynamodb_table" "good" {
+          name     = "panasa-agent-x-some-table"
+          hash_key = "id"
+          point_in_time_recovery {
+            enabled = true
+          }
+        }
+        """
+    )
+    check = _checks_by_name(report)["dynamodb_pitr"]
+    assert check.passed, check.detail
 
 
 async def test_tagging_catches_missing_tags() -> None:

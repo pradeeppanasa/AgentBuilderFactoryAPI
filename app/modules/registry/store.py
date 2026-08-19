@@ -34,6 +34,7 @@ from app.modules.registry.models import (
     AgentVersionRecord,
     EvaluationResult,
     ProjectLifecycleStatus,
+    normalise_agent_type,
 )
 from app.modules.registry.versioner import AgentVersioner
 from app.shared.dynamodb_types import decimal_to_native
@@ -56,6 +57,15 @@ def _new_agent_id(name: str) -> str:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _normalise_agent_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Map a retired agent_type value (Section 38.6) to the current
+    vocabulary before an AgentRecord is constructed from a raw DynamoDB
+    item — old records must stay readable with no migration required."""
+    if "agent_type" in item:
+        item = {**item, "agent_type": normalise_agent_type(item["agent_type"])}
+    return item
 
 
 def _encode_cursor(key: dict[str, Any]) -> str:
@@ -166,6 +176,8 @@ class AgentRegistryStore:
         created_by: str,
         project_id: str | None = None,
         owner_email: str | None = None,
+        tags: dict[str, str] | None = None,
+        changelog: str | None = None,
     ) -> tuple[AgentRecord, AgentVersionRecord]:
         await self._validate_no_circular_dependency(
             tenant_id, agent_id=None, configuration=configuration
@@ -190,7 +202,7 @@ class AgentRegistryStore:
             created_at=now,
             updated_by=created_by,
             updated_at=now,
-            tags={},
+            tags=tags or {},
             project_id=project_id,
             project_lifecycle_status="draft" if project_id is not None else None,
             owner_email=owner_email,
@@ -202,7 +214,7 @@ class AgentRegistryStore:
             version=1,
             configuration=configuration,
             changed_by=created_by,
-            change_description="Initial version",
+            change_description=changelog or "Initial version",
         )
 
         await asyncio.to_thread(self._agents_table.put_item, Item=_agent_item(record))
@@ -230,7 +242,7 @@ class AgentRegistryStore:
         item = response.get("Item")
         if item is None:
             return None
-        return AgentRecord(**decimal_to_native(item))
+        return AgentRecord(**_normalise_agent_item(decimal_to_native(item)))
 
     async def _require_agent(self, tenant_id: str, agent_id: str) -> AgentRecord:
         record = await self.get_agent(tenant_id, agent_id)
@@ -262,12 +274,15 @@ class AgentRegistryStore:
         version: int,
         iac_version: str,
         iac_s3_key: str,
+        iac_modules: list[str] | None = None,
         iac_validation_report: IaCValidationReport | None = None,
     ) -> None:
         await self._require_agent(tenant_id, agent_id)
         if await self._versioner.get(agent_id, version) is None:
             raise VersionNotFoundError(agent_id, version)
         fields: dict[str, Any] = {"iac_version": iac_version, "iac_s3_key": iac_s3_key}
+        if iac_modules is not None:
+            fields["iac_modules"] = iac_modules
         if iac_validation_report is not None:
             fields["iac_validation_report"] = iac_validation_report.model_dump(mode="json")
         await self._versioner.record_derived_fields(agent_id, version, **fields)
@@ -378,7 +393,10 @@ class AgentRegistryStore:
             query_kwargs["ExclusiveStartKey"] = _decode_cursor(cursor)
 
         response = await asyncio.to_thread(self._agents_table.query, **query_kwargs)
-        records = [AgentRecord(**decimal_to_native(item)) for item in response.get("Items", [])]
+        records = [
+            AgentRecord(**_normalise_agent_item(decimal_to_native(item)))
+            for item in response.get("Items", [])
+        ]
         next_cursor = None
         if "LastEvaluatedKey" in response:
             next_cursor = _encode_cursor(response["LastEvaluatedKey"])
@@ -396,7 +414,10 @@ class AgentRegistryStore:
             KeyConditionExpression=Key("project_id").eq(project_id),
             FilterExpression=Attr("tenant_id").eq(tenant_id),
         )
-        return [AgentRecord(**decimal_to_native(item)) for item in response.get("Items", [])]
+        return [
+            AgentRecord(**_normalise_agent_item(decimal_to_native(item)))
+            for item in response.get("Items", [])
+        ]
 
     async def get_agent_in_project(
         self, tenant_id: str, project_id: str, agent_id: str

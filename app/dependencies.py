@@ -38,6 +38,7 @@ from app.modules.platform_settings.store import PlatformSettingsStore
 from app.modules.playground.store import PlaygroundSessionStore
 from app.modules.projects.store import ProjectStore
 from app.modules.registry.store import AgentRegistryStore
+from app.modules.runs.store import RunStore
 from app.modules.secrets.manager import SecretsManager
 from app.modules.skills.store import SkillStore
 from app.modules.telemetry.emitter import TelemetryConfig, TelemetryEmitter
@@ -162,6 +163,11 @@ async def get_bedrock_guardrail_provisioner(request: Request) -> BedrockGuardrai
 
 async def get_playground_session_store(request: Request) -> PlaygroundSessionStore:
     store: PlaygroundSessionStore = request.app.state.playground_session_store
+    return store
+
+
+async def get_run_store(request: Request) -> RunStore:
+    store: RunStore = request.app.state.run_store
     return store
 
 

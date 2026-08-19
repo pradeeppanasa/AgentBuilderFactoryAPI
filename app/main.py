@@ -39,6 +39,7 @@ from app.modules.platform_settings.store import PlatformSettingsStore
 from app.modules.playground.store import PlaygroundSessionStore
 from app.modules.projects.store import ProjectStore
 from app.modules.registry.store import AgentRegistryStore
+from app.modules.runs.store import RunStore
 from app.modules.secrets.manager import SecretsManager
 from app.modules.skills.store import SkillStore
 from app.modules.telemetry.emitter import TelemetryConfig, TelemetryEmitter
@@ -171,6 +172,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await playground_session_store.ensure_table()
     app.state.playground_session_store = playground_session_store
 
+    run_store = RunStore(dynamodb, settings)
+    await run_store.ensure_table()
+    app.state.run_store = run_store
+
     bedrock_credential_store = BedrockCredentialStore(dynamodb, settings)
     await bedrock_credential_store.ensure_table()
     app.state.bedrock_credential_store = bedrock_credential_store
@@ -190,6 +195,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await hitl_review_store.ensure_table()
     app.state.hitl_review_store = hitl_review_store
 
+    # Observability — Runs Feature, Phase 1
+    run_store = RunStore(dynamodb, settings)
+    await run_store.ensure_table()
+    app.state.run_store = run_store
+
     # Section 39/R45, R45-7/8 — Admin observability settings
     platform_settings_store = PlatformSettingsStore(dynamodb, settings)
     await platform_settings_store.ensure_table()
@@ -201,6 +211,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         sts_client=create_sts_client(settings),
         credential_store=bedrock_credential_store,
         client_factory=lambda creds: create_bedrock_client_with_credentials(settings, creds),
+        mock_enabled=settings.mock_bedrock_guardrails,
     )
 
     # R16: TELEMETRY_ENABLED defaults false; categories default all-on so

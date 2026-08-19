@@ -45,7 +45,7 @@ def _create_project_and_agent(
             "name": "Agent A",
             "description": "d",
             "business_purpose": "p",
-            "agent_type": "task",
+            "agent_type": "standard",
             "configuration": config or _config(),
         },
         headers=_bearer(token),

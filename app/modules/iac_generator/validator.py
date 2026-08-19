@@ -24,6 +24,7 @@ question that has nothing to do with the generated HCL's correctness.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import subprocess
 import tempfile
@@ -35,6 +36,7 @@ from typing import Any
 
 import hcl2
 
+from app.modules.iac_generator.naming import bedrock_guardrail_name
 from app.modules.iac_generator.validation_models import CheckResult, IaCValidationReport
 from app.modules.registry.models import AgentConfiguration
 from app.shared.logging import get_logger
@@ -266,13 +268,28 @@ def _check_lambda_role_least_privilege(blocks: list[ResourceBlock]) -> CheckResu
 
 def _check_naming_convention(blocks: list[ResourceBlock], agent_id: str) -> CheckResult:
     prefix = f"panasa-{agent_id}-"
+    # QA I-02 — aws_bedrock_guardrail is the one resource type with a real
+    # AWS length cap (50 chars) tight enough that long agent_ids overflow
+    # the standard prefix; bedrock_guardrail_name() truncates it, so this
+    # check compares against that exact expected name rather than the
+    # literal panasa-{agent_id}- prefix every other resource type uses.
+    expected_guardrail_name = bedrock_guardrail_name(agent_id)
     violations = []
     for block in blocks:
         attr = _NAMEABLE_RESOURCE_TYPES.get(block.resource_type)
         if attr is None:
             continue
         value = block.attrs.get(attr)
-        if isinstance(value, str) and not value.startswith(prefix):
+        if not isinstance(value, str):
+            continue
+        if block.resource_type == "aws_bedrock_guardrail":
+            if value != expected_guardrail_name:
+                violations.append(
+                    f"{block.resource_type}.{block.resource_name}.{attr} = {value!r} "
+                    f"(expected {expected_guardrail_name!r})"
+                )
+            continue
+        if not value.startswith(prefix):
             violations.append(f"{block.resource_type}.{block.resource_name}.{attr} = {value!r}")
     passed = not violations
     detail = (
@@ -419,6 +436,37 @@ def _check_s3_public_access_block(blocks: list[ResourceBlock]) -> CheckResult:
     return CheckResult(name="s3_block_public_access", passed=passed, detail=detail)
 
 
+def _check_dynamodb_pitr(blocks: list[ResourceBlock]) -> CheckResult:
+    """Wizard Redesign QA A-03/I-01. Per-agent Terraform bundles don't
+    currently create any aws_dynamodb_table (the real DynamoDB tables are
+    all platform-wide, provisioned once in bootstrap/stage1/dynamodb.tf —
+    and already set point_in_time_recovery.enabled=true there) — so this
+    check passes trivially today. It exists so a future per-agent template
+    that does add a DynamoDB table can't silently ship without PITR."""
+    tables = [b for b in blocks if b.resource_type == "aws_dynamodb_table"]
+    if not tables:
+        return CheckResult(
+            name="dynamodb_pitr",
+            passed=True,
+            detail="No aws_dynamodb_table resources in this configuration",
+        )
+
+    violations = []
+    for table in tables:
+        pitr = table.attrs.get("point_in_time_recovery")
+        if isinstance(pitr, list):
+            pitr = pitr[0] if pitr else {}
+        if not isinstance(pitr, dict) or pitr.get("enabled") is not True:
+            violations.append(f"aws_dynamodb_table.{table.resource_name}")
+    passed = not violations
+    detail = (
+        f"All {len(tables)} DynamoDB table(s) have point_in_time_recovery enabled"
+        if passed
+        else "Tables missing point_in_time_recovery: " + ", ".join(violations)
+    )
+    return CheckResult(name="dynamodb_pitr", passed=passed, detail=detail)
+
+
 def _looks_like_reference(value: str) -> bool:
     return (
         value.startswith("${")
@@ -534,10 +582,45 @@ def _run_terraform_validate(tmpdir: Path) -> CheckResult:
     return CheckResult(
         name="terraform_validate",
         passed=False,
-        detail=f"terraform validate failed:\n{validate_result.stdout}{validate_result.stderr}"[
-            :2000
-        ],
+        detail=_parse_terraform_validate_diagnostics(
+            validate_result.stdout, validate_result.stderr
+        ),
     )
+
+
+def _parse_terraform_validate_diagnostics(stdout: str, stderr: str) -> str:
+    """QA U-16 — `terraform validate -json`'s raw stdout is a JSON object
+    with a `diagnostics` array; dumping it verbatim showed end users an
+    unreadable wall of JSON instead of the actual error. Extract each
+    diagnostic's summary/detail into a plain-English line; fall back to the
+    raw output if it isn't parseable JSON in the expected shape (never
+    crash the validator over an unexpected terraform output format)."""
+    fallback = f"terraform validate failed:\n{stdout}{stderr}"[:2000]
+    try:
+        parsed = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError):
+        return fallback
+
+    diagnostics = parsed.get("diagnostics") if isinstance(parsed, dict) else None
+    if not isinstance(diagnostics, list) or not diagnostics:
+        return fallback
+
+    lines = []
+    for diag in diagnostics:
+        if not isinstance(diag, dict):
+            continue
+        summary = diag.get("summary") or "Unknown error"
+        detail = diag.get("detail")
+        diag_range = diag.get("range")
+        filename = diag_range.get("filename") if isinstance(diag_range, dict) else None
+        line = str(summary)
+        if detail:
+            line += f" — {detail}"
+        if filename:
+            line += f" ({filename})"
+        lines.append(line)
+
+    return "\n".join(lines)[:2000] if lines else fallback
 
 
 class IaCValidator:
@@ -589,6 +672,7 @@ class IaCValidator:
         checks.append(_check_security_group_ingress(blocks))
         checks.append(_check_s3_public_access_block(blocks))
         checks.append(_check_no_hardcoded_secrets(blocks))
+        checks.append(_check_dynamodb_pitr(blocks))
 
         with tempfile.TemporaryDirectory(prefix="panasa-iac-validate-") as tmpdir_str:
             tmpdir = Path(tmpdir_str)

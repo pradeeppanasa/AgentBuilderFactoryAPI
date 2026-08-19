@@ -26,7 +26,7 @@ def _minimal_agent_payload(name: str = "KYC Agent") -> dict[str, Any]:
         "name": name,
         "description": "Know Your Customer verification agent",
         "business_purpose": "Automate KYC document verification for onboarding",
-        "agent_type": "task",
+        "agent_type": "standard",
         "configuration": {
             "model_id": "anthropic.claude-3-5-sonnet-20241022-v2:0",
             "model_provider": "bedrock",

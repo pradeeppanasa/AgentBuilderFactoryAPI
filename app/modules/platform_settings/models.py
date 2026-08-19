@@ -37,5 +37,21 @@ class PlatformSettingsRecord(BaseModel):
     datadog_api_key_arn: str | None = None  # Secrets Manager ARN only
     datadog_site: str | None = None
 
+    # Grafana / Loki (optional, customer-routed — R45/41.5). Endpoint-only:
+    # like the generic OTel endpoint above, Grafana/Loki accepts spans over
+    # plain OTLP with no separate API key for basic wiring.
+    grafana_enabled: bool = False
+    grafana_endpoint: str | None = None
+
+    # New Relic (optional, customer-routed — R45/41.5). Same shape as
+    # Datadog: needs a license/API key, not just an endpoint.
+    new_relic_enabled: bool = False
+    new_relic_api_key_arn: str | None = None  # Secrets Manager ARN only
+
+    # Dynatrace (optional, customer-routed — R45/41.5). Endpoint-only, same
+    # shape as Grafana/Loki — matches Section 41.5's UI mockup exactly.
+    dynatrace_enabled: bool = False
+    dynatrace_endpoint: str | None = None
+
     updated_by: str
     updated_at: str

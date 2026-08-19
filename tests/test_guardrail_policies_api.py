@@ -17,7 +17,11 @@ from fastapi.testclient import TestClient
 from app.dependencies import get_bedrock_guardrail_provisioner
 from app.main import app
 from app.modules.guardrails.provisioner import BedrockGuardrailProvisioner
-from tests.fakes import FakeBedrockControlPlaneClient
+from tests.fakes import (
+    FailingBedrockControlPlaneClient,
+    FakeBedrockControlPlaneClient,
+    InvalidCredentialsBedrockControlPlaneClient,
+)
 
 TENANT_A = "tenant-a"
 TENANT_B = "tenant-b"
@@ -108,6 +112,108 @@ async def test_update_calls_update_guardrail_not_create(
     assert len(fake_bedrock_provisioner.create_calls) == 1  # from create
     assert len(fake_bedrock_provisioner.update_calls) == 1  # from the PUT
     assert fake_bedrock_provisioner.update_calls[0]["guardrailIdentifier"] == "gr-fake-123"
+
+
+async def test_create_failure_returns_502_and_does_not_orphan_record(
+    make_user_and_token,
+) -> None:
+    """A real Bedrock provisioning failure (auth, throttling, region not
+    enabled) must surface as a clean 502 — not a bare 500 — and must not
+    leave a DynamoDB record behind that the caller was told failed to
+    save (this is exactly what happens today against real Bedrock with
+    local dev's placeholder AWS credentials, CLAUDE.md Section 34)."""
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+    # Overwrites — does not delete — the autouse fake_bedrock_provisioner
+    # fixture's own override; that fixture's teardown still does the one
+    # `del` afterward, so this must NOT also delete it here.
+    app.dependency_overrides[get_bedrock_guardrail_provisioner] = (
+        lambda: BedrockGuardrailProvisioner(FailingBedrockControlPlaneClient())
+    )
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/platform/guardrail-policies",
+            json={"name": "Will Fail", "description": "d"},
+            headers=_bearer(admin_token),
+        )
+        assert created.status_code == 502
+        assert "Bedrock guardrail provisioning failed" in created.json()["detail"]
+
+        listed = client.get("/api/v1/platform/guardrail-policies", headers=_bearer(admin_token))
+        assert listed.json()["items"] == []
+
+
+async def test_create_failure_with_credential_error_returns_503(make_user_and_token) -> None:
+    """QA A-05 — a real botocore ClientError shaped like AWS's actual
+    'invalid/unrecognized credentials' response must surface as an
+    actionable 503, distinct from the generic 502 used for any other
+    Bedrock-side failure."""
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+    app.dependency_overrides[get_bedrock_guardrail_provisioner] = (
+        lambda: BedrockGuardrailProvisioner(InvalidCredentialsBedrockControlPlaneClient())
+    )
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/platform/guardrail-policies",
+            json={"name": "Will Fail On Credentials", "description": "d"},
+            headers=_bearer(admin_token),
+        )
+        assert created.status_code == 503
+        body = created.json()["detail"]
+        assert body["error"] == "aws_credentials_invalid"
+        assert "MOCK_BEDROCK_GUARDRAILS" in body["message"]
+
+        listed = client.get("/api/v1/platform/guardrail-policies", headers=_bearer(admin_token))
+        assert listed.json()["items"] == []
+
+
+async def test_mock_bedrock_guardrails_never_calls_the_real_client(make_user_and_token) -> None:
+    """QA A-05 — settings.mock_bedrock_guardrails must short-circuit before
+    any AWS call, so it works against local dev's placeholder credentials.
+    Uses FailingBedrockControlPlaneClient as the underlying client
+    precisely so the test fails loudly if mock mode ever falls through to
+    a real call."""
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+    app.dependency_overrides[get_bedrock_guardrail_provisioner] = (
+        lambda: BedrockGuardrailProvisioner(
+            FailingBedrockControlPlaneClient(), mock_enabled=True
+        )
+    )
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/platform/guardrail-policies",
+            json={"name": "Mocked Policy", "description": "d"},
+            headers=_bearer(admin_token),
+        )
+        assert created.status_code == 201
+        assert created.json()["bedrock_guardrail_id"].startswith("mock-gr-")
+
+
+async def test_update_provisioning_failure_returns_502(make_user_and_token) -> None:
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/platform/guardrail-policies",
+            json={"name": "Editable", "description": "d"},
+            headers=_bearer(admin_token),
+        )
+        policy_id = created.json()["policy_id"]
+
+        # Overwrites — does not delete — the autouse fixture's override; see
+        # the create-failure test above for why no `del` belongs here.
+        app.dependency_overrides[get_bedrock_guardrail_provisioner] = (
+            lambda: BedrockGuardrailProvisioner(FailingBedrockControlPlaneClient())
+        )
+        updated = client.put(
+            f"/api/v1/platform/guardrail-policies/{policy_id}",
+            json={"description": "updated description"},
+            headers=_bearer(admin_token),
+        )
+        assert updated.status_code == 502
+        assert "Bedrock guardrail provisioning failed" in updated.json()["detail"]
 
 
 async def test_developer_cannot_create_policy(make_user_and_token) -> None:
@@ -272,7 +378,7 @@ async def test_delete_blocked_when_referenced_by_agent(make_user_and_token) -> N
                 "name": "Guarded Agent",
                 "description": "d",
                 "business_purpose": "p",
-                "agent_type": "task",
+                "agent_type": "standard",
                 "configuration": {
                     "model_id": "anthropic.claude-3-5-sonnet-20241022-v2:0",
                     "model_provider": "bedrock",

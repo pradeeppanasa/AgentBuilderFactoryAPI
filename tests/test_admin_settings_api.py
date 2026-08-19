@@ -140,6 +140,68 @@ async def test_save_datadog_config_masks_api_key_on_read(make_user_and_token) ->
         assert fetched.json()["api_key"] == "****"
 
 
+async def test_save_grafana_config_and_read_back(make_user_and_token) -> None:
+    """Section 41.5's mockup — Grafana/Loki is endpoint-only, no API key."""
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        saved = client.patch(
+            "/api/v1/admin/settings/integrations/grafana",
+            json={"enabled": True, "endpoint": "https://loki.internal.example.com/otlp"},
+            headers=_bearer(admin_token),
+        )
+        assert saved.status_code == 200
+        body = saved.json()
+        assert body == {"enabled": True, "endpoint": "https://loki.internal.example.com/otlp"}
+
+        fetched = client.get(
+            "/api/v1/admin/settings/integrations/grafana", headers=_bearer(admin_token)
+        )
+        assert fetched.json() == body
+
+
+async def test_save_new_relic_config_masks_api_key_on_read(make_user_and_token) -> None:
+    """Section 41.5's mockup — New Relic needs an API key, same shape as Datadog."""
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        saved = client.patch(
+            "/api/v1/admin/settings/integrations/new-relic",
+            json={"enabled": True, "api_key": "nr-license-key-xyz"},
+            headers=_bearer(admin_token),
+        )
+        assert saved.status_code == 200
+        body = saved.json()
+        assert body["enabled"] is True
+        assert body["api_key"] == "****"
+        assert "nr-license-key-xyz" not in saved.text
+
+        fetched = client.get(
+            "/api/v1/admin/settings/integrations/new-relic", headers=_bearer(admin_token)
+        )
+        assert fetched.json()["api_key"] == "****"
+
+
+async def test_save_dynatrace_config_and_read_back(make_user_and_token) -> None:
+    """Section 41.5's mockup — Dynatrace is endpoint-only, same shape as Grafana/Loki."""
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        saved = client.patch(
+            "/api/v1/admin/settings/integrations/dynatrace",
+            json={"enabled": True, "endpoint": "https://abc12345.live.dynatrace.com"},
+            headers=_bearer(admin_token),
+        )
+        assert saved.status_code == 200
+        body = saved.json()
+        assert body == {"enabled": True, "endpoint": "https://abc12345.live.dynatrace.com"}
+
+        fetched = client.get(
+            "/api/v1/admin/settings/integrations/dynatrace", headers=_bearer(admin_token)
+        )
+        assert fetched.json() == body
+
+
 async def test_settings_are_tenant_isolated(make_user_and_token) -> None:
     _, admin_a_token = await make_user_and_token(TENANT_A, role="admin")
     _, admin_b_token = await make_user_and_token(TENANT_B, role="admin")

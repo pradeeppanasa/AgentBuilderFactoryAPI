@@ -17,7 +17,7 @@ def _minimal_agent_payload(name: str = "KYC Agent") -> dict[str, Any]:
         "name": name,
         "description": "Know Your Customer verification agent",
         "business_purpose": "Automate KYC document verification for onboarding",
-        "agent_type": "task",
+        "agent_type": "standard",
         "configuration": {
             "model_id": "anthropic.claude-3-5-sonnet-20241022-v2:0",
             "model_provider": "bedrock",
@@ -39,6 +39,53 @@ async def test_create_agent_returns_201_with_v1_draft(make_user_and_token) -> No
     assert body["version"] == 1
     assert body["status"] == "DRAFT"
     assert body["agent_id"].startswith("kyc-agent-")
+
+
+async def test_create_agent_persists_tags_and_changelog(make_user_and_token) -> None:
+    """QA U-20/U-21: CreateAgentRequest previously had no tags/changelog
+    fields at all — create_agent() always wrote tags={} and hardcoded v1's
+    change_description to "Initial version", silently dropping whatever the
+    caller sent."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        payload = _minimal_agent_payload()
+        payload["tags"] = {"team": "kyc", "priority": "high"}
+        payload["changelog"] = "Initial KYC agent for the onboarding pilot."
+        created = client.post("/api/v1/agents", json=payload, headers=_bearer(token)).json()
+        agent_id = created["agent_id"]
+
+        agent_response = client.get(f"/api/v1/agents/{agent_id}", headers=_bearer(token))
+        versions_response = client.get(
+            f"/api/v1/agents/{agent_id}/versions", headers=_bearer(token)
+        )
+
+    assert agent_response.json()["agent"]["tags"] == {"team": "kyc", "priority": "high"}
+    v1 = next(v for v in versions_response.json()["items"] if v["version"] == 1)
+    assert v1["change_description"] == "Initial KYC agent for the onboarding pilot."
+
+
+async def test_create_agent_without_tags_or_changelog_keeps_old_defaults(
+    make_user_and_token,
+) -> None:
+    """Both fields are optional — omitting them must behave exactly as
+    before this change (empty tags, "Initial version" changelog)."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/agents", json=_minimal_agent_payload(), headers=_bearer(token)
+        ).json()
+        agent_id = created["agent_id"]
+
+        agent_response = client.get(f"/api/v1/agents/{agent_id}", headers=_bearer(token))
+        versions_response = client.get(
+            f"/api/v1/agents/{agent_id}/versions", headers=_bearer(token)
+        )
+
+    assert agent_response.json()["agent"]["tags"] == {}
+    v1 = next(v for v in versions_response.json()["items"] if v["version"] == 1)
+    assert v1["change_description"] == "Initial version"
 
 
 async def test_get_agent_returns_current_configuration(make_user_and_token) -> None:

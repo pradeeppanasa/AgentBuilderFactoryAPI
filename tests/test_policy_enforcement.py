@@ -36,7 +36,7 @@ async def _seed_agent_and_deployment(
         name="KYC Agent",
         description="desc",
         business_purpose="purpose",
-        agent_type="task",
+        agent_type="standard",
         configuration=AgentConfiguration(
             model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",
             model_provider="bedrock",

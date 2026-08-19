@@ -13,13 +13,16 @@ empty/stubbed here rather than faked — see the docstrings on
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Any
 
+import litellm
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
+from app.config import settings
 from app.dependencies import (
     get_audit_writer,
     get_guardrail_engine,
@@ -36,6 +39,7 @@ from app.modules.guardrails.models import GuardrailDecision
 from app.modules.guardrails.store import GuardrailPolicyStore
 from app.modules.playground.models import PlaygroundTurn
 from app.modules.playground.store import PlaygroundSessionStore
+from app.modules.registry.models import AgentConfiguration
 from app.modules.registry.store import AgentRegistryStore
 from app.services.model_router import call_model
 
@@ -134,6 +138,82 @@ def _reject_overrides_if_not_admin(
         )
 
 
+def _classify_llm_error(exc: Exception, config: AgentConfiguration) -> dict[str, str]:
+    """Wizard Redesign QA A-01 — a structured, UI-actionable error body
+    instead of a bare stringified exception, so Step8Test/the playground
+    page (U-09) can render something more useful than a raw status code."""
+    if isinstance(exc, litellm.exceptions.AuthenticationError):
+        category = "llm_auth_failed"
+        message = "Model provider credentials are invalid or the model is not enabled."
+    elif isinstance(
+        exc,
+        litellm.exceptions.Timeout
+        | litellm.exceptions.APIConnectionError
+        | litellm.exceptions.ServiceUnavailableError,
+    ):
+        category = "llm_timeout"
+        message = "Model provider did not respond in time."
+    else:
+        category = "llm_unknown"
+        message = str(exc)
+    return {
+        "error": category,
+        "message": message,
+        "provider": config.model_provider,
+        "model_id": config.model_id,
+    }
+
+
+def _mock_output_example(schema: dict[str, Any]) -> Any:
+    """Best-effort structurally-plausible example value for one JSON Schema
+    fragment. Used only to shape the playground's mock reply (Section 39.7)
+    around whatever schema the agent itself is configured with — never a
+    domain-specific example hardcoded for one agent (e.g. KYC)."""
+    if schema.get("enum"):
+        return schema["enum"][0]
+    schema_type = schema.get("type")
+    if schema_type == "object" or (schema_type is None and "properties" in schema):
+        return {
+            key: _mock_output_example(sub_schema)
+            for key, sub_schema in schema.get("properties", {}).items()
+        }
+    if schema_type == "array":
+        # Always an empty list — populating with a synthetic item (e.g. a
+        # made-up "mock value" string) implies the mock reply found a real
+        # result, which is misleading for a call that never touched an LLM.
+        return []
+    if schema_type == "integer":
+        return 0
+    if schema_type == "number":
+        return 0.0
+    if schema_type == "boolean":
+        return False
+    if schema_type == "string":
+        return schema.get("title") or schema.get("description") or "mock value"
+    return None
+
+
+def _mock_playground_result(config: AgentConfiguration) -> tuple[str, float, int, int]:
+    """Wizard Redesign QA A-02/U-10 — canned values, LLM never called.
+
+    Section 39.7 clarifies A-02: the mock reply must be shaped like the
+    agent's *own* configured output, not one fixed generic string for every
+    agent regardless of what it's configured to produce. When the agent has
+    a JSON output_schema configured, the mock reply is a structurally
+    plausible example built from that schema (see `_mock_output_example`);
+    otherwise it falls back to the original generic text.
+    """
+    output_schema = config.output_schema
+    if (
+        output_schema is not None
+        and output_schema.format == "json"
+        and output_schema.schema_definition
+    ):
+        example = _mock_output_example(output_schema.schema_definition)
+        return json.dumps(example), 0.0, 120, 64
+    return "Mock response — LLM not called.", 0.0, 120, 64
+
+
 def _run_tool_calls() -> list[ToolCallSummary]:
     """Tool execution belongs to the Generated Agent Runtime (F8), a
     separate service this Builder Runtime does not build. Always empty
@@ -163,6 +243,7 @@ async def run_playground_turn(
     guardrail_engine: Annotated[GuardrailEngine, Depends(get_guardrail_engine)],
     session_store: Annotated[PlaygroundSessionStore, Depends(get_playground_session_store)],
     audit_writer: Annotated[AuditWriter, Depends(get_audit_writer)],
+    mock: bool = False,
 ) -> PlaygroundResponse:
     _reject_overrides_if_not_admin(payload.overrides, current_user)
 
@@ -181,6 +262,45 @@ async def run_playground_turn(
 
     session_id = None if payload.overrides.clear_memory else payload.session_id
     session = await session_store.get_or_create(tenant_id, agent_id, session_id)
+
+    if mock or settings.mock_llm:
+        # Wizard Redesign QA A-02/U-10 — no LLM, no guardrail engine call;
+        # a canned response so the playground UI (and the wizard's IaC-test
+        # step) is exercisable without real Bedrock credentials.
+        mock_reply, mock_cost, mock_input_tokens, mock_output_tokens = _mock_playground_result(
+            config
+        )
+        now = datetime.now(UTC).isoformat()
+        mock_turns = [
+            PlaygroundTurn(
+                turn_id=len(session.turns), role="user", content=payload.message, created_at=now
+            ),
+            PlaygroundTurn(
+                turn_id=len(session.turns) + 1,
+                role="assistant",
+                content=mock_reply,
+                created_at=now,
+            ),
+        ]
+        mock_session = await session_store.append_turns(agent_id, session.session_id, mock_turns)
+        return PlaygroundResponse(
+            session_id=mock_session.session_id,
+            blocked=False,
+            message=mock_reply,
+            metrics=PlaygroundMetrics(
+                latency=LatencyBreakdown(guardrail_ms=0, retrieval_ms=0, llm_ms=42, total_ms=42),
+                tokens=TokenUsageSummary(
+                    input_tokens=mock_input_tokens, output_tokens=mock_output_tokens
+                ),
+                estimated_cost_usd=mock_cost,
+                guardrail_decisions=[],
+                tool_calls=[],
+                kb_retrievals=None,
+                memory=MemoryStateSummary(
+                    session_entries=len(mock_session.turns), long_term_entries_used=0
+                ),
+            ),
+        )
 
     policy = None
     if config.guardrail_policy_id and not payload.overrides.disable_guardrails:
@@ -219,13 +339,25 @@ async def run_playground_turn(
             )
 
         start = time.perf_counter()
-        reply_text, cost, usage = await call_model(
-            effective_config,
-            [
-                {"role": "system", "content": config.system_prompt},
-                {"role": "user", "content": payload.message},
-            ],
-        )
+        try:
+            reply_text, cost, usage = await call_model(
+                effective_config,
+                [
+                    {"role": "system", "content": config.system_prompt},
+                    {"role": "user", "content": payload.message},
+                ],
+            )
+        except Exception as exc:
+            # call_model has no error handling of its own — an LLM-side
+            # failure (auth, throttling, timeout, model not found) must
+            # never surface as a bare, detail-less 500. Wizard Redesign QA
+            # A-01: a structured body (not just a stringified exception) so
+            # U-09's playground error panel can render something
+            # actionable instead of a raw status code.
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=_classify_llm_error(exc, effective_config),
+            ) from exc
         llm_ms = (time.perf_counter() - start) * 1000
         if usage is not None:
             input_tokens, output_tokens = usage.input_tokens, usage.output_tokens

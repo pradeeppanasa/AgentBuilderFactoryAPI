@@ -229,7 +229,7 @@ async def test_delete_skill_blocked_while_referenced_by_agent(make_user_and_toke
                 "name": "Agent A",
                 "description": "d",
                 "business_purpose": "p",
-                "agent_type": "task",
+                "agent_type": "standard",
                 "configuration": config,
             },
             headers=_bearer(dev_token),

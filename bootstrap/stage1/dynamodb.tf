@@ -133,6 +133,18 @@ locals {
       gsis           = []
       ttl_attribute  = null
     }
+    # Observability — Runs Feature, Phase 1. Schema matches
+    # app/modules/runs/store.py's ensure_table() exactly: range key is
+    # started_at (ISO 8601, lexicographically sortable), not run_id, so a
+    # plain Query with ScanIndexForward=False returns newest-first with no
+    # separate index.
+    "panasa-runs" = {
+      hash_key       = "agent_id"
+      range_key      = "started_at"
+      range_key_type = "S"
+      gsis           = []
+      ttl_attribute  = null
+    }
     "panasa-bedrock-credentials" = {
       # Section 37.15 (2026-08-16) — STS AssumeRole credential bindings.
       # Schema matches app/modules/bedrock_credentials/store.py's

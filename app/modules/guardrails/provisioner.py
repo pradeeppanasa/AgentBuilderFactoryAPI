@@ -39,6 +39,7 @@ Deliberately partial mappings, each documented at its own site below:
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import Callable
 from typing import Any
 
@@ -100,11 +101,15 @@ class BedrockGuardrailProvisioner:
         sts_client: Any | None = None,
         credential_store: BedrockCredentialStore | None = None,
         client_factory: BedrockClientFactory = _default_client_factory_unset,
+        mock_enabled: bool = False,
     ) -> None:
         self._default_client = default_bedrock_client
         self._sts = sts_client
         self._credential_store = credential_store
         self._client_factory = client_factory
+        # QA A-05 / settings.mock_bedrock_guardrails — skips every AWS call
+        # below entirely, for dev environments without real Bedrock access.
+        self._mock_enabled = mock_enabled
 
     async def provision(self, tenant_id: str, policy: GuardrailPolicy) -> tuple[str, str]:
         """Creates (or updates, if `policy.bedrock_guardrail_id` is already
@@ -112,6 +117,11 @@ class BedrockGuardrailProvisioner:
         (guardrail_id, guardrail_version). The caller decides whether to
         invoke this at all — e.g. skip when `policy.bedrock_enabled` is
         False, since there's nothing useful to provision."""
+        if self._mock_enabled:
+            if policy.bedrock_guardrail_id:
+                return policy.bedrock_guardrail_id, policy.bedrock_guardrail_version
+            return f"mock-gr-{uuid.uuid4().hex[:8]}", "1"
+
         client = await self._resolve_client(tenant_id, policy)
         request = self._build_request(policy)
 
@@ -129,7 +139,7 @@ class BedrockGuardrailProvisioner:
         DynamoDB record is this Runtime's source of truth for desired
         state (R02), and a stray orphaned Bedrock resource is a cheaper
         failure mode than blocking the policy delete the admin asked for."""
-        if not policy.bedrock_guardrail_id:
+        if not policy.bedrock_guardrail_id or self._mock_enabled:
             return
         try:
             client = await self._resolve_client(tenant_id, policy)

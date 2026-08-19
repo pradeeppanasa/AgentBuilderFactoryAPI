@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
+from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, model_validator
 
@@ -151,6 +152,37 @@ async def _agents_referencing_policy(
             return referencing
 
 
+# QA A-05 — botocore.exceptions.ClientError's own str() is a raw AWS SDK
+# error message ("An error occurred (UnrecognizedClientException) when
+# calling the CreateGuardrail operation: ...") which isn't actionable for
+# an end user testing locally without real Bedrock credentials. Recognised
+# credential-shaped error codes get a specific, actionable 503; anything
+# else falls back to the existing generic 502.
+_CREDENTIAL_ERROR_CODES = frozenset(
+    {"UnrecognizedClientException", "InvalidSignatureException", "ExpiredTokenException"}
+)
+
+
+def _bedrock_provisioning_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, ClientError) and exc.response.get("Error", {}).get("Code") in (
+        _CREDENTIAL_ERROR_CODES
+    ):
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "aws_credentials_invalid",
+                "message": (
+                    "AWS credentials not configured. Set MOCK_BEDROCK_GUARDRAILS=true "
+                    "for local testing."
+                ),
+            },
+        )
+    return HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail=f"Bedrock guardrail provisioning failed: {exc}",
+    )
+
+
 async def _provision_bedrock_guardrail(
     provisioner: BedrockGuardrailProvisioner, tenant_id: str, policy: GuardrailPolicy
 ) -> GuardrailPolicy:
@@ -197,7 +229,16 @@ async def create_guardrail_policy(
         compliance=payload.compliance,
         blocked_messages=payload.blocked_messages,
     )
-    provisioned = await _provision_bedrock_guardrail(provisioner, tenant_id, created)
+    try:
+        provisioned = await _provision_bedrock_guardrail(provisioner, tenant_id, created)
+    except Exception as exc:
+        # A real Bedrock/AWS failure (auth, throttling, region not enabled)
+        # must never leave an orphaned DynamoDB record behind that the UI
+        # reported as "failed to save" — roll the just-created draft back
+        # so a retry (or a corrected credential) starts clean rather than
+        # accumulating half-provisioned policies.
+        await store.delete(tenant_id, created.policy_id)
+        raise _bedrock_provisioning_error(exc) from exc
     if provisioned is created:
         return created
     return await store.update(
@@ -256,7 +297,15 @@ async def update_guardrail_policy(
     except GuardrailPolicyNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
-    provisioned = await _provision_bedrock_guardrail(provisioner, tenant_id, updated)
+    try:
+        provisioned = await _provision_bedrock_guardrail(provisioner, tenant_id, updated)
+    except Exception as exc:
+        # The field changes above are already persisted — there is no clean
+        # "previous state" to roll back to (the edit itself succeeded; only
+        # the Bedrock sync failed) — so this raises rather than silently
+        # returning `updated` as if nothing went wrong, matching create's
+        # never-swallow-a-real-AWS-failure behaviour.
+        raise _bedrock_provisioning_error(exc) from exc
     if provisioned is updated:
         return updated
     return await store.update(
@@ -293,5 +342,7 @@ async def delete_guardrail_policy(
                 f"{', '.join(referencing)}"
             ),
         )
+    # deprovision() is deliberately best-effort (swallows AWS-side failures,
+    # see its own docstring) — no try/except needed here, unlike provision().
     await provisioner.deprovision(tenant_id, record)
     await store.delete(tenant_id, policy_id)

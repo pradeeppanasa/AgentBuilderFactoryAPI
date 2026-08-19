@@ -31,7 +31,7 @@ async def _seed_agent(registry_store: AgentRegistryStore) -> str:
         name="RAG Agent",
         description="desc",
         business_purpose="purpose",
-        agent_type="rag",
+        agent_type="standard",
         configuration=AgentConfiguration(
             model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",
             model_provider="bedrock",

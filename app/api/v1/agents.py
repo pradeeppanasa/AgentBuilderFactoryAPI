@@ -9,10 +9,10 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.dependencies import (
@@ -35,7 +35,10 @@ from app.modules.deployment.orchestrator import DeploymentOrchestrator
 from app.modules.deployment.status_store import DeploymentStatusStore
 from app.modules.git_provider.base import GitProvider
 from app.modules.iac_generator.generator import IaCGenerator
-from app.modules.iac_generator.validation_models import IaCValidationReport
+from app.modules.iac_generator.validation_models import (
+    IaCValidationReport,
+    TerraformValidationMode,
+)
 from app.modules.iac_generator.validator import IaCValidator
 from app.modules.observability.metrics import MetricsEmitter
 from app.modules.registry.diff import ConfigDiff, compute_config_diff
@@ -101,6 +104,11 @@ class CreateAgentRequest(BaseModel):
     business_purpose: str
     agent_type: AgentType
     configuration: AgentConfiguration
+    tags: dict[str, str] = Field(default_factory=dict)
+    # QA U-21: without this, create_agent() always wrote the hardcoded
+    # "Initial version" as v1's change_description, discarding whatever the
+    # wizard's Step 10 Changelog field actually said.
+    changelog: str | None = None
 
 
 class CreateAgentResponse(BaseModel):
@@ -185,6 +193,31 @@ class GenerateIaCResponse(BaseModel):
     s3_key: str
     modules: list[str]
     validation_report: IaCValidationReport
+    validation_mode: TerraformValidationMode = "local"
+    environment_note: str | None = None
+
+
+class IaCStageStatus(BaseModel):
+    name: str
+    status: Literal["completed", "pending"]
+
+
+class IaCStatusResponse(BaseModel):
+    """GET /agents/{agent_id}/iac/status (Wizard Redesign QA A-04/U-08).
+
+    generate-iac renders + validates synchronously in a single request (pure
+    Jinja2 templating plus a local `terraform fmt`/`validate` — no network
+    calls, no long-running job), so there is no in-progress state to observe
+    between polls: this endpoint reports the outcome of the most recent
+    completed generate-iac call, not a live-updating background job. A
+    caller that polls immediately after triggering generate-iac will see
+    "completed"/"failed" on its very first poll."""
+
+    agent_id: str
+    version: int
+    status: Literal["not_started", "completed", "failed"]
+    stages: list[IaCStageStatus]
+    validation: IaCValidationReport | None = None
 
 
 class DeployResponse(BaseModel):
@@ -218,6 +251,8 @@ async def create_agent(
             agent_type=payload.agent_type,
             configuration=payload.configuration,
             created_by=current_user.email,
+            tags=payload.tags,
+            changelog=payload.changelog,
         )
     except CircularDependencyError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
@@ -625,11 +660,37 @@ async def rollback_agent(
 async def generate_iac(
     agent_id: str,
     tenant_id: Annotated[str, Depends(get_tenant_id)],
-    _current_user: Annotated[CurrentUser, Depends(require_role(*_WRITE_ROLES))],
+    current_user: Annotated[CurrentUser, Depends(require_role(*_WRITE_ROLES))],
     store: Annotated[AgentRegistryStore, Depends(get_registry_store)],
     iac_generator: Annotated[IaCGenerator, Depends(get_iac_generator)],
     iac_validator: Annotated[IaCValidator, Depends(get_iac_validator)],
+    validation_mode: TerraformValidationMode = "local",
 ) -> GenerateIaCResponse:
+    # Development Terraform Validation Mode: "local" (default) always runs —
+    # it never requires AWS credentials or contacts a real AWS account
+    # (IaCValidator uses `terraform init -backend=false` only). The
+    # "panasa_vpc"/"customer_vpc" modes are admin/developer-only
+    # placeholders for later stages (Section 35 Stage 2/3) — hidden unless
+    # explicitly enabled, and never perform a real deployment even when
+    # enabled (Stage 1 scope).
+    if validation_mode != "local":
+        if not settings.dev_validation_extended_modes_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Validation mode {validation_mode!r} is disabled on this deployment. "
+                    "Only 'local' validation is available."
+                ),
+            )
+        if current_user.role not in ("developer", "admin"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Validation mode {validation_mode!r} requires the developer "
+                    "or admin role."
+                ),
+            )
+
     record = await store.get_agent(tenant_id, agent_id)
     if record is None:
         raise HTTPException(
@@ -667,6 +728,7 @@ async def generate_iac(
         version=record.current_version,
         iac_version=result.iac_version,
         iac_s3_key=result.s3_key,
+        iac_modules=result.modules,
         iac_validation_report=validation_report,
     )
 
@@ -674,6 +736,14 @@ async def generate_iac(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=validation_report.model_dump(mode="json"),
+        )
+
+    environment_note = None
+    if validation_mode != "local":
+        environment_note = (
+            f"Real deployment to {validation_mode!r} is not implemented in Stage 1. "
+            "This response reflects local generation and validation only — "
+            "no AWS account was contacted."
         )
 
     return GenerateIaCResponse(
@@ -684,6 +754,52 @@ async def generate_iac(
         s3_key=result.s3_key,
         modules=result.modules,
         validation_report=validation_report,
+        validation_mode=validation_mode,
+        environment_note=environment_note,
+    )
+
+
+@router.get("/{agent_id}/iac/status", response_model=IaCStatusResponse)
+async def get_iac_status(
+    agent_id: str,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    _current_user: Annotated[CurrentUser, Depends(require_role(*_READ_ROLES))],
+    store: Annotated[AgentRegistryStore, Depends(get_registry_store)],
+) -> IaCStatusResponse:
+    """Wizard Redesign QA A-04/U-08 — the UI's IaC generation progress panel
+    polls this. See IaCStatusResponse's docstring: generate-iac has already
+    completed by the time this is ever polled (no background job to
+    observe mid-flight), so every stage in `modules` is reported
+    "completed"/"pending" from the already-persisted result of the most
+    recent generate-iac call, not a live in-progress state."""
+    record = await store.get_agent(tenant_id, agent_id)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent {agent_id!r} not found"
+        )
+    version_record = await store.get_version(agent_id, record.current_version)
+    if version_record is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Current version {record.current_version} missing for agent {agent_id!r}",
+        )
+
+    if version_record.iac_version is None:
+        return IaCStatusResponse(
+            agent_id=agent_id, version=record.current_version, status="not_started", stages=[]
+        )
+
+    modules = version_record.iac_modules or []
+    report = version_record.iac_validation_report
+    overall_status: Literal["completed", "failed"] = (
+        "completed" if report is not None and report.passed else "failed"
+    )
+    return IaCStatusResponse(
+        agent_id=agent_id,
+        version=record.current_version,
+        status=overall_status,
+        stages=[IaCStageStatus(name=m, status="completed") for m in modules],
+        validation=report,
     )
 
 

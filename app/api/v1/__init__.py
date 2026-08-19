@@ -13,6 +13,7 @@ from app.api.v1 import (
     platform,
     playground,
     projects,
+    runs,
     skills,
     task_planner,
 )
@@ -27,6 +28,7 @@ router.include_router(knowledge_bases.router)
 router.include_router(bedrock_credentials.router)
 router.include_router(guardrail_policies.router)
 router.include_router(playground.router)
+router.include_router(runs.router)
 router.include_router(projects.router)
 router.include_router(skills.router)
 router.include_router(hitl.router)

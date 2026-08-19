@@ -12,7 +12,48 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.modules.iac_generator.validation_models import IaCValidationReport
 
-AgentType = Literal["conversational", "task", "rag", "multi-step", "orchestrator"]
+AgentType = Literal["standard", "orchestrator"]
+
+# Retired 2026-08-18 (CLAUDE.md Section 38.6 "Design corrections" / Wizard
+# Redesign). "conversational" and "task" both collapse to "standard" — the
+# distinction was never load-bearing anywhere in the pipeline (IaC, change
+# impact, guardrails all branched on knowledge_base/tools/orchestration
+# presence, never on this specific value). "multi-step" collapses to
+# "orchestrator", its closest surviving meaning.
+#
+# Retired 2026-08-19 (CLAUDE.md Section 39.1 — "Agent Role = Standard |
+# Orchestrator ONLY"): "rag" and "tool_executor" are retired for the same
+# reason — an agent's structural role is either a single node ("standard",
+# which may or may not have a knowledge_base/tools attached) or a manager of
+# sub-agents ("orchestrator"). Whether an agent does retrieval or calls tools
+# is a *capability* (kb_id set, tool_instances non-empty), not a role, and
+# was never branched on by IaC/change-impact/guardrails either. Both
+# collapse to "standard". The wizard's UI-side `WizardAgentType`
+# (agent-wizard.ts) was narrowed to the same two values on 2026-08-18, ahead
+# of this backend change.
+#
+# No DynamoDB migration is run for either retirement — normalise_agent_type()
+# maps old values to new ones at read time so existing records stay readable
+# indefinitely; new writes go straight through the AgentType Literal above,
+# which rejects retired values with a 422.
+_LEGACY_AGENT_TYPE_MAP: dict[str, AgentType] = {
+    "conversational": "standard",
+    "task": "standard",
+    "multi-step": "orchestrator",
+    "rag": "standard",
+    "tool_executor": "standard",
+}
+
+
+def normalise_agent_type(value: str) -> str:
+    """Map a possibly-retired agent_type value to the current vocabulary.
+
+    Read-time only. Values already in the current vocabulary (or anything
+    unrecognised) pass through unchanged — unrecognised values still fail
+    loudly via the AgentType Literal when the caller constructs the Pydantic
+    model, which is the correct outcome for genuinely corrupt data.
+    """
+    return _LEGACY_AGENT_TYPE_MAP.get(value, value)
 
 AgentStatus = Literal[
     "DRAFT",
@@ -472,6 +513,10 @@ class AgentVersionRecord(BaseModel):
     # Derived artifacts (populated after pipeline runs — later phases)
     iac_version: str | None = None
     iac_s3_key: str | None = None
+    iac_modules: list[str] | None = None
+    """Resolved module list from the most recent generate-iac call — lets
+    GET /agents/{id}/iac/status (Wizard Redesign QA A-04) report per-module
+    stages without re-resolving them from the configuration."""
     iac_validation_report: IaCValidationReport | None = None
     """Set only by POST /agents/{id}/generate-iac (CLAUDE.md Section 6's IaC
     validation suite) — not by the deploy flow's own IaC generation, whose

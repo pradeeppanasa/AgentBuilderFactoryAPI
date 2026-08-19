@@ -3,7 +3,7 @@
 ## Agent: {{ agent_id }}  Version: {{ version }}
 
 resource "aws_bedrock_guardrail" "agent_guardrail" {
-  name                      = "panasa-{{ agent_id }}-guardrail"
+  name                      = "{{ bedrock_guardrail_name(agent_id) }}"
   blocked_input_messaging   = "This request cannot be processed."
   blocked_outputs_messaging = "This response cannot be shown."
 

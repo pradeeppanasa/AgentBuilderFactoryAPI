@@ -17,7 +17,8 @@ from __future__ import annotations
 import os
 import tempfile
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from typing import Any
 
 import pytest
 from moto import mock_aws
@@ -42,6 +43,18 @@ os.environ["S3_ENDPOINT"] = ""
 # real httpx call that hangs until ConnectTimeout instead of resolving to
 # "disabled" — reproduced in test_health.py, which asserts "disabled".
 os.environ["LANGFUSE_HOST"] = ""
+# Same reasoning again: a developer's real .env may set this true for their
+# own local generate-iac testing (R46). Tests that want it enabled do so
+# explicitly via monkeypatch — the baseline must be deterministic regardless
+# of whatever a developer's own .env happens to have — reproduced: without
+# this, test_non_local_validation_mode_forbidden_by_default failed against a
+# real .env with the flag left on from manual testing.
+os.environ["DEV_VALIDATION_EXTENDED_MODES_ENABLED"] = "false"
+# Same reasoning again: a developer's real .env may set this true for their
+# own manual Runs-feature testing (Observability — Runs Feature, Phase 1).
+# Reproduced: test_seed_demo_forbidden_by_default failed against a real
+# .env with SEED_RUNS_ENABLED=true left on from manual testing.
+os.environ["SEED_RUNS_ENABLED"] = "false"
 os.environ.setdefault("JWT_SECRET_ARN", "jwt-secret")
 os.environ.setdefault("IAC_OUTPUT_BUCKET", "panasa-iac-artifacts-test")
 os.environ.setdefault("AUDIT_S3_BUCKET", "panasa-audit-test")
@@ -109,7 +122,7 @@ async def reset_database() -> AsyncIterator[None]:
 
 
 @pytest.fixture
-async def make_user_and_token():
+async def make_user_and_token() -> Callable[..., Awaitable[tuple[Any, str]]]:
     from app.config import settings
     from app.modules.auth.db import create_db_engine, create_session_factory
     from app.modules.auth.models import User

@@ -1,7 +1,9 @@
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
+from app.config import settings
 from app.main import app
 from app.modules.iac_generator.validation_models import CheckResult, IaCValidationReport
 
@@ -33,7 +35,7 @@ def _minimal_agent_payload(name: str = "KYC Agent") -> dict[str, Any]:
         "name": name,
         "description": "Know Your Customer verification agent",
         "business_purpose": "Automate KYC document verification for onboarding",
-        "agent_type": "task",
+        "agent_type": "standard",
         "configuration": {
             "model_id": "anthropic.claude-3-5-sonnet-20241022-v2:0",
             "model_provider": "bedrock",
@@ -66,6 +68,11 @@ async def test_generate_iac_happy_path_persists_artifact(make_user_and_token) ->
         assert "naming_convention" in check_names
         assert "tagging" in check_names
         assert "resource_presence" in check_names
+
+        # Development Terraform Validation Mode: "local" is the default and
+        # never carries a real-deployment note.
+        assert body["validation_mode"] == "local"
+        assert body["environment_note"] is None
 
         detail = client.get(f"/api/v1/agents/{agent_id}/versions/1", headers=_bearer(token)).json()
 
@@ -129,6 +136,98 @@ async def test_generate_iac_forbidden_for_auditor(make_user_and_token) -> None:
     assert response.status_code == 403
 
 
+async def test_non_local_validation_mode_forbidden_by_default(make_user_and_token) -> None:
+    """dev_validation_extended_modes_enabled defaults to False — the
+    Panasa VPC / Customer VPC placeholder modes must stay hidden unless an
+    operator deliberately opts in."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/agents", json=_minimal_agent_payload(), headers=_bearer(token)
+        ).json()
+        agent_id = created["agent_id"]
+
+        response = client.post(
+            f"/api/v1/agents/{agent_id}/generate-iac",
+            params={"validation_mode": "panasa_vpc"},
+            headers=_bearer(token),
+        )
+        assert response.status_code == 403
+
+        # Nothing was generated or persisted for the disallowed call.
+        detail = client.get(f"/api/v1/agents/{agent_id}/versions/1", headers=_bearer(token)).json()
+    assert detail["iac_s3_key"] is None
+
+
+async def test_non_local_validation_mode_allowed_when_enabled(
+    make_user_and_token, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Never a real deployment even when enabled — same local generate +
+    validate as the default mode, just labelled with an explanatory note
+    and no AWS account contacted (IaCValidator is unchanged either way)."""
+    monkeypatch.setattr(settings, "dev_validation_extended_modes_enabled", True)
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/agents", json=_minimal_agent_payload(), headers=_bearer(token)
+        ).json()
+        agent_id = created["agent_id"]
+
+        response = client.post(
+            f"/api/v1/agents/{agent_id}/generate-iac",
+            params={"validation_mode": "customer_vpc"},
+            headers=_bearer(token),
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["validation_mode"] == "customer_vpc"
+        assert body["environment_note"] is not None
+        assert "not implemented in Stage 1" in body["environment_note"]
+        assert "no aws account was contacted" in body["environment_note"].lower()
+        # Still ran the real, AWS-independent local checks.
+        assert body["validation_report"]["passed"] is True
+
+
+async def test_non_local_validation_mode_forbidden_for_auditor_even_when_enabled(
+    make_user_and_token, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "dev_validation_extended_modes_enabled", True)
+    _, developer_token = await make_user_and_token(TENANT_A, role="developer")
+    _, auditor_token = await make_user_and_token(TENANT_A, role="auditor")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/agents", json=_minimal_agent_payload(), headers=_bearer(developer_token)
+        ).json()
+        agent_id = created["agent_id"]
+
+        response = client.post(
+            f"/api/v1/agents/{agent_id}/generate-iac",
+            params={"validation_mode": "panasa_vpc"},
+            headers=_bearer(auditor_token),
+        )
+        assert response.status_code == 403
+
+
+async def test_invalid_validation_mode_returns_422(make_user_and_token) -> None:
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/agents", json=_minimal_agent_payload(), headers=_bearer(token)
+        ).json()
+        agent_id = created["agent_id"]
+
+        response = client.post(
+            f"/api/v1/agents/{agent_id}/generate-iac",
+            params={"validation_mode": "bogus_mode"},
+            headers=_bearer(token),
+        )
+        assert response.status_code == 422
+
+
 async def test_generate_iac_cross_tenant_returns_404(make_user_and_token) -> None:
     _, token_a = await make_user_and_token(TENANT_A, role="developer")
     _, token_b = await make_user_and_token(TENANT_B, role="developer")
@@ -140,5 +239,91 @@ async def test_generate_iac_cross_tenant_returns_404(make_user_and_token) -> Non
         agent_id = created["agent_id"]
 
         response = client.post(f"/api/v1/agents/{agent_id}/generate-iac", headers=_bearer(token_b))
+
+    assert response.status_code == 404
+
+
+async def test_iac_status_not_started_before_first_generate(make_user_and_token) -> None:
+    """Wizard Redesign QA A-04/U-08 — before generate-iac has ever run for
+    this version, the status endpoint reports not_started with no stages,
+    rather than 404ing or fabricating progress."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/agents", json=_minimal_agent_payload(), headers=_bearer(token)
+        ).json()
+        agent_id = created["agent_id"]
+
+        response = client.get(f"/api/v1/agents/{agent_id}/iac/status", headers=_bearer(token))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "not_started"
+    assert body["stages"] == []
+    assert body["validation"] is None
+
+
+async def test_iac_status_completed_after_generate(make_user_and_token) -> None:
+    """generate-iac renders + validates synchronously (see IaCStatusResponse's
+    docstring) — a poll right after triggering it must already report
+    completed with every resolved module marked as a completed stage."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/agents", json=_minimal_agent_payload(), headers=_bearer(token)
+        ).json()
+        agent_id = created["agent_id"]
+
+        generate_response = client.post(
+            f"/api/v1/agents/{agent_id}/generate-iac", headers=_bearer(token)
+        )
+        assert generate_response.status_code == 200
+        modules = generate_response.json()["modules"]
+
+        response = client.get(f"/api/v1/agents/{agent_id}/iac/status", headers=_bearer(token))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["version"] == 1
+    assert {s["name"] for s in body["stages"]} == set(modules)
+    assert all(s["status"] == "completed" for s in body["stages"])
+    assert body["validation"]["passed"] is True
+
+
+async def test_iac_status_reports_failed_when_validation_failed(make_user_and_token) -> None:
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        app.state.iac_validator = _AlwaysFailsValidator()
+
+        created = client.post(
+            "/api/v1/agents", json=_minimal_agent_payload(), headers=_bearer(token)
+        ).json()
+        agent_id = created["agent_id"]
+
+        client.post(f"/api/v1/agents/{agent_id}/generate-iac", headers=_bearer(token))
+
+        response = client.get(f"/api/v1/agents/{agent_id}/iac/status", headers=_bearer(token))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "failed"
+    assert body["validation"]["passed"] is False
+
+
+async def test_iac_status_forbidden_for_wrong_tenant(make_user_and_token) -> None:
+    _, token_a = await make_user_and_token(TENANT_A, role="developer")
+    _, token_b = await make_user_and_token(TENANT_B, role="developer")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/agents", json=_minimal_agent_payload(), headers=_bearer(token_a)
+        ).json()
+        agent_id = created["agent_id"]
+
+        response = client.get(f"/api/v1/agents/{agent_id}/iac/status", headers=_bearer(token_b))
 
     assert response.status_code == 404

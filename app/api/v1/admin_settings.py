@@ -79,11 +79,44 @@ class SaveDatadogRequest(BaseModel):
     site: DatadogSite | None = None
 
 
+class GrafanaConfig(BaseModel):
+    enabled: bool
+    endpoint: str | None
+
+
+class SaveGrafanaRequest(BaseModel):
+    enabled: bool
+    endpoint: str | None = None
+
+
+class NewRelicConfig(BaseModel):
+    enabled: bool
+    api_key: str | None  # "****" if set, null if unset — never the real value
+
+
+class SaveNewRelicRequest(BaseModel):
+    enabled: bool
+    api_key: str | None = None
+
+
+class DynatraceConfig(BaseModel):
+    enabled: bool
+    endpoint: str | None
+
+
+class SaveDynatraceRequest(BaseModel):
+    enabled: bool
+    endpoint: str | None = None
+
+
 class ObservabilityConfigResponse(BaseModel):
     default_stack: DefaultStackStatus
     otel: OtelEndpointConfig
     langfuse: LangfuseConfig
     datadog: DatadogConfig
+    grafana: GrafanaConfig
+    new_relic: NewRelicConfig
+    dynatrace: DynatraceConfig
 
 
 def _now() -> str:
@@ -107,6 +140,18 @@ async def _load_response(
             enabled=record.datadog_enabled,
             api_key=_MASK if record.datadog_api_key_arn else None,
             site=record.datadog_site,
+        ),
+        grafana=GrafanaConfig(
+            enabled=record.grafana_enabled,
+            endpoint=record.grafana_endpoint,
+        ),
+        new_relic=NewRelicConfig(
+            enabled=record.new_relic_enabled,
+            api_key=_MASK if record.new_relic_api_key_arn else None,
+        ),
+        dynatrace=DynatraceConfig(
+            enabled=record.dynatrace_enabled,
+            endpoint=record.dynatrace_endpoint,
         ),
     )
 
@@ -231,3 +276,110 @@ async def save_datadog_config(
         api_key=_MASK if record.datadog_api_key_arn else None,
         site=record.datadog_site,
     )
+
+
+@router.get("/integrations/grafana", response_model=GrafanaConfig)
+async def get_grafana_config(
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    current_user: Annotated[CurrentUser, Depends(require_role())],
+    store: Annotated[PlatformSettingsStore, Depends(get_platform_settings_store)],
+) -> GrafanaConfig:
+    response = await _load_response(tenant_id, store, current_user.email)
+    return response.grafana
+
+
+@router.patch("/integrations/grafana", response_model=GrafanaConfig)
+async def save_grafana_config(
+    payload: SaveGrafanaRequest,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    current_user: Annotated[CurrentUser, Depends(require_role())],
+    store: Annotated[PlatformSettingsStore, Depends(get_platform_settings_store)],
+) -> GrafanaConfig:
+    record = await store.get_or_create(tenant_id, current_user.email)
+    record = record.model_copy(
+        update={
+            "grafana_enabled": payload.enabled,
+            "grafana_endpoint": (
+                payload.endpoint if payload.endpoint is not None else record.grafana_endpoint
+            ),
+            "updated_by": current_user.email,
+            "updated_at": _now(),
+        }
+    )
+    await store.save(record)
+    return GrafanaConfig(enabled=record.grafana_enabled, endpoint=record.grafana_endpoint)
+
+
+@router.get("/integrations/new-relic", response_model=NewRelicConfig)
+async def get_new_relic_config(
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    current_user: Annotated[CurrentUser, Depends(require_role())],
+    store: Annotated[PlatformSettingsStore, Depends(get_platform_settings_store)],
+) -> NewRelicConfig:
+    response = await _load_response(tenant_id, store, current_user.email)
+    return response.new_relic
+
+
+@router.patch("/integrations/new-relic", response_model=NewRelicConfig)
+async def save_new_relic_config(
+    payload: SaveNewRelicRequest,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    current_user: Annotated[CurrentUser, Depends(require_role())],
+    store: Annotated[PlatformSettingsStore, Depends(get_platform_settings_store)],
+    secrets_manager: Annotated[SecretsManager, Depends(get_secrets_manager)],
+) -> NewRelicConfig:
+    record = await store.get_or_create(tenant_id, current_user.email)
+
+    api_key_arn = record.new_relic_api_key_arn
+    if payload.api_key:
+        api_key_arn = await secrets_manager.create_or_update_secret(
+            name=f"panasa/{tenant_id}/new-relic-api-key",
+            value=payload.api_key,
+            existing_arn=api_key_arn,
+        )
+
+    record = record.model_copy(
+        update={
+            "new_relic_enabled": payload.enabled,
+            "new_relic_api_key_arn": api_key_arn,
+            "updated_by": current_user.email,
+            "updated_at": _now(),
+        }
+    )
+    await store.save(record)
+    return NewRelicConfig(
+        enabled=record.new_relic_enabled,
+        api_key=_MASK if record.new_relic_api_key_arn else None,
+    )
+
+
+@router.get("/integrations/dynatrace", response_model=DynatraceConfig)
+async def get_dynatrace_config(
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    current_user: Annotated[CurrentUser, Depends(require_role())],
+    store: Annotated[PlatformSettingsStore, Depends(get_platform_settings_store)],
+) -> DynatraceConfig:
+    response = await _load_response(tenant_id, store, current_user.email)
+    return response.dynatrace
+
+
+@router.patch("/integrations/dynatrace", response_model=DynatraceConfig)
+async def save_dynatrace_config(
+    payload: SaveDynatraceRequest,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    current_user: Annotated[CurrentUser, Depends(require_role())],
+    store: Annotated[PlatformSettingsStore, Depends(get_platform_settings_store)],
+) -> DynatraceConfig:
+    record = await store.get_or_create(tenant_id, current_user.email)
+    record = record.model_copy(
+        update={
+            "dynatrace_enabled": payload.enabled,
+            "dynatrace_endpoint": (
+                payload.endpoint if payload.endpoint is not None else record.dynatrace_endpoint
+            ),
+            "updated_by": current_user.email,
+            "updated_at": _now(),
+        }
+    )
+    await store.save(record)
+    return DynatraceConfig(enabled=record.dynatrace_enabled, endpoint=record.dynatrace_endpoint)

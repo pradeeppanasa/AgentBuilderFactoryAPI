@@ -119,7 +119,7 @@ async def test_delete_blocked_when_referenced_by_agent(make_user_and_token) -> N
                 "name": "Agent Using KB",
                 "description": "d",
                 "business_purpose": "p",
-                "agent_type": "rag",
+                "agent_type": "standard",
                 "configuration": {
                     "model_id": "anthropic.claude-3-5-sonnet-20241022-v2:0",
                     "model_provider": "bedrock",
