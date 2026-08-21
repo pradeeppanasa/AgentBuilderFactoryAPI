@@ -144,7 +144,11 @@ async def test_playground_turn_without_guardrail_policy(make_user_and_token) -> 
     assert body["metrics"]["guardrail_decisions"] == []
     assert body["metrics"]["tool_calls"] == []
     assert body["metrics"]["kb_retrievals"] is None
-    assert body["metrics"]["memory"]["session_entries"] == 2
+    # TS02-U-02: _memory_state reports 0 when memory is off (the default
+    # here — this agent has no memory config override), not the raw turn
+    # count — see test_playground_session_round_trips_turns for the
+    # memory-enabled case.
+    assert body["metrics"]["memory"]["session_entries"] == 0
 
 
 async def test_playground_model_call_failure_returns_502_with_detail(
@@ -257,6 +261,75 @@ async def test_playground_mock_mode_shapes_reply_from_agents_own_output_schema(
     assert parsed == {"status": "VERIFIED", "confidence": 0.0, "flags": []}
 
 
+async def test_playground_mock_mode_reports_zero_latency(
+    make_user_and_token, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TS02-U-03 — llm_ms was hardcoded to 42, contradicting "LLM not
+    called." Mock mode does no real work in any stage, so every latency
+    figure must be 0."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    async def _fail_if_called(**kwargs: Any) -> None:
+        raise AssertionError("mock mode must never call litellm.acompletion")
+
+    monkeypatch.setattr(litellm, "acompletion", _fail_if_called)
+
+    with TestClient(app) as client:
+        agent_id = await _create_agent(client, token)
+
+        response = client.post(
+            f"/api/v1/agents/{agent_id}/playground?mock=true",
+            json={"message": "hi there"},
+            headers=_bearer(token),
+        )
+
+    assert response.status_code == 200
+    latency = response.json()["metrics"]["latency"]
+    assert latency == {"guardrail_ms": 0, "retrieval_ms": 0, "llm_ms": 0, "total_ms": 0}
+
+
+async def test_playground_reports_zero_session_entries_when_memory_disabled(
+    make_user_and_token,
+) -> None:
+    """TS02-U-02 — session_entries previously reported this playground
+    session's own turn count unconditionally, so an agent configured with
+    Memory: None still showed "Session entries: 2" after one exchange. That
+    number must reflect the agent's own memory feature, not the playground's
+    internal conversation log."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        agent_id = await _create_agent(client, token, memory={"memory_type": "none"})
+
+        response = client.post(
+            f"/api/v1/agents/{agent_id}/playground?mock=true",
+            json={"message": "hi there"},
+            headers=_bearer(token),
+        )
+
+    assert response.status_code == 200
+    memory = response.json()["metrics"]["memory"]
+    assert memory == {"session_entries": 0, "long_term_entries_used": 0}
+
+
+async def test_playground_reports_session_entries_when_memory_enabled(
+    make_user_and_token,
+) -> None:
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        agent_id = await _create_agent(client, token, memory={"memory_type": "session"})
+
+        response = client.post(
+            f"/api/v1/agents/{agent_id}/playground?mock=true",
+            json={"message": "hi there"},
+            headers=_bearer(token),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["metrics"]["memory"]["session_entries"] == 2
+
+
 async def test_playground_mock_mode_never_calls_the_llm(
     make_user_and_token, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -289,10 +362,13 @@ async def test_playground_mock_mode_never_calls_the_llm(
 
 
 async def test_playground_session_round_trips_turns(make_user_and_token) -> None:
+    """TS02-U-02 fixed _memory_state to report 0 when memory is off — this
+    test is about session_entries reflecting real turn count, so it needs
+    an agent with session memory actually enabled to test that at all."""
     _, token = await make_user_and_token(TENANT_A, role="developer")
 
     with TestClient(app) as client:
-        agent_id = await _create_agent(client, token)
+        agent_id = await _create_agent(client, token, memory={"memory_type": "session"})
 
         first = client.post(
             f"/api/v1/agents/{agent_id}/playground",

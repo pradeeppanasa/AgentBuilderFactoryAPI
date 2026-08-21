@@ -29,6 +29,7 @@ from app.modules.guardrails.store import GuardrailPolicyStore
 from app.modules.hitl.store import HitlReviewStore
 from app.modules.iac_generator.generator import IaCGenerator
 from app.modules.iac_generator.validator import IaCValidator
+from app.modules.knowledge_base.provisioner import BedrockKnowledgeBaseProvisioner
 from app.modules.knowledge_base.store import KnowledgeBaseStore
 from app.modules.observability.metrics import MetricsEmitter
 from app.modules.platform.upgrade_orchestrator import PlatformUpgradeOrchestrator
@@ -41,6 +42,7 @@ from app.modules.registry.store import AgentRegistryStore
 from app.modules.runs.store import RunStore
 from app.modules.secrets.manager import SecretsManager
 from app.modules.skills.store import SkillStore
+from app.modules.task_planner.session_store import BuildWithAISessionStore
 from app.modules.telemetry.emitter import TelemetryConfig, TelemetryEmitter
 
 
@@ -146,6 +148,11 @@ async def get_knowledge_base_store(request: Request) -> KnowledgeBaseStore:
     return store
 
 
+async def get_bedrock_kb_provisioner(request: Request) -> BedrockKnowledgeBaseProvisioner:
+    provisioner: BedrockKnowledgeBaseProvisioner = request.app.state.bedrock_kb_provisioner
+    return provisioner
+
+
 async def get_guardrail_policy_store(request: Request) -> GuardrailPolicyStore:
     store: GuardrailPolicyStore = request.app.state.guardrail_policy_store
     return store
@@ -163,6 +170,11 @@ async def get_bedrock_guardrail_provisioner(request: Request) -> BedrockGuardrai
 
 async def get_playground_session_store(request: Request) -> PlaygroundSessionStore:
     store: PlaygroundSessionStore = request.app.state.playground_session_store
+    return store
+
+
+async def get_build_with_ai_session_store(request: Request) -> BuildWithAISessionStore:
+    store: BuildWithAISessionStore = request.app.state.build_with_ai_session_store
     return store
 
 

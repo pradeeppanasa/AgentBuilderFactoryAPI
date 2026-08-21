@@ -214,6 +214,21 @@ def _mock_playground_result(config: AgentConfiguration) -> tuple[str, float, int
     return "Mock response — LLM not called.", 0.0, 120, 64
 
 
+def _memory_state(config: AgentConfiguration, session_turn_count: int) -> MemoryStateSummary:
+    """TS02-U-02: `session_entries` previously reported the playground
+    session's own turn count unconditionally — a live count of *this test
+    conversation*, not the agent's configured memory feature. That reads as
+    "session memory is storing N entries" even when the agent has
+    memory.memory_type == "none", i.e. memory explicitly turned off.
+    Honest behaviour: report 0 when the feature is off, the real turn count
+    only when session/persistent memory is actually enabled. Long-term
+    (persistent) retrieval is Generated Agent Runtime infrastructure this
+    Builder Runtime does not build (F8) — always 0, never fabricated."""
+    if config.memory.memory_type == "none":
+        return MemoryStateSummary(session_entries=0, long_term_entries_used=0)
+    return MemoryStateSummary(session_entries=session_turn_count, long_term_entries_used=0)
+
+
 def _run_tool_calls() -> list[ToolCallSummary]:
     """Tool execution belongs to the Generated Agent Runtime (F8), a
     separate service this Builder Runtime does not build. Always empty
@@ -288,7 +303,10 @@ async def run_playground_turn(
             blocked=False,
             message=mock_reply,
             metrics=PlaygroundMetrics(
-                latency=LatencyBreakdown(guardrail_ms=0, retrieval_ms=0, llm_ms=42, total_ms=42),
+                # TS02-U-03: llm_ms was hardcoded to 42 — a nonzero latency
+                # contradicts "LLM not called." Mock mode does no real work
+                # in any stage, so every latency figure is honestly 0.
+                latency=LatencyBreakdown(guardrail_ms=0, retrieval_ms=0, llm_ms=0, total_ms=0),
                 tokens=TokenUsageSummary(
                     input_tokens=mock_input_tokens, output_tokens=mock_output_tokens
                 ),
@@ -296,9 +314,7 @@ async def run_playground_turn(
                 guardrail_decisions=[],
                 tool_calls=[],
                 kb_retrievals=None,
-                memory=MemoryStateSummary(
-                    session_entries=len(mock_session.turns), long_term_entries_used=0
-                ),
+                memory=_memory_state(config, len(mock_session.turns)),
             ),
         )
 
@@ -429,8 +445,6 @@ async def run_playground_turn(
             guardrail_decisions=guardrail_decisions,
             tool_calls=_run_tool_calls(),
             kb_retrievals=kb_retrievals,
-            memory=MemoryStateSummary(
-                session_entries=len(updated_session.turns), long_term_entries_used=0
-            ),
+            memory=_memory_state(config, len(updated_session.turns)),
         ),
     )

@@ -37,6 +37,16 @@ variable "deployment_role_arn" {
   type = string
 }
 
+variable "opensearch_collection_arn" {
+  description = <<-EOT
+    ARN of the OpenSearch Serverless collection Bedrock Knowledge Bases
+    write vectors to (instructions_kb_api.md / CLAUDE.md Section 43).
+    Provisioned/managed outside this stage — passed in as an existing
+    resource, same as kms_key_arn above.
+  EOT
+  type        = string
+}
+
 variable "ecr_repository_urls" {
   description = "map(image name => repository URL), from stage0's ecr_repository_urls output."
   type        = map(string)

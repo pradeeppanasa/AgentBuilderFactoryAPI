@@ -26,6 +26,8 @@ from app.modules.skills.store import SkillStore
 from app.modules.task_planner.models import (
     AgentProposal,
     CatalogSuggestion,
+    MissingResourceProposal,
+    ResourceKind,
     ResourceProposal,
     TaskPlannerError,
     TaskPlannerProposal,
@@ -452,3 +454,153 @@ async def analyze_architecture(
         confidence=confidence,
         reasoning=reasoning,
     )
+
+
+# ── Build with AI — missing resource config proposal (Section 42.8 Step 2) ──
+# A second, separate LLM call from architecture analysis above: given the
+# resources Step 1 already identified as missing (name + description only),
+# elaborate each into a type-specific starter config (Section 42.5). One
+# batched call for every missing resource in the proposal, not one call per
+# resource — bounded cost regardless of how many resources are missing.
+
+_CONFIG_SYSTEM_PROMPT = """You are an AI agent architect for an enterprise \
+agent-building platform. You are given a list of resources that a proposed \
+agent architecture needs but that do not exist yet. Propose a starter \
+configuration for each, so a human can review and create it.
+
+Per resource_type, "proposed_config" must contain exactly these keys:
+
+- "tool": {"purpose": "string", "endpoint": "string (a plausible REST URL \
+template — clearly a placeholder the user will replace)", "http_method": \
+"GET|POST|PUT|DELETE", "auth_type": "bearer|api_key|oauth|none", \
+"executor_type": "http|lambda", "input_schema": {JSON Schema object}, \
+"output_schema": {JSON Schema object}}
+- "knowledge_base": {"chunk_strategy": "semantic|fixed|paragraph", \
+"embedding_model": "amazon.titan-embed-text-v2:0|cohere.embed-english-v3"}
+- "skill": {"capability": "short phrase naming what this skill lets the \
+agent do", "prompt_fragment": "one sentence telling the agent how/when to \
+use this skill"}
+- "guardrail_policy": {"suggested_filters": ["toxicity"|"pii"|"topic", ...], \
+"reasoning": "one sentence on why these filters fit this use case"}
+
+RULES — follow exactly, no exceptions:
+- NEVER include an actual credential, API key, token, password, or secret \
+value anywhere in a proposed_config. For "tool", "auth_type" is a type \
+label only — never a value.
+- Do not invent fields beyond the ones listed above for each resource_type.
+- Respond with ONLY a single valid JSON object, no markdown fences, no \
+prose:
+
+{"resources": [
+  {"resource_key": "string (copied verbatim from the input)",
+   "proposed_config": {...}},
+  ...
+]}
+"""
+
+
+def _missing_resources(response: TaskPlannerResponse) -> list[MissingResourceProposal]:
+    """Every resource across the whole proposed architecture that came back
+    in_catalog=false — Section 42.2's "Missing" rows, before configs are
+    elaborated. resource_key is a stable `type:slug` id since a
+    not-yet-created resource has no resource_id yet."""
+    missing: list[MissingResourceProposal] = []
+    seen_keys: set[str] = set()
+
+    def _add(kind: ResourceKind, suggestion: CatalogSuggestion) -> None:
+        if suggestion.in_catalog:
+            return
+        key = f"{kind}:{_slugify_key(suggestion.name)}"
+        if key in seen_keys:
+            return
+        seen_keys.add(key)
+        missing.append(
+            MissingResourceProposal(
+                resource_key=key,
+                resource_type=kind,
+                name=suggestion.name,
+                description=suggestion.description or "",
+            )
+        )
+
+    for tool in response.resources.tools:
+        _add("tool", tool)
+    for kb in response.resources.knowledge_bases:
+        _add("knowledge_base", kb)
+    for policy in response.resources.guardrail_policies:
+        _add("guardrail_policy", policy)
+    for skill in response.resources.skills:
+        _add("skill", skill)
+    return missing
+
+
+def _slugify_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "resource"
+
+
+def _try_parse_configs(raw: str) -> dict[str, dict[str, Any]] | None:
+    try:
+        data: Any = json.loads(_strip_code_fence(raw))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    resources = data.get("resources")
+    if not isinstance(resources, list):
+        return None
+    result: dict[str, dict[str, Any]] = {}
+    for entry in resources:
+        if not isinstance(entry, dict):
+            continue
+        key = entry.get("resource_key")
+        config = entry.get("proposed_config")
+        if isinstance(key, str) and isinstance(config, dict):
+            result[key] = config
+    return result
+
+
+async def propose_missing_resource_configs(
+    response: TaskPlannerResponse,
+    model_id: str,
+    max_tokens: int,
+) -> list[MissingResourceProposal]:
+    """Section 42.8 Step 2. Returns the missing resources from `response`
+    with `proposed_config` filled in where the LLM call succeeds — a
+    resource whose config the model didn't return (or returned
+    unparseably) keeps an empty proposed_config rather than failing the
+    whole propose request; the user can still review/edit it manually."""
+    missing = _missing_resources(response)
+    if not missing:
+        return []
+
+    user_message = "Missing resources:\n" + json.dumps(
+        [
+            {
+                "resource_key": m.resource_key,
+                "resource_type": m.resource_type,
+                "name": m.name,
+                "description": m.description,
+            }
+            for m in missing
+        ],
+        indent=2,
+    )
+
+    try:
+        raw = await call_factory_model(model_id, _CONFIG_SYSTEM_PROMPT, user_message, max_tokens)
+    except Exception:
+        # Best-effort enrichment, not a hard requirement — propose() still
+        # returns useful name/description/resource_type even if this call
+        # fails outright (auth, throttling, timeout).
+        return missing
+
+    configs = _try_parse_configs(raw)
+    if configs is None:
+        return missing
+
+    return [
+        m.model_copy(update={"proposed_config": configs[m.resource_key]})
+        if m.resource_key in configs
+        else m
+        for m in missing
+    ]

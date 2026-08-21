@@ -96,8 +96,18 @@ class GuardrailConfig(BaseModel):
 
 class KBConfig(BaseModel):
     enabled: bool = False
+    # CLAUDE.md Section 43.1 (2026-08-19): links this inline retrieval config
+    # to a real panasa-knowledge-bases catalog record. Distinct from
+    # AgentConfiguration.kb_id below — that field is the one actually wired
+    # to the KB catalog picker in the UI; this one lets KBConfig be
+    # self-describing without requiring callers to cross-reference the
+    # top-level field.
+    kb_id: str | None = None
     kb_name: str | None = None
     s3_bucket: str | None = None
+    # Section 43.2: exact S3 path Bedrock's data source crawls recursively —
+    # "{tenant_id}/{kb_id}/raw/". Never write to the bucket root.
+    s3_prefix: str | None = None
     embedding_model: str = "amazon.titan-embed-text-v2:0"
     chunk_strategy: str = "semantic"  # semantic | fixed | paragraph
     top_k: int = 5

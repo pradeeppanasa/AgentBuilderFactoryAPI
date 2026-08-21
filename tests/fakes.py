@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
 from botocore.exceptions import ClientError
 
 from app.modules.git_provider.base import GitProvider
@@ -44,6 +45,44 @@ class FakeGitProvider(GitProvider):
 
     async def close_pull_request(self, repo: str, pr_id: str, reason: str) -> None:
         self.closed.append((repo, pr_id, reason))
+
+
+class FailingGitProvider(GitProvider):
+    """Simulates a real git provider auth failure (e.g. an expired/invalid
+    GIT_CREDENTIALS_SECRET token) — raises the same httpx.HTTPStatusError
+    shape GitHubProvider.create_branch's raise_for_status() would, so the
+    deploy endpoint's exception handling is exercised against the real
+    exception type rather than a generic stand-in."""
+
+    def __init__(self, status_code: int = 401) -> None:
+        self._status_code = status_code
+
+    async def create_branch(self, repo: str, branch: str, from_branch: str = "main") -> None:
+        request = httpx.Request("GET", "https://api.github.com/repos/org/repo/git/ref/heads/main")
+        response = httpx.Response(self._status_code, request=request)
+        raise httpx.HTTPStatusError(
+            f"Client error '{self._status_code} Unauthorized' for url '{request.url}'",
+            request=request,
+            response=response,
+        )
+
+    async def commit_files(
+        self, repo: str, branch: str, files: dict[str, str], message: str
+    ) -> str:
+        raise AssertionError("commit_files should never be reached — create_branch fails first")
+
+    async def create_pull_request(
+        self, repo: str, branch: str, title: str, description: str
+    ) -> str:
+        raise AssertionError(
+            "create_pull_request should never be reached — create_branch fails first"
+        )
+
+    async def merge_pull_request(self, repo: str, pr_id: str) -> None:
+        raise AssertionError("merge_pull_request should never be reached in this test")
+
+    async def close_pull_request(self, repo: str, pr_id: str, reason: str) -> None:
+        raise AssertionError("close_pull_request should never be reached in this test")
 
 
 class FakeToxicityClassifier:
@@ -203,5 +242,62 @@ class FakeSTSClient:
                 "SecretAccessKey": self._secret_access_key,
                 "SessionToken": self._session_token,
                 "Expiration": "2026-08-16T01:00:00Z",
+            }
+        }
+
+
+class FakeBedrockAgentClient:
+    """Stands in for the boto3 `bedrock-agent` control-plane client's
+    CreateKnowledgeBase/CreateDataSource/StartIngestionJob/GetIngestionJob —
+    moto doesn't implement any of these (same gap as FakeBedrockControlPlaneClient
+    above for plain `bedrock`), so this is the only way to test
+    app.modules.knowledge_base.provisioner.BedrockKnowledgeBaseProvisioner
+    without a real AWS call."""
+
+    def __init__(
+        self,
+        *,
+        kb_id: str = "kb-fake-123",
+        ds_id: str = "ds-fake-456",
+        ingestion_status: str = "COMPLETE",
+    ) -> None:
+        self._kb_id = kb_id
+        self._ds_id = ds_id
+        self._ingestion_status = ingestion_status
+        self.create_kb_calls: list[dict[str, Any]] = []
+        self.create_ds_calls: list[dict[str, Any]] = []
+        self.delete_ds_calls: list[dict[str, Any]] = []
+        self.delete_kb_calls: list[dict[str, Any]] = []
+        self.start_ingestion_calls: list[dict[str, Any]] = []
+        self.get_ingestion_calls: list[dict[str, Any]] = []
+
+    def create_knowledge_base(self, **kwargs: Any) -> dict[str, Any]:
+        self.create_kb_calls.append(kwargs)
+        return {"knowledgeBase": {"knowledgeBaseId": self._kb_id}}
+
+    def create_data_source(self, **kwargs: Any) -> dict[str, Any]:
+        self.create_ds_calls.append(kwargs)
+        return {"dataSource": {"dataSourceId": self._ds_id}}
+
+    def delete_data_source(self, **kwargs: Any) -> dict[str, Any]:
+        self.delete_ds_calls.append(kwargs)
+        return {}
+
+    def delete_knowledge_base(self, **kwargs: Any) -> dict[str, Any]:
+        self.delete_kb_calls.append(kwargs)
+        return {}
+
+    def start_ingestion_job(self, **kwargs: Any) -> dict[str, Any]:
+        self.start_ingestion_calls.append(kwargs)
+        return {"ingestionJob": {"ingestionJobId": "job-fake-789"}}
+
+    def get_ingestion_job(self, **kwargs: Any) -> dict[str, Any]:
+        self.get_ingestion_calls.append(kwargs)
+        return {
+            "ingestionJob": {
+                "status": self._ingestion_status,
+                "statistics": {"numberOfDocumentsIndexed": 3, "numberOfDocumentsFailed": 0},
+                "startedAt": "2026-08-19T10:00:00Z",
+                "updatedAt": "2026-08-19T10:00:05Z",
             }
         }

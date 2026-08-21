@@ -11,7 +11,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from app.main import app
-from tests.fakes import FakeGitProvider
+from tests.fakes import FailingGitProvider, FakeGitProvider
 
 TENANT_A = "tenant-a"
 TENANT_B = "tenant-b"
@@ -76,6 +76,34 @@ async def test_deploy_happy_path_triggers_git_and_eventbridge(make_user_and_toke
     assert agent_id in pr_title
     assert "Deploy" in pr_title
     assert "pending" in pr_description.lower()
+
+
+async def test_deploy_git_provider_failure_returns_structured_502_not_bare_500(
+    make_user_and_token,
+) -> None:
+    """TS02-A-03 — before this fix, an unhandled httpx.HTTPStatusError from
+    GitHubProvider.create_branch (e.g. an invalid/expired git token)
+    propagated straight out of the route as a bodyless 500. The UI must
+    always get a structured, actionable error instead (Fix 3 of the TS02
+    bug report), and the deployment record must be marked FAILED rather
+    than left stuck at its initial PENDING stages."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        app.state.git_provider = FailingGitProvider(status_code=401)
+
+        created = client.post(
+            "/api/v1/agents", json=_minimal_agent_payload(), headers=_bearer(token)
+        ).json()
+        agent_id = created["agent_id"]
+
+        response = client.post(f"/api/v1/agents/{agent_id}/deploy", headers=_bearer(token))
+
+    assert response.status_code == 502
+    body = response.json()
+    assert body["detail"]["error"] == "git_provider_failed"
+    message = body["detail"]["message"].lower()
+    assert "credentials" in message or "token" in message
 
 
 async def test_deploy_404_for_unknown_agent(make_user_and_token) -> None:

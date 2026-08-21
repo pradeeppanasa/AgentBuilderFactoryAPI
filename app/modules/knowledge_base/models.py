@@ -14,7 +14,16 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 KBSourceType = Literal["s3", "url", "upload", "manual"]
-KBStatus = Literal["INDEXING", "READY", "FAILED"]
+# CREATING/ACTIVE/SYNCING/SYNC_FAILED/DELETING added alongside the original
+# INDEXING/READY/FAILED (CLAUDE.md Section 43/instructions_kb_api.md,
+# 2026-08-19) rather than replacing them — existing records and the
+# pre-Bedrock reindex stub still use the old three; real Bedrock-backed KBs
+# (see provisioner.py) use the new five. Additive, same treatment every
+# other Advanced Config extension in this codebase gets.
+KBStatus = Literal[
+    "INDEXING", "READY", "FAILED", "CREATING", "ACTIVE", "SYNCING", "SYNC_FAILED", "DELETING"
+]
+KBSyncStatus = Literal["IN_PROGRESS", "COMPLETE", "FAILED"]
 
 EmbeddingModel = Literal[
     "amazon.titan-embed-text-v2:0",
@@ -40,9 +49,25 @@ class KnowledgeBaseRecord(BaseModel):
     embedding_model: EmbeddingModel = "amazon.titan-embed-text-v2:0"
     chunk_size_tokens: int = 512
     chunk_overlap_pct: int = 10
+    chunk_strategy: Literal["semantic", "fixed", "paragraph"] = "semantic"
+    """Bedrock's own chunking-strategy concept (instructions_kb_api.md) —
+    distinct from chunk_size_tokens/chunk_overlap_pct above, which predate
+    real Bedrock provisioning and describe a size-based scheme Bedrock's
+    SEMANTIC/FIXED_SIZE chunking strategies don't directly map onto."""
 
     status: KBStatus = "INDEXING"
     document_count: int = 0
+
+    # ── Real Bedrock provisioning (Section 43 / instructions_kb_api.md,
+    # 2026-08-19) — additive. None for any KB created before this existed,
+    # or one whose source_type isn't backed by a real Bedrock KB yet.
+    s3_bucket: str | None = None
+    s3_prefix: str | None = None  # "{tenant_id}/{kb_id}/raw/"
+    bedrock_kb_id: str | None = None
+    bedrock_ds_id: str | None = None
+    last_synced_at: str | None = None
+    sync_status: KBSyncStatus | None = None
+    sync_error: str | None = None
 
     created_by: str
     created_at: str

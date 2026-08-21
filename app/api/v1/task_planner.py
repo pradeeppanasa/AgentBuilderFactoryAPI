@@ -6,6 +6,12 @@ before the standard create-agent flow (`POST /projects/{id}/agents`) runs.
 Read-only relative to persisted state, so open to every authenticated role
 (same as other non-mutating analysis endpoints in this API), not gated to
 developer-only.
+
+The "Build with AI" propose/approve/status flow (CLAUDE.md Section 42) that
+sits on top of analyze_architecture() below lives in its own router,
+app/api/v1/build_with_ai.py, mounted at /agents/build-with-ai per Section
+42.6's exact path spec — not nested under this file's /platform/task-planner
+prefix.
 """
 
 from __future__ import annotations

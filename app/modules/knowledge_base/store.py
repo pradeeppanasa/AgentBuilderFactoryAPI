@@ -18,8 +18,10 @@ from app.config import Settings
 from app.modules.knowledge_base.models import (
     EmbeddingModel,
     KBSourceType,
+    KBSyncStatus,
     KnowledgeBaseRecord,
 )
+from app.modules.knowledge_base.provisioner import BedrockKnowledgeBaseProvisioner
 from app.shared.dynamodb_types import decimal_to_native
 
 
@@ -77,10 +79,22 @@ class KnowledgeBaseStore:
         embedding_model: EmbeddingModel = "amazon.titan-embed-text-v2:0",
         chunk_size_tokens: int = 512,
         chunk_overlap_pct: int = 10,
+        chunk_strategy: str = "semantic",
+        kb_documents_bucket: str | None = None,
+        provisioner: BedrockKnowledgeBaseProvisioner | None = None,
     ) -> KnowledgeBaseRecord:
+        """When `provisioner` is given (instructions_kb_api.md /
+        CLAUDE.md Section 43), also provisions a real Bedrock Knowledge
+        Base + S3 data source and stores the resulting bedrock_kb_id/
+        bedrock_ds_id/s3_bucket/s3_prefix. A provisioning failure
+        (KnowledgeBaseProvisioningError) propagates to the caller before
+        anything is written to DynamoDB — never a half-created record."""
         now = _now()
+        kb_id = f"{_slugify(name)}-{uuid.uuid4().hex[:6]}"
+        s3_prefix = f"{tenant_id}/{kb_id}/raw/" if kb_documents_bucket else None
+
         record = KnowledgeBaseRecord(
-            kb_id=f"{_slugify(name)}-{uuid.uuid4().hex[:6]}",
+            kb_id=kb_id,
             tenant_id=tenant_id,
             name=name,
             description=description,
@@ -89,14 +103,63 @@ class KnowledgeBaseStore:
             embedding_model=embedding_model,
             chunk_size_tokens=chunk_size_tokens,
             chunk_overlap_pct=chunk_overlap_pct,
-            status="INDEXING",
+            chunk_strategy=chunk_strategy,
+            status="CREATING" if provisioner is not None else "INDEXING",
             document_count=0,
+            s3_bucket=kb_documents_bucket,
+            s3_prefix=s3_prefix,
             created_by=created_by,
             created_at=now,
             updated_at=now,
         )
+
+        if provisioner is not None:
+            bedrock_kb_id, bedrock_ds_id = await provisioner.provision(record)
+            record = record.model_copy(
+                update={
+                    "bedrock_kb_id": bedrock_kb_id,
+                    "bedrock_ds_id": bedrock_ds_id,
+                    "status": "ACTIVE",
+                }
+            )
+
         await asyncio.to_thread(self._table.put_item, Item=record.model_dump(mode="json"))
         return record
+
+    async def update_sync_state(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        sync_status: KBSyncStatus,
+        sync_error: str | None = None,
+        mark_synced: bool = False,
+    ) -> KnowledgeBaseRecord:
+        record = await self.get(tenant_id, kb_id)
+        if record is None:
+            raise KnowledgeBaseNotFoundError(kb_id)
+        updates: dict[str, Any] = {
+            "sync_status": sync_status,
+            "sync_error": sync_error,
+            "status": "SYNCING" if sync_status == "IN_PROGRESS" else "ACTIVE",
+            "updated_at": _now(),
+        }
+        if mark_synced:
+            updates["last_synced_at"] = _now()
+        updated = record.model_copy(update=updates)
+        await asyncio.to_thread(self._table.put_item, Item=updated.model_dump(mode="json"))
+        return updated
+
+    async def set_document_count(
+        self, tenant_id: str, kb_id: str, document_count: int
+    ) -> KnowledgeBaseRecord:
+        record = await self.get(tenant_id, kb_id)
+        if record is None:
+            raise KnowledgeBaseNotFoundError(kb_id)
+        updated = record.model_copy(
+            update={"document_count": document_count, "updated_at": _now()}
+        )
+        await asyncio.to_thread(self._table.put_item, Item=updated.model_dump(mode="json"))
+        return updated
 
     async def list_knowledge_bases(self, tenant_id: str) -> list[KnowledgeBaseRecord]:
         response = await asyncio.to_thread(

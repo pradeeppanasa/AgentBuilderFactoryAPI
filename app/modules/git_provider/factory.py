@@ -10,11 +10,14 @@ from app.modules.git_provider.bitbucket import BitbucketProvider
 from app.modules.git_provider.codecommit import CodeCommitProvider
 from app.modules.git_provider.github import GitHubProvider
 from app.modules.git_provider.gitlab import GitLabProvider
+from app.modules.git_provider.mock import MockGitProvider
 
 
 def create_git_provider(
     settings: Settings, token: str | None, codecommit_client: Any
 ) -> GitProvider:
+    if settings.mock_git_provider:
+        return MockGitProvider()
     if settings.git_provider == "github":
         assert token is not None
         return GitHubProvider(token)

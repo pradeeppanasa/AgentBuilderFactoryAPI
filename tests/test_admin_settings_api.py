@@ -265,3 +265,95 @@ async def test_non_admin_cannot_read_or_write_settings(make_user_and_token) -> N
             ).status_code
             == 403
         )
+
+
+# ── Capability Discovery — provider-neutral capabilities ────────────────────
+# The UI must only ever see "logs"/"metrics"/"distributed_tracing"/
+# "opentelemetry" plus a status/detail/adapters list — never brand a
+# capability by its backing provider. See
+# app/modules/observability/capabilities.py.
+
+
+async def test_capabilities_default_state(make_user_and_token) -> None:
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/v1/admin/settings/observability/capabilities", headers=_bearer(admin_token)
+        )
+        assert response.status_code == 200
+        by_kind = {c["capability"]: c for c in response.json()["capabilities"]}
+
+        assert by_kind["logs"]["status"] == "active"
+        assert by_kind["logs"]["adapters"] == ["cloudwatch_logs"]
+        assert by_kind["metrics"]["status"] == "active"
+        assert by_kind["distributed_tracing"]["status"] == "active"
+        assert by_kind["distributed_tracing"]["adapters"] == ["aws_xray"]
+
+        # Nothing configured yet — OpenTelemetry is honestly "inactive", not
+        # a false "active"/"unknown" claim.
+        assert by_kind["opentelemetry"]["status"] == "inactive"
+        assert by_kind["opentelemetry"]["adapters"] == ["otel_collector"]
+
+        # Provider-neutral: no vendor name anywhere in the response other
+        # than inside `detail`/`adapters` disclosure text.
+        for kind in ("capability", "status"):
+            for cap in response.json()["capabilities"]:
+                assert isinstance(cap[kind], str)
+
+
+async def test_capabilities_reflect_configured_otel_endpoint(make_user_and_token) -> None:
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        client.patch(
+            "/api/v1/admin/settings/otel-endpoint",
+            json={"endpoint": "http://collector.internal:4317"},
+            headers=_bearer(admin_token),
+        )
+
+        response = client.get(
+            "/api/v1/admin/settings/observability/capabilities", headers=_bearer(admin_token)
+        )
+        by_kind = {c["capability"]: c for c in response.json()["capabilities"]}
+
+        # Configured but not actively health-probed — "unknown", not "active".
+        assert by_kind["opentelemetry"]["status"] == "unknown"
+        assert "collector.internal:4317" in by_kind["opentelemetry"]["detail"]
+
+
+async def test_capabilities_merge_optional_integration_into_existing_capability(
+    make_user_and_token,
+) -> None:
+    """Enabling Langfuse must not invent a fifth capability — it merges into
+    distributed_tracing, and since X-Ray ("active") already backs that
+    capability, the merged status stays "active" (active outranks unknown)."""
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        client.patch(
+            "/api/v1/admin/settings/integrations/langfuse",
+            json={"enabled": True, "host": "https://langfuse.internal.example.com"},
+            headers=_bearer(admin_token),
+        )
+
+        response = client.get(
+            "/api/v1/admin/settings/observability/capabilities", headers=_bearer(admin_token)
+        )
+        capabilities = response.json()["capabilities"]
+        assert [c["capability"] for c in capabilities].count("distributed_tracing") == 1
+
+        tracing = next(c for c in capabilities if c["capability"] == "distributed_tracing")
+        assert tracing["status"] == "active"
+        assert set(tracing["adapters"]) == {"aws_xray", "langfuse"}
+        assert "Langfuse" in tracing["detail"]
+
+
+async def test_capabilities_requires_admin_role(make_user_and_token) -> None:
+    _, dev_token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/v1/admin/settings/observability/capabilities", headers=_bearer(dev_token)
+        )
+    assert response.status_code == 403

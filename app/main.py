@@ -30,6 +30,7 @@ from app.modules.guardrails.store import GuardrailPolicyStore
 from app.modules.hitl.store import HitlReviewStore
 from app.modules.iac_generator.generator import IaCGenerator
 from app.modules.iac_generator.validator import IaCValidator
+from app.modules.knowledge_base.provisioner import BedrockKnowledgeBaseProvisioner
 from app.modules.knowledge_base.store import KnowledgeBaseStore
 from app.modules.observability.metrics import MetricsEmitter
 from app.modules.platform.upgrade_orchestrator import PlatformUpgradeOrchestrator
@@ -42,8 +43,10 @@ from app.modules.registry.store import AgentRegistryStore
 from app.modules.runs.store import RunStore
 from app.modules.secrets.manager import SecretsManager
 from app.modules.skills.store import SkillStore
+from app.modules.task_planner.session_store import BuildWithAISessionStore
 from app.modules.telemetry.emitter import TelemetryConfig, TelemetryEmitter
 from app.shared.aws_clients import (
+    create_bedrock_agent_client,
     create_bedrock_client,
     create_bedrock_client_with_credentials,
     create_bedrock_runtime_client,
@@ -172,9 +175,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await playground_session_store.ensure_table()
     app.state.playground_session_store = playground_session_store
 
-    run_store = RunStore(dynamodb, settings)
-    await run_store.ensure_table()
-    app.state.run_store = run_store
+    build_with_ai_session_store = BuildWithAISessionStore(dynamodb, settings)
+    await build_with_ai_session_store.ensure_table()
+    app.state.build_with_ai_session_store = build_with_ai_session_store
 
     bedrock_credential_store = BedrockCredentialStore(dynamodb, settings)
     await bedrock_credential_store.ensure_table()
@@ -213,6 +216,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         client_factory=lambda creds: create_bedrock_client_with_credentials(settings, creds),
         mock_enabled=settings.mock_bedrock_guardrails,
     )
+    app.state.bedrock_kb_provisioner = BedrockKnowledgeBaseProvisioner(
+        create_bedrock_agent_client(settings),
+        kb_role_arn=settings.bedrock_kb_role_arn or "",
+        opensearch_collection_arn=settings.opensearch_collection_arn or "",
+        aws_region=settings.aws_region,
+        kb_documents_bucket=settings.kb_documents_bucket or "",
+        mock_enabled=settings.mock_bedrock_kb,
+    )
 
     # R16: TELEMETRY_ENABLED defaults false; categories default all-on so
     # flipping the master switch alone re-enables full telemetry. PUT
@@ -246,7 +257,7 @@ else:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_allowed_origins_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -23,6 +23,10 @@ from pydantic import BaseModel
 from app.dependencies import get_platform_settings_store, get_secrets_manager, get_tenant_id
 from app.modules.auth.dependencies import require_role
 from app.modules.auth.schemas import CurrentUser
+from app.modules.observability.capabilities import (
+    CapabilityDiscoveryResponse,
+    discover_capabilities,
+)
 from app.modules.platform_settings.store import PlatformSettingsStore
 from app.modules.secrets.manager import SecretsManager
 
@@ -163,6 +167,20 @@ async def get_observability_config(
     store: Annotated[PlatformSettingsStore, Depends(get_platform_settings_store)],
 ) -> ObservabilityConfigResponse:
     return await _load_response(tenant_id, store, current_user.email)
+
+
+@router.get("/observability/capabilities", response_model=CapabilityDiscoveryResponse)
+async def get_observability_capabilities(
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    current_user: Annotated[CurrentUser, Depends(require_role())],
+    store: Annotated[PlatformSettingsStore, Depends(get_platform_settings_store)],
+) -> CapabilityDiscoveryResponse:
+    """CLAUDE.md Capability Discovery: derives provider-neutral capabilities
+    (logs/metrics/distributed_tracing/opentelemetry) from the tenant's
+    registered configuration. See app/modules/observability/capabilities.py
+    — the only place a specific vendor name is allowed to appear in logic."""
+    record = await store.get_or_create(tenant_id, current_user.email)
+    return discover_capabilities(record)
 
 
 @router.patch("/otel-endpoint", response_model=OtelEndpointConfig)

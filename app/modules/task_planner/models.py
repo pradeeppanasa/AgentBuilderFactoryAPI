@@ -21,7 +21,7 @@ card layout (which shows a single suggested guardrail policy, not a list).
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -137,3 +137,145 @@ class TaskPlannerResponse(BaseModel):
     output_schema: str | None = None
     confidence: float = 0.5
     reasoning: str = ""
+
+
+# ── Build with AI — Resource Resolution (CLAUDE.md Section 42, 2026-08-19) ──
+#
+# Additive, not a replacement: analyze_architecture()/TaskPlannerResponse
+# above are the underlying computation ("what agents, what resources") and
+# stay exactly as they are, still exercised directly by
+# test_task_planner_architecture_api.py. This layer wraps that computation
+# in the propose -> approve -> status flow Section 42 specifies: the
+# propose step additionally classifies every resource as available/missing
+# and (for missing ones) proposes a starter config; the approve step
+# actually creates the approved missing resources and the proposed agents,
+# server-side, from a stored session rather than trusting a client-resent
+# copy of the architecture (R47/R48).
+
+ResourceKind = Literal["tool", "knowledge_base", "guardrail_policy", "skill"]
+
+
+class BuildWithAIRequest(BaseModel):
+    description: str
+    project_id: str | None = None
+
+
+class AvailableResourceRef(BaseModel):
+    """A resource the proposed architecture needs that already exists in
+    the tenant's catalog — Section 42.2's "Available" rows."""
+
+    resource_type: ResourceKind
+    resource_id: str
+    name: str
+
+
+class MissingResourceProposal(BaseModel):
+    """A resource the proposed architecture needs that does not exist yet
+    — Section 42.2's "Missing" rows / Section 42.3's approval cards.
+    `proposed_config` is type-specific (Section 42.5) and, per R48, never
+    contains a credential value — only an `auth_type` label where relevant."""
+
+    resource_key: str
+    """Stable id for this proposal within the session (`type:name` slug) —
+    what the approve request's `skip_resource_keys`/`edited_configs` refer
+    to, since the resource has no real resource_id until it's created."""
+
+    resource_type: ResourceKind
+    name: str
+    description: str
+    proposed_config: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProposedAgentSpec(BaseModel):
+    """One agent Task Planner recommends creating — Section 42.2's
+    "Proposed" rows. `tools`/`knowledge_bases`/`skills`/`guardrail_policy`/
+    `sub_agents` reference resources by name, resolved back to real/
+    to-be-created ids at approve time (see executor.py)."""
+
+    name: str
+    role: Literal["standard", "orchestrator"]
+    business_purpose: str
+    system_prompt: str
+    capability_description: str = ""
+    tools: list[str] = Field(default_factory=list)
+    knowledge_bases: list[str] = Field(default_factory=list)
+    guardrail_policy: str | None = None
+    skills: list[str] = Field(default_factory=list)
+    sub_agents: list[str] = Field(default_factory=list)
+
+
+class BuildWithAIProposal(BaseModel):
+    session_id: str
+    description: str
+    available_resources: list[AvailableResourceRef] = Field(default_factory=list)
+    missing_resources: list[MissingResourceProposal] = Field(default_factory=list)
+    proposed_agents: list[ProposedAgentSpec] = Field(default_factory=list)
+    estimated_duration_seconds: int = 15
+    confidence: float = 0.5
+    reasoning: str = ""
+
+
+class BuildWithAIApproveRequest(BaseModel):
+    session_id: str
+    skip_resource_keys: list[str] = Field(default_factory=list)
+    """resource_key values (from the proposal) the user chose "Skip" on —
+    Section 42.3. Every other missing resource is approved as proposed."""
+    edited_configs: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    """resource_key -> replacement proposed_config for resources the user
+    chose "Edit" on — Section 42.3. Merged over (not replacing) the
+    original proposed_config."""
+
+
+class CreatedResourceSummary(BaseModel):
+    resource_type: ResourceKind
+    resource_id: str
+    name: str
+
+
+class CreatedAgentSummary(BaseModel):
+    agent_id: str
+    name: str
+    role: Literal["standard", "orchestrator"]
+
+
+class BuildWithAIApproveResponse(BaseModel):
+    session_id: str
+    created_resources: list[CreatedResourceSummary] = Field(default_factory=list)
+    skipped_resource_keys: list[str] = Field(default_factory=list)
+    created_agents: list[CreatedAgentSummary] = Field(default_factory=list)
+
+
+BuildWithAISessionStatus = Literal["proposed", "completed", "failed"]
+
+
+class BuildWithAIStatusResponse(BaseModel):
+    session_id: str
+    status: BuildWithAISessionStatus
+    created_resources: list[CreatedResourceSummary] = Field(default_factory=list)
+    created_agents: list[CreatedAgentSummary] = Field(default_factory=list)
+    error: str | None = None
+
+
+class BuildWithAISessionRecord(BaseModel):
+    """Persisted server-side between propose and approve (DynamoDB
+    `panasa-build-with-ai-sessions`, see session_store.py). Approve acts on
+    this stored computation rather than trusting a client-resent copy of
+    the architecture — the client only ever sends back `session_id` plus
+    which resource_keys to skip/edit (R47: nothing is created without
+    explicit user approval, but what gets created is server-computed)."""
+
+    session_id: str
+    tenant_id: str
+    project_id: str | None = None
+    description: str
+
+    architecture: TaskPlannerResponse
+    missing_resources: list[MissingResourceProposal] = Field(default_factory=list)
+
+    status: BuildWithAISessionStatus = "proposed"
+    created_resources: list[CreatedResourceSummary] = Field(default_factory=list)
+    created_agents: list[CreatedAgentSummary] = Field(default_factory=list)
+    error: str | None = None
+
+    created_at: str
+    updated_at: str

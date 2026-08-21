@@ -54,6 +54,16 @@ def create_bedrock_client(settings: Settings) -> Any:
     return boto3.client("bedrock", region_name=settings.aws_region)
 
 
+def create_bedrock_agent_client(settings: Settings) -> Any:
+    """Control-plane client for Bedrock Knowledge Bases —
+    CreateKnowledgeBase/CreateDataSource/StartIngestionJob/GetIngestionJob
+    (app.modules.knowledge_base.provisioner). A different boto3 service
+    ("bedrock-agent") from create_bedrock_client's plain "bedrock" above —
+    guardrails and knowledge bases are control-planed by different Bedrock
+    sub-services."""
+    return boto3.client("bedrock-agent", region_name=settings.aws_region)
+
+
 def create_sts_client(settings: Settings) -> Any:
     """Section 37.15 (2026-08-16) — resolves a GuardrailPolicy's
     bedrock_credential_id into temporary credentials via sts:AssumeRole.

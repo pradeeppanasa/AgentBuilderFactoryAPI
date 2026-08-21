@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Literal
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
@@ -519,9 +520,28 @@ async def _trigger_deployment(
     deployment_id = f"DEP-{uuid.uuid4().hex[:8].upper()}"
     branch = f"panasa/agent-{agent_id}-v{version}-{deployment_id}"
 
-    iac_result = await iac_generator.generate(
-        agent_id=agent_id, tenant_id=tenant_id, version=version, config=configuration
-    )
+    # TS02-A-03: every external call below (S3/IaC generation, the git
+    # provider's real network calls) can fail for reasons entirely outside
+    # this request — a git token that's invalid/expired/unconfigured, the
+    # IaC bucket unreachable, etc. Before this fix, any of those surfaced
+    # as a bare, bodyless 500 (an unhandled httpx.HTTPStatusError or
+    # botocore ClientError propagating straight out of the route). The UI
+    # must always get a structured, actionable error instead (Fix 3 in the
+    # TS02 bug report) — matching the same convention already used for
+    # LLM/guardrail/KB provisioning failures elsewhere in this API.
+    try:
+        iac_result = await iac_generator.generate(
+            agent_id=agent_id, tenant_id=tenant_id, version=version, config=configuration
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "error": "iac_generation_failed",
+                "message": f"Could not generate infrastructure for deployment: {exc}",
+            },
+        ) from exc
+
     await store.record_iac_artifact(
         tenant_id=tenant_id,
         agent_id=agent_id,
@@ -544,26 +564,82 @@ async def _trigger_deployment(
         )
     )
 
-    await git_provider.create_branch(settings.git_repo_url, branch)
-    await git_provider.commit_files(
-        settings.git_repo_url,
-        branch,
-        iac_result.files,
-        message=f"Agent {agent_id} v{version} — generated {iac_result.tool} IaC",
-    )
-    pull_request_id = await git_provider.create_pull_request(
-        settings.git_repo_url,
-        branch,
-        title=f"[Panasa Auto] {agent_id} v{version} — Deploy",
-        description=(
-            f"Agent: {agent_id} | Version: {version} | Impact: PENDING\n"
-            "Security: pending | RAGAS: pending"
-        ),
-    )
+    try:
+        await git_provider.create_branch(settings.git_repo_url, branch)
+        await git_provider.commit_files(
+            settings.git_repo_url,
+            branch,
+            iac_result.files,
+            message=f"Agent {agent_id} v{version} — generated {iac_result.tool} IaC",
+        )
+        pull_request_id = await git_provider.create_pull_request(
+            settings.git_repo_url,
+            branch,
+            title=f"[Panasa Auto] {agent_id} v{version} — Deploy",
+            description=(
+                f"Agent: {agent_id} | Version: {version} | Impact: PENDING\n"
+                "Security: pending | RAGAS: pending"
+            ),
+        )
+    except httpx.HTTPStatusError as exc:
+        message = (
+            f"Git provider rejected the request ({exc.response.status_code}). "
+            "Check that GIT_CREDENTIALS_SECRET holds a valid, unexpired token with "
+            "write access to the configured repository."
+            if exc.response.status_code in (401, 403)
+            else f"Git provider request failed: {exc}"
+        )
+        await deployment_status_store.update_stage(
+            agent_id,
+            deployment_id,
+            stage="GENERATING_IAC",
+            stage_status="FAILED",
+            output_summary=message,
+            overall_status="FAILED",
+            failure_reason=message,
+            failed_stage="GENERATING_IAC",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"error": "git_provider_failed", "message": message},
+        ) from exc
+    except httpx.HTTPError as exc:
+        message = f"Could not reach the git provider: {exc}"
+        await deployment_status_store.update_stage(
+            agent_id,
+            deployment_id,
+            stage="GENERATING_IAC",
+            stage_status="FAILED",
+            output_summary=message,
+            overall_status="FAILED",
+            failure_reason=message,
+            failed_stage="GENERATING_IAC",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"error": "git_provider_unreachable", "message": message},
+        ) from exc
 
-    await deployment_orchestrator.trigger_deployment(
-        agent_id=agent_id, version=version, deployment_id=deployment_id, tenant_id=tenant_id
-    )
+    try:
+        await deployment_orchestrator.trigger_deployment(
+            agent_id=agent_id, version=version, deployment_id=deployment_id, tenant_id=tenant_id
+        )
+    except Exception as exc:
+        message = f"Could not start the deployment pipeline: {exc}"
+        await deployment_status_store.update_stage(
+            agent_id,
+            deployment_id,
+            stage="GENERATING_IAC",
+            stage_status="FAILED",
+            output_summary=message,
+            overall_status="FAILED",
+            failure_reason=message,
+            failed_stage="GENERATING_IAC",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"error": "deployment_trigger_failed", "message": message},
+        ) from exc
 
     updated_record = await store.record_deployment_trigger(
         tenant_id=tenant_id,

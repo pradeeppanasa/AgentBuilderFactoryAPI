@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     # Section 37.15 (2026-08-16) — STS AssumeRole credential bindings for
     # Bedrock guardrail provisioning across accounts.
     dynamodb_bedrock_credentials_table: str = "panasa-bedrock-credentials"
+    # Section 42 (2026-08-19) — Build with AI propose/approve session state.
+    dynamodb_build_with_ai_sessions_table: str = "panasa-build-with-ai-sessions"
 
     # ── Projects / Skills / HITL (CLAUDE.md Section 38) ────────────────────
     dynamodb_projects_table: str = "panasa-projects"
@@ -79,6 +81,27 @@ class Settings(BaseSettings):
     # local dev's placeholder AWS credentials. Never set true in
     # prototype/enterprise deployments.
     mock_bedrock_guardrails: bool = False
+
+    # instructions_kb_api.md / CLAUDE.md Section 43 — same rationale as
+    # mock_bedrock_guardrails above, for Knowledge Base creation's
+    # Bedrock CreateKnowledgeBase/CreateDataSource/StartIngestionJob calls.
+    # Never set true in prototype/enterprise deployments.
+    mock_bedrock_kb: bool = False
+
+    # TS02-A-03 — same rationale as mock_bedrock_guardrails above, for
+    # deploy_agent's real GitHub/GitLab/Bitbucket API calls, which fail
+    # against local dev's placeholder GIT_REPO_URL/GIT_CREDENTIALS_SECRET.
+    # Never set true in prototype/enterprise deployments.
+    mock_git_provider: bool = False
+
+    # ── Knowledge Base — S3 + Bedrock provisioning (instructions_kb_api.md /
+    # CLAUDE.md Section 43) ─────────────────────────────────────────────
+    kb_documents_bucket: str | None = None
+    """None disables real S3/Bedrock provisioning for new KBs — create()
+    falls back to its original DynamoDB-only behaviour (status=INDEXING,
+    no s3_bucket/s3_prefix), same as every KB created before this existed."""
+    bedrock_kb_role_arn: str | None = None
+    opensearch_collection_arn: str | None = None
 
     # Observability Runs Feature Phase 1 — there is no real Generated Agent
     # Runtime deployed anywhere in this Stage 1 environment (R46: only Local
@@ -189,6 +212,23 @@ class Settings(BaseSettings):
     dynamodb_endpoint: str | None = None
     secrets_manager_endpoint: str | None = None  # e.g. http://localstack:4566
     s3_endpoint: str | None = None  # e.g. http://localstack:4566
+
+    # ── CORS (TS02-A-02) ────────────────────────────────────────────────
+    # Comma-separated list of allowed origins. Deliberately NOT ["*"] —
+    # Starlette's CORSMiddleware only reflects the request Origin back on
+    # the OPTIONS preflight response when allow_origins=["*"]; the actual
+    # POST/GET response still sends the literal header value
+    # "Access-Control-Allow-Origin: *", which combined with
+    # allow_credentials=True is a response browsers reject outright (a
+    # credentialed response is never allowed to pair with a wildcard
+    # origin — https://fetch.spec.whatwg.org/#http-access-control-allow-origin).
+    # That mismatch (preflight succeeds, actual request's CORS check fails)
+    # is exactly what TS02-A-02 reported. An explicit origin list avoids it.
+    cors_allowed_origins: str = "http://localhost:5173"
+
+    @property
+    def cors_allowed_origins_list(self) -> list[str]:
+        return [origin.strip() for origin in self.cors_allowed_origins.split(",") if origin.strip()]
 
     @field_validator("deployment_mode", mode="before")
     @classmethod

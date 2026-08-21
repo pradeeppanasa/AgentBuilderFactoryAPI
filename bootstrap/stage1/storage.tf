@@ -9,6 +9,10 @@ locals {
     iac_artifacts = "${var.resource_prefix}-iac-artifacts-${local.account_id}"
     transcripts   = "${var.resource_prefix}-transcripts-${local.account_id}"
     reports       = "${var.resource_prefix}-reports-${local.account_id}"
+    # instructions_kb_api.md / CLAUDE.md Section 43 — raw source documents
+    # for Knowledge Bases, one prefix per KB ({tenant_id}/{kb_id}/raw/).
+    # Bedrock's data source (bedrock_kb.tf) reads from this same bucket.
+    kb_documents = "${var.resource_prefix}-kb-documents-${local.account_id}"
   }
 }
 
