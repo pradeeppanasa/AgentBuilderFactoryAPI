@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from botocore.exceptions import ClientError
+
 from app.modules.git_provider._util import repo_slug_from_url
 from app.modules.git_provider.base import GitProvider
 
@@ -21,6 +23,24 @@ class CodeCommitProvider(GitProvider):
     @staticmethod
     def _repo_name(repo: str) -> str:
         return repo_slug_from_url(repo).rstrip("/").split("/")[-1]
+
+    async def repository_exists(self, repo: str) -> bool:
+        repo_name = self._repo_name(repo)
+
+        def _get() -> bool:
+            try:
+                self._client.get_repository(repositoryName=repo_name)
+                return True
+            except ClientError as exc:
+                if exc.response["Error"]["Code"] == "RepositoryDoesNotExistException":
+                    return False
+                raise
+
+        return await asyncio.to_thread(_get)
+
+    async def create_repository(self, repo: str) -> None:
+        repo_name = self._repo_name(repo)
+        await asyncio.to_thread(self._client.create_repository, repositoryName=repo_name)
 
     async def create_branch(self, repo: str, branch: str, from_branch: str = "main") -> None:
         repo_name = self._repo_name(repo)
@@ -40,19 +60,31 @@ class CodeCommitProvider(GitProvider):
         repo_name = self._repo_name(repo)
 
         def _commit() -> str:
-            branch_info = self._client.get_branch(repositoryName=repo_name, branchName=branch)
-            parent_commit_id = branch_info["branch"]["commitId"]
             put_files = [
                 {"filePath": path, "fileContent": content.encode("utf-8")}
                 for path, content in files.items()
             ]
-            response = self._client.create_commit(
-                repositoryName=repo_name,
-                branchName=branch,
-                parentCommitId=parent_commit_id,
-                putFiles=put_files,
-                commitMessage=message,
-            )
+            try:
+                branch_info = self._client.get_branch(repositoryName=repo_name, branchName=branch)
+                parent_commit_id: str | None = branch_info["branch"]["commitId"]
+            except ClientError as exc:
+                if exc.response["Error"]["Code"] != "BranchDoesNotExistException":
+                    raise
+                # A brand new, just-created repo has no branches at all yet
+                # (Section 45.2's v1 case) — CodeCommit creates the branch
+                # implicitly as part of this commit when parentCommitId is
+                # simply omitted, rather than being told a real parent.
+                parent_commit_id = None
+
+            kwargs: dict[str, Any] = {
+                "repositoryName": repo_name,
+                "branchName": branch,
+                "putFiles": put_files,
+                "commitMessage": message,
+            }
+            if parent_commit_id is not None:
+                kwargs["parentCommitId"] = parent_commit_id
+            response = self._client.create_commit(**kwargs)
             commit_id: str = response["commitId"]
             return commit_id
 

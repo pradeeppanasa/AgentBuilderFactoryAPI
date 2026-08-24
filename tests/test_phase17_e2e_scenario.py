@@ -211,24 +211,27 @@ def _run_simulated_pipeline(
 
 @pytest.fixture
 def fake_git(monkeypatch: pytest.MonkeyPatch) -> FakeGitProvider:
-    """One fake shared by the FastAPI layer and the two lambda_handlers
-    modules that hold their OWN `git_provider` name binding via
-    `from lambda_handlers.common import git_provider` — a plain
-    module-attribute patch on lambda_handlers.common would NOT reach those
-    (each did its own import-time copy of the reference), so each call site
-    is patched individually. Imports are local — see the module-level note
-    on why lambda_handlers.common can't be imported at collection time;
-    this fixture body only runs once conftest's mocked_aws is active.
+    """One fake shared by the FastAPI layer (app.state.git_provider,
+    app/api/v1/agents.py — the ONLY place that generates IaC and does the
+    real branch/commit/PR work, Section 45.2 resolution) and
+    lambda_handlers/policy_check.py, which holds its OWN `git_provider`
+    name binding via `from lambda_handlers.common import git_provider` — a
+    plain module-attribute patch on lambda_handlers.common would NOT reach
+    it (its own import-time copy of the reference), so it's patched
+    directly. generating_iac.py needs no such patch any more: it's a
+    read-only pass-through over what agents.py already wrote, never a git
+    provider of its own. Imports are local — see the module-level note on
+    why lambda_handlers.common can't be imported at collection time; this
+    fixture body only runs once conftest's mocked_aws is active.
 
     Does NOT set app.state.git_provider here — main.py's lifespan hook
     unconditionally overwrites app.state.git_provider on startup, so that
     swap must happen only AFTER `with TestClient(app) as client:` has
     entered (same ordering test_deploy_api.py's fixture-free version uses).
     """
-    from lambda_handlers import generating_iac, policy_check
+    from lambda_handlers import policy_check
 
     git = FakeGitProvider()
-    monkeypatch.setattr(generating_iac, "git_provider", git)
     monkeypatch.setattr(policy_check, "git_provider", git)
     return git
 

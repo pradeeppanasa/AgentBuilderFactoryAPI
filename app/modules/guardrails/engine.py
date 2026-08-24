@@ -67,10 +67,17 @@ class GuardrailEngine:
         self,
         bedrock_client: Any,
         classifier_factory: ClassifierFactory = ONNXBertClassifier,
+        mock_enabled: bool = False,
     ) -> None:
         self._bedrock = bedrock_client
         self._classifier_factory = classifier_factory
         self._classifiers: dict[tuple[str, str], ToxicityClassifier] = {}
+        # settings.mock_bedrock_guardrails — skips the real Bedrock
+        # ApplyGuardrail runtime call entirely, for dev environments
+        # without real Bedrock access (same flag/rationale as
+        # BedrockGuardrailProvisioner's mock_enabled, which only covers
+        # provisioning a guardrail — this covers actually running one).
+        self._mock_enabled = mock_enabled
 
     def _classifier_for(self, model_name: str, target_keyword: str) -> ToxicityClassifier:
         key = (model_name, target_keyword)
@@ -255,6 +262,12 @@ class GuardrailEngine:
     async def _call_bedrock_guardrail_with_output(
         self, text: str, policy: GuardrailPolicy, *, source: str
     ) -> tuple[GuardrailLayerResult, str]:
+        if self._mock_enabled:
+            return (
+                GuardrailLayerResult(layer="bedrock", action="pass", reason="mocked_pass"),
+                text,
+            )
+
         try:
             response = await asyncio.to_thread(
                 self._bedrock.apply_guardrail,

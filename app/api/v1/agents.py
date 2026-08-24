@@ -24,6 +24,7 @@ from app.dependencies import (
     get_iac_generator,
     get_iac_validator,
     get_metrics_emitter,
+    get_platform_settings_store,
     get_registry_store,
     get_tenant_id,
 )
@@ -31,10 +32,12 @@ from app.modules.audit.writer import AuditEvent, AuditWriter
 from app.modules.auth.dependencies import require_role
 from app.modules.auth.schemas import CurrentUser
 from app.modules.change_impact.analyzer import ChangeImpactAnalyzer, ImpactAnalysis
-from app.modules.deployment.models import DeploymentRecord, initial_stages
+from app.modules.deployment.models import ApprovalMode, DeploymentRecord, initial_stages
 from app.modules.deployment.orchestrator import DeploymentOrchestrator
 from app.modules.deployment.status_store import DeploymentStatusStore
+from app.modules.git_provider._util import agent_repo_identifier
 from app.modules.git_provider.base import GitProvider
+from app.modules.iac_generator.cicd_templates import generate_cicd_workflow
 from app.modules.iac_generator.generator import IaCGenerator
 from app.modules.iac_generator.validation_models import (
     IaCValidationReport,
@@ -42,6 +45,7 @@ from app.modules.iac_generator.validation_models import (
 )
 from app.modules.iac_generator.validator import IaCValidator
 from app.modules.observability.metrics import MetricsEmitter
+from app.modules.platform_settings.store import PlatformSettingsStore
 from app.modules.registry.diff import ConfigDiff, compute_config_diff
 from app.modules.registry.models import (
     AgentCapabilityContract,
@@ -183,7 +187,7 @@ class RollbackResponse(BaseModel):
     updated_at: str
     deployment_id: str
     branch: str
-    pull_request_id: str
+    pull_request_id: str | None
 
 
 class GenerateIaCResponse(BaseModel):
@@ -227,7 +231,7 @@ class DeployResponse(BaseModel):
     deployment_id: str
     status: AgentStatus
     branch: str
-    pull_request_id: str
+    pull_request_id: str | None
 
 
 class DeploymentListResponse(BaseModel):
@@ -487,8 +491,22 @@ async def get_version_diff(
 class _TriggeredDeployment:
     deployment_id: str
     branch: str
-    pull_request_id: str
+    pull_request_id: str | None
     updated_record: AgentRecord
+
+
+def _generate_agent_repo_readme(*, agent_id: str, version: int, deployment_id: str) -> str:
+    """Section 45.2 — "auto-generated, describes the agent + version"."""
+    return (
+        f"# {agent_id}\n\n"
+        f"Generated Terraform for Panasa agent `{agent_id}`.\n\n"
+        f"- Current version: {version}\n"
+        f"- Last deployment: {deployment_id}\n\n"
+        "This repository is managed entirely by the Panasa Agent Builder "
+        "Runtime (CLAUDE.md Section 45.2). Its Terraform is always "
+        "generated from the agent's configuration and pushed here "
+        "automatically on every deploy — do not edit it by hand.\n"
+    )
 
 
 async def _trigger_deployment(
@@ -503,6 +521,7 @@ async def _trigger_deployment(
     git_provider: GitProvider,
     deployment_orchestrator: DeploymentOrchestrator,
     deployment_status_store: DeploymentStatusStore,
+    platform_settings_store: PlatformSettingsStore,
 ) -> _TriggeredDeployment:
     """Shared by deploy_agent and rollback_agent (Phase 13: "Rollback
     endpoint creates new version from old config, triggers deployment") —
@@ -511,14 +530,23 @@ async def _trigger_deployment(
     nothing here touches live_version — only MarkActive (Phase 11) does,
     once HEALTH_CHECK passes.
     """
-    if not settings.git_repo_url:
+    # Section 45.2 — one private repo per agent (panasa-iac-{agent_id}),
+    # not the single shared GIT_REPO_URL.
+    repo = agent_repo_identifier(settings.git_provider, settings.git_org, agent_id)
+    if repo is None:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="GIT_REPO_URL is not configured",
+            detail="GIT_ORG is not configured",
         )
 
     deployment_id = f"DEP-{uuid.uuid4().hex[:8].upper()}"
-    branch = f"panasa/agent-{agent_id}-v{version}-{deployment_id}"
+
+    # Section 45.3/45.13 (R50, resolved as configurable — see
+    # deployment/models.py's module docstring): read once, at trigger time,
+    # so a later change to the tenant's default never affects a deployment
+    # already in flight.
+    tenant_settings = await platform_settings_store.get_or_create(tenant_id, triggered_by)
+    approval_mode: ApprovalMode = tenant_settings.default_approval_mode
 
     # TS02-A-03: every external call below (S3/IaC generation, the git
     # provider's real network calls) can fail for reasons entirely outside
@@ -558,6 +586,7 @@ async def _trigger_deployment(
             version=version,
             triggered_by=triggered_by,
             triggered_at=now,
+            approval_mode=approval_mode,
             stages=initial_stages(),
             iac_s3_key=iac_result.s3_key,
             updated_at=now,
@@ -565,22 +594,61 @@ async def _trigger_deployment(
     )
 
     try:
-        await git_provider.create_branch(settings.git_repo_url, branch)
-        await git_provider.commit_files(
-            settings.git_repo_url,
-            branch,
-            iac_result.files,
-            message=f"Agent {agent_id} v{version} — generated {iac_result.tool} IaC",
-        )
-        pull_request_id = await git_provider.create_pull_request(
-            settings.git_repo_url,
-            branch,
-            title=f"[Panasa Auto] {agent_id} v{version} — Deploy",
-            description=(
-                f"Agent: {agent_id} | Version: {version} | Impact: PENDING\n"
-                "Security: pending | RAGAS: pending"
+        # Section 45.3: v1 (repo doesn't exist yet) pushes straight to the
+        # default branch, no PR. v2+ (repo already exists) always goes
+        # through a branch + PR, even if this happens to be a re-deploy of
+        # version 1 against an already-created repo — repo existence, not
+        # the raw version number, is what the spec keys this on.
+        repo_already_existed = await git_provider.repository_exists(repo)
+        if not repo_already_existed:
+            await git_provider.create_repository(repo)
+
+        files = {
+            **iac_result.files,
+            "README.md": _generate_agent_repo_readme(
+                agent_id=agent_id, version=version, deployment_id=deployment_id
             ),
-        )
+        }
+        if not repo_already_existed:
+            # Section 45.6/R58 — the workflow file is a per-repo artifact,
+            # committed once alongside the repo's very first Terraform.
+            # Changing the tenant's cicd_provider/approval_mode later never
+            # rewrites an already-created repo's workflow file (same
+            # "read once, at creation" rule as approval_mode itself — see
+            # PlatformSettingsRecord.cicd_provider's docstring).
+            workflow_path, workflow_content = generate_cicd_workflow(
+                tenant_settings.cicd_provider, approval_mode
+            )
+            files[workflow_path] = workflow_content
+
+        pull_request_id: str | None
+        if repo_already_existed:
+            branch = f"deploy/v{version}-{deployment_id}"
+            await git_provider.create_branch(repo, branch, from_branch=settings.git_default_branch)
+            await git_provider.commit_files(
+                repo,
+                branch,
+                files,
+                message=f"Agent {agent_id} v{version} — generated {iac_result.tool} IaC",
+            )
+            pull_request_id = await git_provider.create_pull_request(
+                repo,
+                branch,
+                title=f"[Panasa Auto] {agent_id} v{version} — Deploy",
+                description=(
+                    f"Agent: {agent_id} | Version: {version} | Impact: PENDING\n"
+                    "Security: pending | RAGAS: pending"
+                ),
+            )
+        else:
+            branch = settings.git_default_branch
+            await git_provider.commit_files(
+                repo,
+                branch,
+                files,
+                message=f"Agent {agent_id} v{version} — generated {iac_result.tool} IaC",
+            )
+            pull_request_id = None
     except httpx.HTTPStatusError as exc:
         message = (
             f"Git provider rejected the request ({exc.response.status_code}). "
@@ -619,6 +687,10 @@ async def _trigger_deployment(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={"error": "git_provider_unreachable", "message": message},
         ) from exc
+
+    await deployment_status_store.record_git_reference(
+        agent_id, deployment_id, branch=branch, pull_request_id=pull_request_id
+    )
 
     try:
         await deployment_orchestrator.trigger_deployment(
@@ -670,6 +742,7 @@ async def rollback_agent(
         DeploymentOrchestrator, Depends(get_deployment_orchestrator)
     ],
     deployment_status_store: Annotated[DeploymentStatusStore, Depends(get_deployment_status_store)],
+    platform_settings_store: Annotated[PlatformSettingsStore, Depends(get_platform_settings_store)],
     audit_writer: Annotated[AuditWriter, Depends(get_audit_writer)],
     metrics_emitter: Annotated[MetricsEmitter, Depends(get_metrics_emitter)],
 ) -> RollbackResponse:
@@ -704,6 +777,7 @@ async def rollback_agent(
         git_provider=git_provider,
         deployment_orchestrator=deployment_orchestrator,
         deployment_status_store=deployment_status_store,
+        platform_settings_store=platform_settings_store,
     )
 
     await _record_event(
@@ -891,6 +965,7 @@ async def deploy_agent(
         DeploymentOrchestrator, Depends(get_deployment_orchestrator)
     ],
     deployment_status_store: Annotated[DeploymentStatusStore, Depends(get_deployment_status_store)],
+    platform_settings_store: Annotated[PlatformSettingsStore, Depends(get_platform_settings_store)],
     audit_writer: Annotated[AuditWriter, Depends(get_audit_writer)],
     metrics_emitter: Annotated[MetricsEmitter, Depends(get_metrics_emitter)],
 ) -> DeployResponse:
@@ -918,6 +993,7 @@ async def deploy_agent(
         git_provider=git_provider,
         deployment_orchestrator=deployment_orchestrator,
         deployment_status_store=deployment_status_store,
+        platform_settings_store=platform_settings_store,
     )
 
     await _record_event(
@@ -959,3 +1035,84 @@ async def list_deployments(
 
     deployments = await deployment_status_store.list_deployments(agent_id)
     return DeploymentListResponse(items=deployments)
+
+
+@router.post("/{agent_id}/deployments/{deployment_id}/approve", response_model=DeploymentRecord)
+async def approve_deployment(
+    agent_id: str,
+    deployment_id: str,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    current_user: Annotated[CurrentUser, Depends(require_role(*_WRITE_ROLES))],
+    store: Annotated[AgentRegistryStore, Depends(get_registry_store)],
+    deployment_status_store: Annotated[DeploymentStatusStore, Depends(get_deployment_status_store)],
+    deployment_orchestrator: Annotated[
+        DeploymentOrchestrator, Depends(get_deployment_orchestrator)
+    ],
+) -> DeploymentRecord:
+    """Section 45.4/R50 (resolved as configurable — see
+    deployment/models.py's module docstring): approve a "manual"-mode
+    deployment parked at PENDING_APPROVAL. A no-op deployment_id under the
+    default "automated" mode (F1/R06) never reaches PENDING_APPROVAL in the
+    first place — POLICY_CHECK already decided PASS/BLOCK on its own — so
+    calling this here is a 409, not a silent success: there is nothing for
+    a human to approve.
+    """
+    if await store.get_agent(tenant_id, agent_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent {agent_id!r} not found"
+        )
+
+    record = await deployment_status_store.get_deployment(agent_id, deployment_id)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Deployment {deployment_id!r} not found for agent {agent_id!r}",
+        )
+
+    if record.approval_mode != "manual":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "approval_not_applicable",
+                "message": (
+                    f"Deployment {deployment_id!r} runs the automated pipeline "
+                    "(approval_mode='automated') — POLICY_CHECK already decided "
+                    "PASS/BLOCK automatically. There is nothing to approve."
+                ),
+            },
+        )
+
+    if record.status != "PENDING_APPROVAL":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "not_pending_approval",
+                "message": (
+                    f"Deployment {deployment_id!r} is in status {record.status!r}, "
+                    "not PENDING_APPROVAL."
+                ),
+            },
+        )
+
+    # status alone doesn't change on approval (only the customer's CI/CD
+    # moves PENDING_APPROVAL -> APPLYING, per this module's docstring) — so
+    # a second call would otherwise silently re-approve the same deployment.
+    if record.approved_by is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "already_approved",
+                "message": (
+                    f"Deployment {deployment_id!r} was already approved by "
+                    f"{record.approved_by!r} at {record.approved_at}."
+                ),
+            },
+        )
+
+    updated_record = await deployment_status_store.record_approval(
+        agent_id, deployment_id, approved_by=current_user.email
+    )
+    await deployment_orchestrator.notify_deployment_approved(
+        agent_id, deployment_id, tenant_id, approved_by=current_user.email
+    )
+    return updated_record

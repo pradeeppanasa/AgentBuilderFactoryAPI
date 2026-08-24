@@ -39,6 +39,25 @@ class GitHubProvider(GitProvider):
     def _repo(repo: str) -> str:
         return repo_slug_from_url(repo)
 
+    async def repository_exists(self, repo: str) -> bool:
+        slug = self._repo(repo)
+        response = await self._client.get(f"/repos/{slug}")
+        if response.status_code == 404:
+            return False
+        response.raise_for_status()
+        return True
+
+    async def create_repository(self, repo: str) -> None:
+        slug = self._repo(repo)
+        org, _, name = slug.partition("/")
+        # auto_init=True gives the repo an initial commit on its default
+        # branch — otherwise there is no ref for commit_files()'s blob/tree/
+        # commit dance (or create_branch()) to build on top of.
+        response = await self._client.post(
+            f"/orgs/{org}/repos", json={"name": name, "private": True, "auto_init": True}
+        )
+        response.raise_for_status()
+
     async def create_branch(self, repo: str, branch: str, from_branch: str = "main") -> None:
         slug = self._repo(repo)
         base_ref = await self._client.get(f"/repos/{slug}/git/ref/heads/{from_branch}")

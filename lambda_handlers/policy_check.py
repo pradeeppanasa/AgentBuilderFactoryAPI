@@ -38,12 +38,14 @@ from lambda_handlers.common import (
     metrics_emitter,
     registry_store,
     require,
-    require_git_repo_url,
+    require_agent_repo,
     run,
 )
 
 
-async def _decide(agent_id: str, tenant_id: str, deployment_id: str, pr_id: str) -> dict[str, Any]:
+async def _decide(
+    agent_id: str, tenant_id: str, deployment_id: str, pr_id: str | None
+) -> dict[str, Any]:
     deployment = await deployment_status_store.get_deployment(agent_id, deployment_id)
     if deployment is None:
         raise RuntimeError(f"Deployment {deployment_id!r} not found for agent {agent_id!r}")
@@ -105,11 +107,15 @@ async def _decide(agent_id: str, tenant_id: str, deployment_id: str, pr_id: str)
         result_decision = gate_result.decision
         result_reason = gate_result.reason
 
-    git_repo_url = require_git_repo_url()
-    if result_decision == "BLOCK":
-        await git_provider.close_pull_request(git_repo_url, pr_id, reason=result_reason)
-    else:
-        await git_provider.merge_pull_request(git_repo_url, pr_id)
+    # Section 45.3 — a v1 deploy (repo didn't exist yet) pushed straight to
+    # the default branch; no PR was ever opened, so there's nothing here to
+    # merge or close.
+    if pr_id is not None:
+        repo = require_agent_repo(agent_id)
+        if result_decision == "BLOCK":
+            await git_provider.close_pull_request(repo, pr_id, reason=result_reason)
+        else:
+            await git_provider.merge_pull_request(repo, pr_id)
 
     return {"result": result_decision, "reason": result_reason}
 

@@ -13,23 +13,44 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from botocore.exceptions import ClientError
 
 from app.modules.git_provider.codecommit import CodeCommitProvider
 
 REPO_NAME = "panasa-agent-iac"
 
 
+def _client_error(code: str, operation: str) -> ClientError:
+    return ClientError({"Error": {"Code": code, "Message": code}}, operation)
+
+
 class _FakeCodeCommitClient:
-    def __init__(self) -> None:
-        self.branches: dict[str, str] = {"main": "commit-0"}
+    def __init__(self, repositories: set[str] | None = None) -> None:
+        self.repositories: set[str] = repositories if repositories is not None else {REPO_NAME}
+        self.branches: dict[str, str] = (
+            {"main": "commit-0"} if REPO_NAME in self.repositories else {}
+        )
         self.pull_requests: dict[str, dict[str, Any]] = {}
         self._commit_counter = 0
         self._pr_counter = 0
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
+    def get_repository(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("get_repository", kwargs))
+        name = kwargs["repositoryName"]
+        if name not in self.repositories:
+            raise _client_error("RepositoryDoesNotExistException", "GetRepository")
+        return {"repositoryMetadata": {"repositoryName": name}}
+
+    def create_repository(self, **kwargs: Any) -> None:
+        self.calls.append(("create_repository", kwargs))
+        self.repositories.add(kwargs["repositoryName"])
+
     def get_branch(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("get_branch", kwargs))
         branch_name = kwargs["branchName"]
+        if branch_name not in self.branches:
+            raise _client_error("BranchDoesNotExistException", "GetBranch")
         return {"branch": {"branchName": branch_name, "commitId": self.branches[branch_name]}}
 
     def create_branch(self, **kwargs: Any) -> None:
@@ -89,6 +110,48 @@ def fake_client() -> _FakeCodeCommitClient:
 @pytest.fixture
 def provider(fake_client: _FakeCodeCommitClient) -> CodeCommitProvider:
     return CodeCommitProvider(fake_client)
+
+
+async def test_repository_exists_true(
+    provider: CodeCommitProvider, fake_client: _FakeCodeCommitClient
+) -> None:
+    assert await provider.repository_exists(REPO_NAME) is True
+
+
+async def test_repository_exists_false(
+    provider: CodeCommitProvider, fake_client: _FakeCodeCommitClient
+) -> None:
+    assert await provider.repository_exists("panasa-iac-new-agent") is False
+
+
+async def test_create_repository(
+    provider: CodeCommitProvider, fake_client: _FakeCodeCommitClient
+) -> None:
+    await provider.create_repository("panasa-iac-new-agent")
+
+    assert "panasa-iac-new-agent" in fake_client.repositories
+    create_call = next(c for c in fake_client.calls if c[0] == "create_repository")
+    assert create_call[1] == {"repositoryName": "panasa-iac-new-agent"}
+
+
+async def test_commit_files_into_brand_new_repo_omits_parent_commit_id(
+    fake_client: _FakeCodeCommitClient,
+) -> None:
+    """Section 45.2 — a just-created repo has no branches at all yet;
+    CodeCommit creates the branch implicitly when parentCommitId is
+    omitted, rather than failing on a nonexistent "main"."""
+    fake_client.repositories = {"panasa-iac-new-agent"}
+    fake_client.branches = {}
+    provider = CodeCommitProvider(fake_client)
+
+    commit_id = await provider.commit_files(
+        "panasa-iac-new-agent", "main", {"README.md": "hello"}, message="initial commit"
+    )
+
+    assert commit_id == "commit-1"
+    assert fake_client.branches["main"] == "commit-1"
+    commit_call = next(c for c in fake_client.calls if c[0] == "create_commit")
+    assert "parentCommitId" not in commit_call[1]
 
 
 async def test_create_branch(

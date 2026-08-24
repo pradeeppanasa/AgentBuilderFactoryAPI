@@ -21,6 +21,20 @@ from abc import ABC, abstractmethod
 
 class GitProvider(ABC):
     @abstractmethod
+    async def repository_exists(self, repo: str) -> bool:
+        """Section 45.2 — does this agent's panasa-iac-{agent_id} repo exist
+        yet? Drives the v1-vs-v2+ branch in Section 45.3's deploy flow."""
+        ...
+
+    @abstractmethod
+    async def create_repository(self, repo: str) -> None:
+        """Create a new, empty-but-initialised private repo (Section 45.2)
+        — initialised with an empty commit on the default branch so the
+        very first real commit_files() call has something to branch from,
+        the same as every subsequent deploy."""
+        ...
+
+    @abstractmethod
     async def create_branch(self, repo: str, branch: str, from_branch: str = "main") -> None: ...
 
     @abstractmethod

@@ -140,6 +140,47 @@ class DeploymentStatusStore:
         await asyncio.to_thread(self._table.put_item, Item=self._to_item(updated_record))
         return updated_record
 
+    async def record_git_reference(
+        self, agent_id: str, deployment_id: str, branch: str, pull_request_id: str | None
+    ) -> DeploymentRecord:
+        """Section 45.2/45.3 — record where the deploy trigger's IaC commit
+        actually landed, once it's done (branch/pull_request_id aren't
+        known yet when create_deployment() first writes the record — the
+        git operations that produce them run after it)."""
+        record = await self.get_deployment(agent_id, deployment_id)
+        if record is None:
+            raise DeploymentNotFoundError(agent_id, deployment_id)
+
+        updated_record = record.model_copy(
+            update={
+                "branch": branch,
+                "pull_request_id": pull_request_id,
+                "updated_at": _now(),
+            }
+        )
+        await asyncio.to_thread(self._table.put_item, Item=self._to_item(updated_record))
+        return updated_record
+
+    async def record_approval(
+        self, agent_id: str, deployment_id: str, approved_by: str
+    ) -> DeploymentRecord:
+        """Section 45.4 — a human approving a "manual"-mode deployment
+        parked at PENDING_APPROVAL. Only stamps approved_by/approved_at;
+        the actual PENDING_APPROVAL -> APPLYING transition (and everything
+        after it) is written by the customer's CI/CD once it picks up the
+        event this unblocks (R57 — the Runtime never runs terraform itself).
+        """
+        record = await self.get_deployment(agent_id, deployment_id)
+        if record is None:
+            raise DeploymentNotFoundError(agent_id, deployment_id)
+
+        now = _now()
+        updated_record = record.model_copy(
+            update={"approved_by": approved_by, "approved_at": now, "updated_at": now}
+        )
+        await asyncio.to_thread(self._table.put_item, Item=self._to_item(updated_record))
+        return updated_record
+
     async def get_deployment(self, agent_id: str, deployment_id: str) -> DeploymentRecord | None:
         response = await asyncio.to_thread(
             self._table.get_item, Key={"agent_id": agent_id, "deployment_id": deployment_id}

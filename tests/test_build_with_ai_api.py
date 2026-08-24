@@ -51,6 +51,7 @@ def _agent_proposal(
     name: str,
     *,
     agent_type: str = "standard",
+    capability_description: str = "",
     tools: list[dict[str, Any]] | None = None,
     knowledge_bases: list[dict[str, Any]] | None = None,
     skills: list[dict[str, Any]] | None = None,
@@ -61,7 +62,7 @@ def _agent_proposal(
         "agent_type": agent_type,
         "persona_name": None,
         "system_prompt": f"You are {name}.",
-        "capability_description": "",
+        "capability_description": capability_description,
         "tools": tools or [],
         "knowledge_bases": knowledge_bases or [],
         "guardrail_policy": None,
@@ -208,6 +209,87 @@ async def test_approve_creates_missing_resource_and_agent(
         )
         assert status_response.status_code == 200
         assert status_response.json()["status"] == "completed"
+
+
+async def test_approve_wires_sub_agents_into_orchestrator(
+    make_user_and_token, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Section 42.9 — Task Planner is a multi-agent architect: a proposal
+    with real sub_agents must actually create every agent AND wire them
+    into the orchestrator's OrchestrationConfig, not just create N
+    unconnected agents. Every other approve test in this file uses
+    "sub_agents": [] and so never exercises executor.py's
+    sub_agent_refs/OrchestrationConfig(is_manager=True, ...) path at all."""
+    _, dev_token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        architecture = {
+            "orchestrator": _agent_proposal(
+                "KYC Compliance Orchestrator", agent_type="orchestrator"
+            ),
+            "sub_agents": [
+                _agent_proposal(
+                    "Document Extractor Agent",
+                    capability_description="Extracts structured fields from uploaded documents",
+                ),
+                _agent_proposal(
+                    "Risk Scorer Agent",
+                    capability_description="Scores financial crime risk from extracted fields",
+                ),
+            ],
+            "output_schema": None,
+            "confidence": 0.85,
+            "reasoning": "Two specialist agents behind a routing orchestrator.",
+        }
+        _mock_architecture_and_configs(monkeypatch, architecture)
+
+        proposed = client.post(
+            "/api/v1/agents/build-with-ai/propose",
+            json={"description": "Run KYC checks via specialist sub-agents."},
+            headers=_bearer(dev_token),
+        ).json()
+        session_id = proposed["session_id"]
+        assert len(proposed["proposed_agents"]) == 3  # orchestrator + 2 sub-agents
+
+        approved = client.post(
+            "/api/v1/agents/build-with-ai/approve",
+            json={"session_id": session_id},
+            headers=_bearer(dev_token),
+        )
+        assert approved.status_code == 200
+        created_agents = approved.json()["created_agents"]
+        assert len(created_agents) == 3
+
+        # executor.py creates sub-agents first, orchestrator last.
+        assert [a["role"] for a in created_agents] == ["standard", "standard", "orchestrator"]
+        extractor_id = created_agents[0]["agent_id"]
+        scorer_id = created_agents[1]["agent_id"]
+        orchestrator_id = created_agents[2]["agent_id"]
+
+        orchestrator_response = client.get(
+            f"/api/v1/agents/{orchestrator_id}", headers=_bearer(dev_token)
+        )
+        orchestration = orchestrator_response.json()["configuration"]["orchestration"]
+        assert orchestration is not None
+        assert orchestration["is_manager"] is True
+        sub_agent_ids = {ref["agent_id"] for ref in orchestration["sub_agents"]}
+        assert sub_agent_ids == {extractor_id, scorer_id}
+        capability_by_id = {
+            ref["agent_id"]: ref["capability_description"] for ref in orchestration["sub_agents"]
+        }
+        assert capability_by_id[extractor_id] == (
+            "Extracts structured fields from uploaded documents"
+        )
+        assert capability_by_id[scorer_id] == (
+            "Scores financial crime risk from extracted fields"
+        )
+
+        # A sub-agent is a plain standard agent — it is not itself a manager.
+        extractor_response = client.get(
+            f"/api/v1/agents/{extractor_id}", headers=_bearer(dev_token)
+        )
+        extractor_orchestration = extractor_response.json()["configuration"]["orchestration"]
+        assert extractor_orchestration is None or extractor_orchestration["is_manager"] is False
 
 
 async def test_approve_skips_resource_marked_skip(

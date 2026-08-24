@@ -114,6 +114,13 @@ class PlaygroundMetrics(BaseModel):
     tool_calls: list[ToolCallSummary]
     kb_retrievals: KBRetrievalSummary | None
     memory: MemoryStateSummary
+    routing_decision: str | None = None
+    """TS-02 Priority 3 stub, mock mode only — which sub-agent an
+    orchestrator agent would delegate to. Full A2A dispatch (Section 18's
+    ManagerOrchestrator) is Generated Agent Runtime infrastructure this
+    Builder Runtime does not build (F8); None for every non-orchestrator
+    agent and for the real-LLM path, which doesn't fabricate a routing
+    decision it never actually made."""
 
 
 class PlaygroundResponse(BaseModel):
@@ -247,6 +254,22 @@ def _run_kb_retrieval(kb_id: str | None) -> KBRetrievalSummary | None:
     return KBRetrievalSummary(chunk_count=0, similarity_scores=[])
 
 
+def _mock_routing_decision(agent_type: str, config: AgentConfiguration) -> str | None:
+    """TS-02 Priority 3 stub. Real A2A dispatch (Section 18's
+    ManagerOrchestrator — the LLM actually deciding which sub-agent(s) to
+    call) is Generated Agent Runtime infrastructure this Builder Runtime
+    does not build (F8); no LLM runs in mock mode to make that decision
+    for real. Deterministically "selects" the first configured sub-agent
+    instead, purely so an orchestrator agent's mock playground turn has a
+    routing decision to show at all — never fabricated for a standard
+    agent, and never claimed to be a real routing choice."""
+    if agent_type != "orchestrator":
+        return None
+    if config.orchestration is None or not config.orchestration.sub_agents:
+        return None
+    return f"Orchestrator selected: {config.orchestration.sub_agents[0].agent_name}"
+
+
 @router.post("/{agent_id}/playground", response_model=PlaygroundResponse)
 async def run_playground_turn(
     agent_id: str,
@@ -315,6 +338,7 @@ async def run_playground_turn(
                 tool_calls=[],
                 kb_retrievals=None,
                 memory=_memory_state(config, len(mock_session.turns)),
+                routing_decision=_mock_routing_decision(agent.agent_type, config),
             ),
         )
 

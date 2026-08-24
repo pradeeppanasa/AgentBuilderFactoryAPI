@@ -34,6 +34,22 @@ class BitbucketProvider(GitProvider):
     def _repo(repo: str) -> str:
         return repo_slug_from_url(repo)
 
+    async def repository_exists(self, repo: str) -> bool:
+        slug = self._repo(repo)
+        response = await self._client.get(f"/repositories/{slug}")
+        if response.status_code == 404:
+            return False
+        response.raise_for_status()
+        return True
+
+    async def create_repository(self, repo: str) -> None:
+        slug = self._repo(repo)
+        # No auto-init flag here: unlike GitHub/GitLab, Bitbucket's /src
+        # commit endpoint (commit_files below) creates a repo's very first
+        # commit directly — an empty repo needs no special-casing.
+        response = await self._client.post(f"/repositories/{slug}", json={"is_private": True})
+        response.raise_for_status()
+
     async def create_branch(self, repo: str, branch: str, from_branch: str = "main") -> None:
         slug = self._repo(repo)
         response = await self._client.post(

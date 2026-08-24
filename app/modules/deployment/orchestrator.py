@@ -42,3 +42,30 @@ class DeploymentOrchestrator:
                 }
             ],
         )
+
+    async def notify_deployment_approved(
+        self, agent_id: str, deployment_id: str, tenant_id: str, approved_by: str
+    ) -> None:
+        """Section 45.4 — unblock a "manual"-mode deployment parked at
+        PENDING_APPROVAL. The customer's own generated CI/CD workflow
+        (Section 45.6) is what's actually waiting on this event and moves
+        the deployment into APPLYING; the Runtime never runs terraform
+        itself (R57)."""
+        detail = {
+            "deploymentId": deployment_id,
+            "agentId": agent_id,
+            "tenantId": tenant_id,
+            "approvedBy": approved_by,
+            "approvedAt": datetime.now(UTC).isoformat(),
+        }
+        await asyncio.to_thread(
+            self._eventbridge.put_events,
+            Entries=[
+                {
+                    "Source": "panasa.agent-builder",
+                    "DetailType": "AgentDeploymentApproved",
+                    "EventBusName": self._settings.eventbridge_bus_name,
+                    "Detail": json.dumps(detail),
+                }
+            ],
+        )

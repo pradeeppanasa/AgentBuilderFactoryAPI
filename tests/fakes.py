@@ -18,12 +18,21 @@ from app.modules.git_provider.base import GitProvider
 class FakeGitProvider(GitProvider):
     """Records calls instead of talking to a real git host."""
 
-    def __init__(self) -> None:
+    def __init__(self, existing_repos: set[str] | None = None) -> None:
+        self.existing_repos: set[str] = existing_repos or set()
+        self.created_repos: list[str] = []
         self.created_branches: list[tuple[str, str, str]] = []
         self.committed_files: list[tuple[str, str, dict[str, str], str]] = []
         self.opened_prs: list[tuple[str, str, str, str]] = []
         self.merged: list[tuple[str, str]] = []
         self.closed: list[tuple[str, str, str]] = []
+
+    async def repository_exists(self, repo: str) -> bool:
+        return repo in self.existing_repos
+
+    async def create_repository(self, repo: str) -> None:
+        self.created_repos.append(repo)
+        self.existing_repos.add(repo)
 
     async def create_branch(self, repo: str, branch: str, from_branch: str = "main") -> None:
         self.created_branches.append((repo, branch, from_branch))
@@ -50,15 +59,16 @@ class FakeGitProvider(GitProvider):
 class FailingGitProvider(GitProvider):
     """Simulates a real git provider auth failure (e.g. an expired/invalid
     GIT_CREDENTIALS_SECRET token) — raises the same httpx.HTTPStatusError
-    shape GitHubProvider.create_branch's raise_for_status() would, so the
-    deploy endpoint's exception handling is exercised against the real
-    exception type rather than a generic stand-in."""
+    shape a real provider's raise_for_status() would, so the deploy
+    endpoint's exception handling is exercised against the real exception
+    type rather than a generic stand-in. Fails at repository_exists() —
+    Section 45.2's first real git-provider call in the deploy flow."""
 
     def __init__(self, status_code: int = 401) -> None:
         self._status_code = status_code
 
-    async def create_branch(self, repo: str, branch: str, from_branch: str = "main") -> None:
-        request = httpx.Request("GET", "https://api.github.com/repos/org/repo/git/ref/heads/main")
+    async def repository_exists(self, repo: str) -> bool:
+        request = httpx.Request("GET", "https://api.github.com/repos/org/repo")
         response = httpx.Response(self._status_code, request=request)
         raise httpx.HTTPStatusError(
             f"Client error '{self._status_code} Unauthorized' for url '{request.url}'",
@@ -66,16 +76,28 @@ class FailingGitProvider(GitProvider):
             response=response,
         )
 
+    async def create_repository(self, repo: str) -> None:
+        raise AssertionError(
+            "create_repository should never be reached — repository_exists fails first"
+        )
+
+    async def create_branch(self, repo: str, branch: str, from_branch: str = "main") -> None:
+        raise AssertionError(
+            "create_branch should never be reached — repository_exists fails first"
+        )
+
     async def commit_files(
         self, repo: str, branch: str, files: dict[str, str], message: str
     ) -> str:
-        raise AssertionError("commit_files should never be reached — create_branch fails first")
+        raise AssertionError(
+            "commit_files should never be reached — repository_exists fails first"
+        )
 
     async def create_pull_request(
         self, repo: str, branch: str, title: str, description: str
     ) -> str:
         raise AssertionError(
-            "create_pull_request should never be reached — create_branch fails first"
+            "create_pull_request should never be reached — repository_exists fails first"
         )
 
     async def merge_pull_request(self, repo: str, pr_id: str) -> None:

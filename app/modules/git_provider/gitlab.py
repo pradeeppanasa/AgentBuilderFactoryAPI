@@ -36,6 +36,30 @@ class GitLabProvider(GitProvider):
     def _project_id(repo: str) -> str:
         return quote(repo_slug_from_url(repo), safe="")
 
+    async def repository_exists(self, repo: str) -> bool:
+        project_id = self._project_id(repo)
+        response = await self._client.get(f"/projects/{project_id}")
+        if response.status_code == 404:
+            return False
+        response.raise_for_status()
+        return True
+
+    async def create_repository(self, repo: str) -> None:
+        namespace, _, name = repo_slug_from_url(repo).rpartition("/")
+        # initialize_with_readme gives the project an initial commit on its
+        # default branch — same reason as GitHub's auto_init (see there).
+        payload: dict[str, str | bool | int] = {"name": name, "initialize_with_readme": True}
+        if namespace:
+            namespace_lookup = await self._client.get(
+                "/namespaces", params={"search": namespace}
+            )
+            namespace_lookup.raise_for_status()
+            matches = [n for n in namespace_lookup.json() if n["full_path"] == namespace]
+            if matches:
+                payload["namespace_id"] = matches[0]["id"]
+        response = await self._client.post("/projects", json=payload)
+        response.raise_for_status()
+
     async def create_branch(self, repo: str, branch: str, from_branch: str = "main") -> None:
         project_id = self._project_id(repo)
         response = await self._client.post(

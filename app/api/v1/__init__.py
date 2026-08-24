@@ -14,6 +14,7 @@ from app.api.v1 import (
     platform,
     playground,
     projects,
+    prompt_generation,
     runs,
     skills,
     task_planner,
@@ -24,6 +25,7 @@ router.include_router(platform.router)
 router.include_router(auth.router)
 router.include_router(agents.router)
 router.include_router(build_with_ai.router)
+router.include_router(prompt_generation.router)
 router.include_router(deployments.router)
 router.include_router(connectors.router)
 router.include_router(knowledge_bases.router)

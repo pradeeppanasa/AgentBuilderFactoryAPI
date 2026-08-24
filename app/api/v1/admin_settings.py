@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from app.dependencies import get_platform_settings_store, get_secrets_manager, get_tenant_id
 from app.modules.auth.dependencies import require_role
 from app.modules.auth.schemas import CurrentUser
+from app.modules.deployment.models import ApprovalMode, CICDProvider
 from app.modules.observability.capabilities import (
     CapabilityDiscoveryResponse,
     discover_capabilities,
@@ -113,6 +114,27 @@ class SaveDynatraceRequest(BaseModel):
     endpoint: str | None = None
 
 
+class DeploymentSettingsConfig(BaseModel):
+    """Section 45.3/45.13 (R50, resolved as configurable). Default
+    "automated" preserves F1's fully-automated pipeline exactly as frozen;
+    a tenant switches to "manual" to opt into R50/Stage 5's human-approval
+    gate (Section 45.4) for every deployment it triggers from then on.
+
+    cicd_provider (Section 45.6/R58) picks which workflow file gets
+    committed to a newly-created agent repo (Section 45.2's v1 case) —
+    every agent for this tenant shares the same provider template."""
+
+    default_approval_mode: ApprovalMode
+    cicd_provider: CICDProvider
+
+
+class SaveDeploymentSettingsRequest(BaseModel):
+    default_approval_mode: ApprovalMode
+    cicd_provider: CICDProvider | None = None
+    """None keeps the tenant's current cicd_provider — matches every other
+    optional field in this file (e.g. SaveGrafanaRequest.endpoint)."""
+
+
 class ObservabilityConfigResponse(BaseModel):
     default_stack: DefaultStackStatus
     otel: OtelEndpointConfig
@@ -200,6 +222,44 @@ async def save_otel_endpoint(
     )
     await store.save(record)
     return OtelEndpointConfig(endpoint=record.otel_endpoint)
+
+
+@router.get("/deployment", response_model=DeploymentSettingsConfig)
+async def get_deployment_settings(
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    current_user: Annotated[CurrentUser, Depends(require_role())],
+    store: Annotated[PlatformSettingsStore, Depends(get_platform_settings_store)],
+) -> DeploymentSettingsConfig:
+    record = await store.get_or_create(tenant_id, current_user.email)
+    return DeploymentSettingsConfig(
+        default_approval_mode=record.default_approval_mode,
+        cicd_provider=record.cicd_provider,
+    )
+
+
+@router.patch("/deployment", response_model=DeploymentSettingsConfig)
+async def save_deployment_settings(
+    payload: SaveDeploymentSettingsRequest,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    current_user: Annotated[CurrentUser, Depends(require_role())],
+    store: Annotated[PlatformSettingsStore, Depends(get_platform_settings_store)],
+) -> DeploymentSettingsConfig:
+    record = await store.get_or_create(tenant_id, current_user.email)
+    record = record.model_copy(
+        update={
+            "default_approval_mode": payload.default_approval_mode,
+            "cicd_provider": (
+                payload.cicd_provider if payload.cicd_provider is not None else record.cicd_provider
+            ),
+            "updated_by": current_user.email,
+            "updated_at": _now(),
+        }
+    )
+    await store.save(record)
+    return DeploymentSettingsConfig(
+        default_approval_mode=record.default_approval_mode,
+        cicd_provider=record.cicd_provider,
+    )
 
 
 @router.get("/integrations/langfuse", response_model=LangfuseConfig)

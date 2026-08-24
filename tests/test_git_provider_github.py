@@ -25,6 +25,15 @@ class _Recorder:
         self.requests.append(request)
         method, path = request.method, request.url.path
 
+        if method == "GET" and path == "/repos/acme/panasa-agent-iac":
+            return httpx.Response(200, json={"full_name": "acme/panasa-agent-iac"})
+
+        if method == "GET" and path == "/repos/acme/panasa-iac-new-agent":
+            return httpx.Response(404, json={"message": "Not Found"})
+
+        if method == "POST" and path == "/orgs/acme/repos":
+            return httpx.Response(201, json={"full_name": "acme/panasa-iac-new-agent"})
+
         if method == "GET" and path == "/repos/acme/panasa-agent-iac/git/ref/heads/main":
             return httpx.Response(200, json={"object": {"sha": "base-sha"}})
 
@@ -77,6 +86,33 @@ def recorder() -> _Recorder:
 def provider(recorder: _Recorder) -> GitHubProvider:
     transport = httpx.MockTransport(recorder.handler)
     return GitHubProvider(token="fake-token", transport=transport)
+
+
+async def test_repository_exists_true_for_200(
+    provider: GitHubProvider, recorder: _Recorder
+) -> None:
+    assert await provider.repository_exists(REPO) is True
+
+
+async def test_repository_exists_false_for_404(
+    provider: GitHubProvider, recorder: _Recorder
+) -> None:
+    assert await provider.repository_exists("https://github.com/acme/panasa-iac-new-agent") is False
+
+
+async def test_create_repository_posts_to_org_repos_with_auto_init(
+    provider: GitHubProvider, recorder: _Recorder
+) -> None:
+    await provider.create_repository("acme/panasa-iac-new-agent")
+
+    request = recorder.requests[-1]
+    assert request.method == "POST"
+    assert request.url.path == "/orgs/acme/repos"
+    assert json.loads(request.content) == {
+        "name": "panasa-iac-new-agent",
+        "private": True,
+        "auto_init": True,
+    }
 
 
 async def test_create_branch_fetches_base_sha_and_creates_ref(

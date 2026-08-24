@@ -61,6 +61,7 @@ os.environ.setdefault("AUDIT_S3_BUCKET", "panasa-audit-test")
 os.environ.setdefault("GIT_PROVIDER", "github")
 os.environ.setdefault("GIT_CREDENTIALS_SECRET", "git-token")
 os.environ.setdefault("GIT_REPO_URL", "https://github.com/test-org/test-repo")
+os.environ.setdefault("GIT_ORG", "test-org")
 os.environ.setdefault("EVENTBRIDGE_BUS_NAME", "panasa-agent-builder-test")
 # Deliberately unreachable (connection refused, not a timeout) so
 # check_cache()'s "error" path is deterministic in tests regardless of

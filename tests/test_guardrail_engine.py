@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 import pytest
 
 from app.modules.guardrails.engine import GuardrailEngine
-from app.modules.guardrails.models import BertConfig, GuardrailPolicy
+from app.modules.guardrails.models import BertConfig, GuardrailLayerResult, GuardrailPolicy
 from tests.fakes import (
     FailingBedrockGuardrailClient,
     FakeBedrockGuardrailClient,
@@ -120,6 +120,42 @@ async def test_input_escalates_to_bedrock_and_bedrock_blocks() -> None:
 
     assert decision.blocked is True
     assert decision.layers[-1].action == "block"
+
+
+async def test_mock_enabled_skips_real_bedrock_call_and_returns_pass() -> None:
+    """settings.mock_bedrock_guardrails — even a fake client configured to
+    intervene/block must never actually be called when mock_enabled=True;
+    the engine short-circuits to a mocked pass before touching Bedrock.
+    classifier_score=0.5 lands BERT in its escalate band (matching
+    test_input_escalates_to_bedrock_and_bedrock_blocks above) so this
+    genuinely exercises the Bedrock call site, not just a BERT-only block."""
+    bedrock = FakeBedrockGuardrailClient(intervene=True)
+    engine = GuardrailEngine(
+        bedrock,
+        classifier_factory=lambda _model, _keyword: FakeToxicityClassifier(0.5),
+        mock_enabled=True,
+    )
+    policy = _policy(bedrock_guardrail_id="gr-123")
+
+    decision = await engine.check_input("ambiguous text", policy)
+
+    assert decision.blocked is False
+    assert decision.layers[-1] == GuardrailLayerResult(
+        layer="bedrock", action="pass", reason="mocked_pass"
+    )
+    assert bedrock.calls == []
+
+
+async def test_mock_enabled_skips_real_bedrock_call_on_output_too() -> None:
+    bedrock = FakeBedrockGuardrailClient(intervene=True)
+    engine = GuardrailEngine(bedrock, mock_enabled=True)
+    policy = _policy(bedrock_guardrail_id="gr-123")
+
+    decision = await engine.check_output("some output text", policy)
+
+    assert decision.blocked is False
+    assert decision.sanitised_text is None
+    assert bedrock.calls == []
 
 
 async def test_input_unsure_with_no_bedrock_guardrail_configured_passes_with_note() -> None:

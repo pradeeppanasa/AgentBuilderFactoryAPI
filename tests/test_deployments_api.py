@@ -37,6 +37,12 @@ def _minimal_agent_payload(name: str = "KYC Agent") -> dict[str, Any]:
 
 
 class FakeGitProvider(GitProvider):
+    async def repository_exists(self, repo: str) -> bool:
+        return False
+
+    async def create_repository(self, repo: str) -> None:
+        pass
+
     async def create_branch(self, repo: str, branch: str, from_branch: str = "main") -> None:
         pass
 

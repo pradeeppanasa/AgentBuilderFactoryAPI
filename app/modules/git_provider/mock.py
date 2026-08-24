@@ -21,6 +21,13 @@ log = get_logger()
 
 
 class MockGitProvider(GitProvider):
+    async def repository_exists(self, repo: str) -> bool:
+        log.info("git.mock.repository_exists", repo=repo)
+        return False
+
+    async def create_repository(self, repo: str) -> None:
+        log.info("git.mock.create_repository", repo=repo)
+
     async def create_branch(self, repo: str, branch: str, from_branch: str = "main") -> None:
         log.info("git.mock.create_branch", repo=repo, branch=branch, from_branch=from_branch)
 

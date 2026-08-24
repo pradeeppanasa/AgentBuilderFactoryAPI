@@ -84,6 +84,69 @@ async def test_generate_iac_happy_path_persists_artifact(make_user_and_token) ->
     assert detail["iac_validation_report"] == body["validation_report"]
 
 
+async def test_generate_iac_reflects_new_config_after_edit_and_regenerate(
+    make_user_and_token,
+) -> None:
+    """I-03 (CLAUDE.md Section 39.8: "IaC generator uses stale agent data on
+    regenerate") — regression coverage. generate-iac always re-fetches
+    agent.current_version fresh from the store (app/api/v1/agents.py), so
+    editing an agent (which creates a new version, R08) and regenerating
+    must produce IaC for the NEW config, never the version generate-iac
+    last ran against."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/agents", json=_minimal_agent_payload(), headers=_bearer(token)
+        ).json()
+        agent_id = created["agent_id"]
+
+        v1_response = client.post(
+            f"/api/v1/agents/{agent_id}/generate-iac", headers=_bearer(token)
+        ).json()
+        assert v1_response["version"] == 1
+        assert "tools" not in v1_response["modules"]
+
+        v2_config = _minimal_agent_payload()["configuration"]
+        v2_config["tools"] = [
+            {
+                "tool_id": "jira",
+                "tool_name": "Jira",
+                "executor_type": "http",
+                "endpoint": "https://acme.atlassian.net/rest/api/3",
+                "input_schema": {},
+            }
+        ]
+        put_response = client.put(
+            f"/api/v1/agents/{agent_id}",
+            json={"configuration": v2_config, "change_description": "Add Jira tool"},
+            headers=_bearer(token),
+        )
+        assert put_response.status_code == 200
+        assert put_response.json()["version"] == 2
+
+        v2_response = client.post(
+            f"/api/v1/agents/{agent_id}/generate-iac", headers=_bearer(token)
+        ).json()
+        assert v2_response["version"] == 2
+        assert "tools" in v2_response["modules"]
+        assert v2_response["s3_key"] != v1_response["s3_key"]
+
+        v1_detail = client.get(
+            f"/api/v1/agents/{agent_id}/versions/1", headers=_bearer(token)
+        ).json()
+        v2_detail = client.get(
+            f"/api/v1/agents/{agent_id}/versions/2", headers=_bearer(token)
+        ).json()
+
+    # Each version's own recorded artifact stays exactly what generate-iac
+    # produced for it — v1's record is never overwritten by v2's run.
+    assert v1_detail["iac_s3_key"] == v1_response["s3_key"]
+    assert "tools" not in v1_detail["iac_modules"]
+    assert v2_detail["iac_s3_key"] == v2_response["s3_key"]
+    assert "tools" in v2_detail["iac_modules"]
+
+
 async def test_generate_iac_422_when_validation_fails(make_user_and_token) -> None:
     _, token = await make_user_and_token(TENANT_A, role="developer")
 

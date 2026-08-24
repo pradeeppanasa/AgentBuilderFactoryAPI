@@ -24,6 +24,15 @@ class _Recorder:
         # base_url similarly has a non-empty path component "/api/v4").
         method, path = request.method, request.url.path
 
+        if method == "GET" and path.endswith(f"/repositories/{SLUG}"):
+            return httpx.Response(200, json={"full_name": SLUG})
+
+        if method == "GET" and path.endswith("/repositories/acme/panasa-iac-new-agent"):
+            return httpx.Response(404, json={"error": {"message": "Repository not found"}})
+
+        if method == "POST" and path.endswith("/repositories/acme/panasa-iac-new-agent"):
+            return httpx.Response(200, json={"full_name": "acme/panasa-iac-new-agent"})
+
         if method == "POST" and path.endswith(f"/repositories/{SLUG}/refs/branches"):
             return httpx.Response(201, json={"name": "deploy-branch"})
 
@@ -57,6 +66,30 @@ def recorder() -> _Recorder:
 def provider(recorder: _Recorder) -> BitbucketProvider:
     transport = httpx.MockTransport(recorder.handler)
     return BitbucketProvider(token="fake-token", transport=transport)
+
+
+async def test_repository_exists_true_for_200(
+    provider: BitbucketProvider, recorder: _Recorder
+) -> None:
+    assert await provider.repository_exists(REPO) is True
+
+
+async def test_repository_exists_false_for_404(
+    provider: BitbucketProvider, recorder: _Recorder
+) -> None:
+    new_repo = "https://bitbucket.org/acme/panasa-iac-new-agent"
+    assert await provider.repository_exists(new_repo) is False
+
+
+async def test_create_repository_posts_is_private(
+    provider: BitbucketProvider, recorder: _Recorder
+) -> None:
+    await provider.create_repository("acme/panasa-iac-new-agent")
+
+    request = recorder.requests[-1]
+    assert request.method == "POST"
+    assert request.url.path.endswith("/repositories/acme/panasa-iac-new-agent")
+    assert json.loads(request.content) == {"is_private": True}
 
 
 async def test_create_branch(provider: BitbucketProvider, recorder: _Recorder) -> None:

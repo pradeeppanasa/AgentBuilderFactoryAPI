@@ -110,8 +110,30 @@ class KBConfig(BaseModel):
     s3_prefix: str | None = None
     embedding_model: str = "amazon.titan-embed-text-v2:0"
     chunk_strategy: str = "semantic"  # semantic | fixed | paragraph
-    top_k: int = 5
+    top_k: int = Field(default=5, gt=0)
     reranking_enabled: bool = True
+
+    # Hybrid retrieval pipeline config: BM25/lexical + vector/semantic
+    # search -> result fusion -> cross-encoder reranker -> top-K selection
+    # -> context filtering. Config-only (F8/R30): the Builder Runtime
+    # provisions and stores this alongside the rest of KBConfig — it never
+    # runs retrieval itself (app/api/v1/playground.py's _run_kb_retrieval
+    # stays a stub). The Generated Agent Runtime is the separate service
+    # responsible for actually building and running this pipeline.
+    hybrid_mode: bool = False
+    """Use hybrid BM25 (lexical) + vector (semantic) search with result
+    fusion, instead of vector-only retrieval."""
+    fusion_weight: float = Field(default=0.5, ge=0.0, le=1.0)
+    """Result-fusion balance between lexical and vector search scores:
+    0.0 = pure BM25/lexical, 1.0 = pure vector/semantic, 0.5 = even split.
+    Meaningful only when hybrid_mode is True."""
+    reranker_model: str | None = None
+    """Cross-encoder reranker model identifier applied to fused results
+    before top-K selection. None = no reranking pass."""
+    filter_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    """Minimum relevance score a chunk must clear to survive context
+    filtering (after reranking, before the LLM sees it). None = no
+    filtering — the top-K results are used as-is."""
 
 
 class ToolConfig(BaseModel):

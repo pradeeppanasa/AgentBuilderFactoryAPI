@@ -208,7 +208,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await platform_settings_store.ensure_table()
     app.state.platform_settings_store = platform_settings_store
 
-    app.state.guardrail_engine = GuardrailEngine(create_bedrock_runtime_client(settings))
+    app.state.guardrail_engine = GuardrailEngine(
+        create_bedrock_runtime_client(settings), mock_enabled=settings.mock_bedrock_guardrails
+    )
     app.state.bedrock_guardrail_provisioner = BedrockGuardrailProvisioner(
         create_bedrock_client(settings),
         sts_client=create_sts_client(settings),

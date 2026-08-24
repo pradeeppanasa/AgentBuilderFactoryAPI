@@ -48,6 +48,49 @@ async def test_default_observability_config_has_always_on_stack(make_user_and_to
         assert body["datadog"] == {"enabled": False, "api_key": None, "site": None}
 
 
+async def test_deployment_settings_default_to_automated(make_user_and_token) -> None:
+    """Section 45.3/45.13 (R50, resolved as configurable) — F1's fully
+    automated pipeline is the default; a tenant must explicitly opt into
+    R50/Stage 5's manual-approval gate."""
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/admin/settings/deployment", headers=_bearer(admin_token))
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "default_approval_mode": "automated",
+        "cicd_provider": "github_actions",
+    }
+
+
+async def test_save_and_read_back_deployment_settings(make_user_and_token) -> None:
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        saved = client.patch(
+            "/api/v1/admin/settings/deployment",
+            json={"default_approval_mode": "manual", "cicd_provider": "gitlab_ci"},
+            headers=_bearer(admin_token),
+        )
+        assert saved.status_code == 200
+        assert saved.json() == {"default_approval_mode": "manual", "cicd_provider": "gitlab_ci"}
+
+        fetched = client.get("/api/v1/admin/settings/deployment", headers=_bearer(admin_token))
+        assert fetched.json() == {"default_approval_mode": "manual", "cicd_provider": "gitlab_ci"}
+
+
+async def test_deployment_settings_forbidden_for_developer(make_user_and_token) -> None:
+    _, developer_token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/v1/admin/settings/deployment", headers=_bearer(developer_token)
+        )
+
+    assert response.status_code == 403
+
+
 async def test_save_and_read_back_otel_endpoint(make_user_and_token) -> None:
     _, admin_token = await make_user_and_token(TENANT_A, role="admin")
 

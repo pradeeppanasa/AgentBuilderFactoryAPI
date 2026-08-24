@@ -361,6 +361,85 @@ async def test_playground_mock_mode_never_calls_the_llm(
     assert body["metrics"]["guardrail_decisions"] == []
 
 
+async def test_playground_mock_mode_orchestrator_reports_routing_decision(
+    make_user_and_token, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TS-02 Priority 3 — full A2A dispatch (Section 18's ManagerOrchestrator)
+    is Generated Agent Runtime infrastructure this Builder Runtime does not
+    build (F8); mock mode instead deterministically "selects" the first
+    configured sub-agent so an orchestrator's playground turn shows some
+    routing decision, purely to unblock TS-02's orchestrator scenarios."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    async def _fail_if_called(**kwargs: Any) -> None:
+        raise AssertionError("mock mode must never call litellm.acompletion")
+
+    monkeypatch.setattr(litellm, "acompletion", _fail_if_called)
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/agents",
+            json={
+                "name": "KYC Compliance Orchestrator",
+                "description": "d",
+                "business_purpose": "p",
+                "agent_type": "orchestrator",
+                "configuration": {
+                    "model_id": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+                    "model_provider": "bedrock",
+                    "system_prompt": "You route requests to specialist sub-agents.",
+                    "orchestration": {
+                        "is_manager": True,
+                        "sub_agents": [
+                            {
+                                "agent_id": "sub-1",
+                                "agent_name": "Identity Verification Agent",
+                                "capability_description": "Verifies identity documents",
+                            },
+                            {
+                                "agent_id": "sub-2",
+                                "agent_name": "Risk Scorer Agent",
+                                "capability_description": "Scores financial crime risk",
+                            },
+                        ],
+                    },
+                },
+            },
+            headers=_bearer(token),
+        )
+        assert created.status_code == 201
+        agent_id = created.json()["agent_id"]
+
+        response = client.post(
+            f"/api/v1/agents/{agent_id}/playground?mock=true",
+            json={"message": "Verify this new customer."},
+            headers=_bearer(token),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["metrics"]["routing_decision"] == (
+        "Orchestrator selected: Identity Verification Agent"
+    )
+
+
+async def test_playground_mock_mode_standard_agent_has_no_routing_decision(
+    make_user_and_token,
+) -> None:
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        agent_id = await _create_agent(client, token)
+
+        response = client.post(
+            f"/api/v1/agents/{agent_id}/playground?mock=true",
+            json={"message": "hi there"},
+            headers=_bearer(token),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["metrics"]["routing_decision"] is None
+
+
 async def test_playground_session_round_trips_turns(make_user_and_token) -> None:
     """TS02-U-02 fixed _memory_state to report 0 when memory is off — this
     test is about session_entries reflecting real turn count, so it needs

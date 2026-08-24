@@ -20,6 +20,7 @@ from typing import Any, TypeVar
 from app.config import settings
 from app.modules.audit.writer import AuditWriter
 from app.modules.deployment.status_store import DeploymentStatusStore
+from app.modules.git_provider._util import agent_repo_identifier
 from app.modules.git_provider.factory import create_git_provider
 from app.modules.git_provider.secrets import fetch_git_token
 from app.modules.iac_generator.generator import IaCGenerator
@@ -75,7 +76,11 @@ def require(event: dict[str, Any], *keys: str) -> tuple[str, ...]:
     return tuple(event[k] for k in keys)
 
 
-def require_git_repo_url() -> str:
-    if not settings.git_repo_url:
-        raise StageFailure("GIT_REPO_URL is not configured")
-    return settings.git_repo_url
+def require_agent_repo(agent_id: str) -> str:
+    """Section 45.2 — the per-agent panasa-iac-{agent_id} repo identifier,
+    same computation app/api/v1/agents.py's deploy trigger already used to
+    create/push to this repo."""
+    repo = agent_repo_identifier(settings.git_provider, settings.git_org, agent_id)
+    if repo is None:
+        raise StageFailure("GIT_ORG is not configured")
+    return repo

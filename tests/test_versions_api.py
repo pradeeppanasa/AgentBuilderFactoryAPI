@@ -187,8 +187,13 @@ async def test_rollback_creates_new_version_from_target_config(make_user_and_tok
     # Phase 13: rollback now triggers a real deployment, same as POST /deploy.
     assert body["status"] == "DEPLOYING"
     assert body["deployment_id"].startswith("DEP-")
-    assert body["pull_request_id"] == "99"
-    assert len(fake_git.opened_prs) == 1
+    # This agent was never deployed before (only edited via PUT) — Section
+    # 45.2/45.3: the per-agent repo doesn't exist yet, so this rollback's
+    # deploy is the v1 case (push straight to main, no PR), even though the
+    # version number it carries is 4.
+    assert body["pull_request_id"] is None
+    assert fake_git.opened_prs == []
+    assert len(fake_git.created_repos) == 1
 
     with TestClient(app) as client:
         detail = client.get(f"/api/v1/agents/{agent_id}", headers=_bearer(token)).json()

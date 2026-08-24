@@ -67,6 +67,13 @@ class Settings(BaseSettings):
     task_planner_model_id: str = "anthropic.claude-3-5-haiku-20241022-v1:0"
     task_planner_max_tokens: int = 2048
 
+    # ── AI Prompt Generation (Section 22) ───────────────────────────────────
+    # Same factory-internal-call rule as Task Planner above — this never
+    # touches the agent being configured, only the Runtime's own Bedrock
+    # access via call_factory_model().
+    prompt_gen_model_id: str = "anthropic.claude-3-5-haiku-20241022-v1:0"
+    prompt_gen_max_tokens: int = 2048
+
     # ── Playground mock mode (dev/test only) ───────────────────────────────
     # Global opt-in for POST /agents/{id}/playground?mock=true's per-request
     # flag — lets a whole dev environment (e.g. local Docker Compose, where
@@ -124,6 +131,13 @@ class Settings(BaseSettings):
     git_provider: Literal["github", "gitlab", "bitbucket", "codecommit"] = "github"
     git_repo_url: str | None = None
     git_credentials_secret: str | None = None
+    # Section 45.2/45.12 — one private repo per agent (panasa-iac-{agent_id})
+    # replaces the single shared git_repo_url for the deploy flow itself;
+    # git_repo_url above is left in place only for bootstrap Terraform /
+    # lambda_handlers, which still reference the old single-repo model.
+    # Not applicable to codecommit — AWS repo names aren't org/namespace-scoped.
+    git_org: str | None = None
+    git_default_branch: str = "main"
 
     # ── Terraform backend (enterprise only) ────────────────────────
     tf_state_bucket: str | None = None
