@@ -417,9 +417,197 @@ async def test_playground_mock_mode_orchestrator_reports_routing_decision(
         )
 
     assert response.status_code == 200
-    assert response.json()["metrics"]["routing_decision"] == (
+    body = response.json()
+    assert body["metrics"]["routing_decision"] == (
         "Orchestrator selected: Identity Verification Agent"
     )
+    assert body["metrics"]["routing_note"] == (
+        "Routing is simulated in mock mode — no real LLM-based dispatch occurred."
+    )
+
+
+def _kyc_orchestrator_payload(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "name": "KYC Compliance Orchestrator",
+        "description": "d",
+        "business_purpose": "p",
+        "agent_type": "orchestrator",
+        "configuration": {
+            "model_id": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "model_provider": "bedrock",
+            "system_prompt": "You route requests to specialist sub-agents.",
+            "orchestration": {
+                "is_manager": True,
+                "sub_agents": [
+                    {
+                        "agent_id": "sub-1",
+                        "agent_name": "Identity Verification Agent",
+                        "capability_description": "Verifies identity documents",
+                    },
+                    {
+                        "agent_id": "sub-2",
+                        "agent_name": "Risk Assessment Agent",
+                        "capability_description": "Scores financial crime risk",
+                    },
+                ],
+            },
+        },
+    }
+    payload["configuration"].update(overrides)
+    return payload
+
+
+async def test_playground_mock_mode_routes_by_keyword_not_just_first_sub_agent(
+    make_user_and_token, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Section 46.4 Part C — Scenario 1 must route to the Identity agent,
+    Scenario 2 to the Risk agent, from message content alone. A stub that
+    always picks sub_agents[0] would pass Scenario 1 by coincidence and
+    fail Scenario 2 (both agents are configured, Identity listed first)."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    async def _fail_if_called(**kwargs: Any) -> None:
+        raise AssertionError("mock mode must never call litellm.acompletion")
+
+    monkeypatch.setattr(litellm, "acompletion", _fail_if_called)
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/agents", json=_kyc_orchestrator_payload(), headers=_bearer(token)
+        )
+        assert created.status_code == 201
+        agent_id = created.json()["agent_id"]
+
+        # Scenario 1 — Identity route (Section 46.4).
+        scenario_1 = client.post(
+            f"/api/v1/agents/{agent_id}/playground?mock=true",
+            json={
+                "message": (
+                    "A new customer wants to open an account. Name: Sarah Johnson, "
+                    "DOB: 22/06/1990, Passport: PQ987654. Please verify her identity."
+                )
+            },
+            headers=_bearer(token),
+        )
+        assert scenario_1.json()["metrics"]["routing_decision"] == (
+            "Orchestrator selected: Identity Verification Agent"
+        )
+
+        # Scenario 2 — Risk route (Section 46.4).
+        scenario_2 = client.post(
+            f"/api/v1/agents/{agent_id}/playground?mock=true",
+            json={
+                "message": (
+                    "Customer ID CUST-4421 has made 5 large transfers in 7 days. "
+                    "Assess the financial crime risk."
+                )
+            },
+            headers=_bearer(token),
+        )
+        assert scenario_2.json()["metrics"]["routing_decision"] == (
+            "Orchestrator selected: Risk Assessment Agent"
+        )
+
+
+async def test_playground_mock_mode_hitl_triggers_when_score_meets_threshold(
+    make_user_and_token, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Section 46.5 Scenario 3 — a message whose parsed score meets the
+    agent's configured HITL threshold returns run_status=HITL_PENDING."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    async def _fail_if_called(**kwargs: Any) -> None:
+        raise AssertionError("mock mode must never call litellm.acompletion")
+
+    monkeypatch.setattr(litellm, "acompletion", _fail_if_called)
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/agents",
+            json=_kyc_orchestrator_payload(
+                hitl={
+                    "enabled": True,
+                    "trigger_conditions": ["low_confidence_high_risk"],
+                    "reviewer_emails": ["analyst@example.com"],
+                    "timeout_hours": 24,
+                    "threshold": 0.70,
+                }
+            ),
+            headers=_bearer(token),
+        )
+        assert created.status_code == 201
+        agent_id = created.json()["agent_id"]
+
+        response = client.post(
+            f"/api/v1/agents/{agent_id}/playground?mock=true",
+            json={
+                "message": (
+                    "Customer ID CUST-8821. Risk score 0.92. Multiple flags raised. "
+                    "Proceed with KYC approval?"
+                )
+            },
+            headers=_bearer(token),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["run_status"] == "HITL_PENDING"
+
+
+async def test_playground_mock_mode_hitl_does_not_trigger_below_threshold(
+    make_user_and_token, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    async def _fail_if_called(**kwargs: Any) -> None:
+        raise AssertionError("mock mode must never call litellm.acompletion")
+
+    monkeypatch.setattr(litellm, "acompletion", _fail_if_called)
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/agents",
+            json=_kyc_orchestrator_payload(
+                hitl={
+                    "enabled": True,
+                    "trigger_conditions": ["low_confidence_high_risk"],
+                    "reviewer_emails": ["analyst@example.com"],
+                    "timeout_hours": 24,
+                    "threshold": 0.80,
+                }
+            ),
+            headers=_bearer(token),
+        )
+        agent_id = created.json()["agent_id"]
+
+        response = client.post(
+            f"/api/v1/agents/{agent_id}/playground?mock=true",
+            json={"message": "Customer ID CUST-1. Risk score 0.30. Looks fine."},
+            headers=_bearer(token),
+        )
+
+    assert response.json()["run_status"] == "SUCCESS"
+
+
+async def test_playground_mock_mode_hitl_disabled_never_triggers(
+    make_user_and_token, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    async def _fail_if_called(**kwargs: Any) -> None:
+        raise AssertionError("mock mode must never call litellm.acompletion")
+
+    monkeypatch.setattr(litellm, "acompletion", _fail_if_called)
+
+    with TestClient(app) as client:
+        agent_id = await _create_agent(client, token)
+
+        response = client.post(
+            f"/api/v1/agents/{agent_id}/playground?mock=true",
+            json={"message": "Risk score 0.99, definitely high risk."},
+            headers=_bearer(token),
+        )
+
+    assert response.json()["run_status"] == "SUCCESS"
 
 
 async def test_playground_mock_mode_standard_agent_has_no_routing_decision(

@@ -23,7 +23,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-RunStatus = Literal["SUCCESS", "FAILED", "RUNNING", "PARTIAL"]
+RunStatus = Literal["SUCCESS", "FAILED", "RUNNING", "PARTIAL", "HITL_PENDING"]
+"""HITL_PENDING (Section 46.5 Scenario 3): a run whose HITL config tripped
+and is now awaiting a human decision (panasa-hitl-reviews) before it can
+resolve to SUCCESS/FAILED. Distinct from RUNNING — a run doesn't just take
+a while, it is blocked on a human, and won't move without one."""
 RunTrigger = Literal["API", "SCHEDULER", "WEBHOOK", "MANUAL", "HITL"]
 ActivityLevel = Literal["INFO", "WARNING", "ERROR", "DEBUG"]
 StepStatus = Literal["SUCCESS", "FAILED", "RUNNING"]

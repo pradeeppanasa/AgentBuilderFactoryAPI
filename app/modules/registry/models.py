@@ -322,6 +322,10 @@ class HitlConfig(BaseModel):
     trigger_conditions: list[str] = Field(default_factory=list)
     reviewer_emails: list[str] = Field(default_factory=list)
     timeout_hours: int = 24
+    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    """Section 46.3's wizard "Threshold" field (e.g. 0.80) — a numeric score
+    a run must meet or exceed to trip this HITL gate. None = threshold-based
+    triggering isn't used; trigger_conditions alone decide."""
 
 
 class AgentConfiguration(BaseModel):

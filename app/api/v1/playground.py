@@ -14,6 +14,7 @@ empty/stubbed here rather than faked — see the docstrings on
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import UTC, datetime
 from typing import Annotated, Any
@@ -41,6 +42,7 @@ from app.modules.playground.models import PlaygroundTurn
 from app.modules.playground.store import PlaygroundSessionStore
 from app.modules.registry.models import AgentConfiguration
 from app.modules.registry.store import AgentRegistryStore
+from app.modules.runs.models import RunStatus
 from app.services.model_router import call_model
 
 router = APIRouter(prefix="/agents", tags=["playground"])
@@ -121,6 +123,11 @@ class PlaygroundMetrics(BaseModel):
     Builder Runtime does not build (F8); None for every non-orchestrator
     agent and for the real-LLM path, which doesn't fabricate a routing
     decision it never actually made."""
+    routing_note: str | None = None
+    """Set alongside routing_decision (mock mode, orchestrator agents only)
+    — an explicit disclosure that the decision above is simulated by
+    keyword matching, never a real LLM dispatch, per F8's Builder-vs-
+    Generated-Runtime boundary."""
 
 
 class PlaygroundResponse(BaseModel):
@@ -128,6 +135,12 @@ class PlaygroundResponse(BaseModel):
     blocked: bool
     message: str
     metrics: PlaygroundMetrics
+    run_status: RunStatus = "SUCCESS"
+    """Section 46.5 Scenario 3 — HITL_PENDING when this turn's HITL config
+    tripped (mock mode: a threshold check against a score parsed from the
+    message text, since no LLM runs to judge risk for real). SUCCESS
+    otherwise; FAILED is reserved for the real-LLM error path below, never
+    set by the mock branch."""
 
 
 def _reject_overrides_if_not_admin(
@@ -254,20 +267,91 @@ def _run_kb_retrieval(kb_id: str | None) -> KBRetrievalSummary | None:
     return KBRetrievalSummary(chunk_count=0, similarity_scores=[])
 
 
-def _mock_routing_decision(agent_type: str, config: AgentConfiguration) -> str | None:
+_ROUTING_NOTE = "Routing is simulated in mock mode — no real LLM-based dispatch occurred."
+
+# Section 46.4 Part C's two scenarios expect two DIFFERENT sub-agents
+# depending on message content — a fixed "always sub_agents[0]" stub can't
+# tell those apart. Keyword sets are deliberately narrow/literal (matching
+# the exact wording CLAUDE.md's test scenarios use) rather than a real NLU
+# classifier: this is a mock-mode simulation, not a routing engine.
+_RISK_KEYWORDS = ("risk", "score", "transfer", "aml", "financial crime")
+_IDENTITY_KEYWORDS = ("identity", "name", "dob", "passport", "verify")
+_ID_WORD_PATTERN = re.compile(r"\bid\b", re.IGNORECASE)
+
+
+def _find_sub_agent_by_name_fragment(sub_agents: list[Any], fragment: str) -> str | None:
+    return next(
+        (sa.agent_name for sa in sub_agents if fragment.lower() in sa.agent_name.lower()),
+        None,
+    )
+
+
+def _mock_routing_decision(
+    agent_type: str, config: AgentConfiguration, message: str
+) -> tuple[str | None, str | None]:
     """TS-02 Priority 3 stub. Real A2A dispatch (Section 18's
     ManagerOrchestrator — the LLM actually deciding which sub-agent(s) to
     call) is Generated Agent Runtime infrastructure this Builder Runtime
-    does not build (F8); no LLM runs in mock mode to make that decision
-    for real. Deterministically "selects" the first configured sub-agent
-    instead, purely so an orchestrator agent's mock playground turn has a
-    routing decision to show at all — never fabricated for a standard
-    agent, and never claimed to be a real routing choice."""
+    does not build (F8); no LLM runs in mock mode to make that decision for
+    real. Keyword-matches the message against the sub-agent's own name
+    (Section 46.4: "identity"/"name"/"dob"/"passport"/"verify"/"id" →
+    whichever sub-agent's name contains "Identity"; "risk"/"score"/
+    "transfer"/"aml"/"financial crime" → whichever contains "Risk"),
+    falling back to the first configured sub-agent — never fabricated for a
+    standard agent, and never claimed to be a real routing choice (see
+    routing_note, always returned alongside).
+
+    Returns (routing_decision, routing_note) — both None for a
+    non-orchestrator agent or one with no sub-agents configured.
+    """
     if agent_type != "orchestrator":
+        return None, None
+    sub_agents = config.orchestration.sub_agents if config.orchestration else []
+    if not sub_agents:
+        return None, None
+
+    lowered = message.lower()
+    selected: str | None = None
+    if any(keyword in lowered for keyword in _RISK_KEYWORDS):
+        selected = _find_sub_agent_by_name_fragment(sub_agents, "risk")
+    has_identity_keyword = any(keyword in lowered for keyword in _IDENTITY_KEYWORDS)
+    if selected is None and (has_identity_keyword or _ID_WORD_PATTERN.search(lowered)):
+        selected = _find_sub_agent_by_name_fragment(sub_agents, "identity")
+    if selected is None:
+        selected = sub_agents[0].agent_name
+
+    return f"Orchestrator selected: {selected}", _ROUTING_NOTE
+
+
+_SCORE_PATTERN = re.compile(r"(?:score|risk)\D{0,10}?([01](?:\.\d+)?)", re.IGNORECASE)
+
+
+def _extract_score_from_message(message: str) -> float | None:
+    """Best-effort numeric score parse (e.g. "risk score 0.92") — mock-mode
+    only. There is no LLM in this path to genuinely judge risk from
+    unstructured text; this exists solely to make Section 46.5 Scenario 3's
+    HITL trip deterministic and testable."""
+    match = _SCORE_PATTERN.search(message)
+    if not match:
         return None
-    if config.orchestration is None or not config.orchestration.sub_agents:
+    try:
+        return float(match.group(1))
+    except ValueError:
         return None
-    return f"Orchestrator selected: {config.orchestration.sub_agents[0].agent_name}"
+
+
+def _mock_hitl_status(config: AgentConfiguration, message: str) -> RunStatus:
+    """Section 46.5 Scenario 3 — HITL_PENDING when a score parsed from the
+    message text meets or exceeds the agent's configured HitlConfig
+    threshold. SUCCESS whenever HITL is disabled, has no threshold set, or
+    no score could be parsed — never fabricated."""
+    hitl = config.hitl
+    if hitl is None or not hitl.enabled or hitl.threshold is None:
+        return "SUCCESS"
+    score = _extract_score_from_message(message)
+    if score is not None and score >= hitl.threshold:
+        return "HITL_PENDING"
+    return "SUCCESS"
 
 
 @router.post("/{agent_id}/playground", response_model=PlaygroundResponse)
@@ -321,10 +405,14 @@ async def run_playground_turn(
             ),
         ]
         mock_session = await session_store.append_turns(agent_id, session.session_id, mock_turns)
+        routing_decision, routing_note = _mock_routing_decision(
+            agent.agent_type, config, payload.message
+        )
         return PlaygroundResponse(
             session_id=mock_session.session_id,
             blocked=False,
             message=mock_reply,
+            run_status=_mock_hitl_status(config, payload.message),
             metrics=PlaygroundMetrics(
                 # TS02-U-03: llm_ms was hardcoded to 42 — a nonzero latency
                 # contradicts "LLM not called." Mock mode does no real work
@@ -338,7 +426,8 @@ async def run_playground_turn(
                 tool_calls=[],
                 kb_retrievals=None,
                 memory=_memory_state(config, len(mock_session.turns)),
-                routing_decision=_mock_routing_decision(agent.agent_type, config),
+                routing_decision=routing_decision,
+                routing_note=routing_note,
             ),
         )
 
