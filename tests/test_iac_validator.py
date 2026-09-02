@@ -671,7 +671,7 @@ async def test_matrix_row_model_only() -> None:
         "base",
         "api_gateway",
         "authentication",
-        "orchestrator",
+        "compute",
         "observability",
     }
     _assert_contains_only(modules, joined, present=set())

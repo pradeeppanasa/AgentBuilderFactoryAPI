@@ -34,6 +34,14 @@ class _Recorder:
         if method == "POST" and path == "/orgs/acme/repos":
             return httpx.Response(201, json={"full_name": "acme/panasa-iac-new-agent"})
 
+        if method == "POST" and path == "/orgs/a-personal-account/repos":
+            return httpx.Response(404, json={"message": "Not Found"})
+
+        if method == "POST" and path == "/user/repos":
+            return httpx.Response(
+                201, json={"full_name": "a-personal-account/panasa-iac-new-agent"}
+            )
+
         if method == "GET" and path == "/repos/acme/panasa-agent-iac/git/ref/heads/main":
             return httpx.Response(200, json={"object": {"sha": "base-sha"}})
 
@@ -113,6 +121,72 @@ async def test_create_repository_posts_to_org_repos_with_auto_init(
         "private": True,
         "auto_init": True,
     }
+
+
+async def test_create_repository_falls_back_to_user_repos_for_personal_account(
+    provider: GitHubProvider, recorder: _Recorder
+) -> None:
+    """GIT_ORG is often a personal GitHub username, not a real Organization —
+    /orgs/{org}/repos 404s in that case. create_repository must retry
+    against /user/repos (creates under the token's own account) instead of
+    surfacing the 404."""
+    await provider.create_repository("a-personal-account/panasa-iac-new-agent")
+
+    request = recorder.requests[-1]
+    assert request.method == "POST"
+    assert request.url.path == "/user/repos"
+    assert json.loads(request.content) == {
+        "name": "panasa-iac-new-agent",
+        "private": True,
+        "auto_init": True,
+    }
+
+
+async def test_commit_files_retries_tree_creation_on_transient_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A repo created moments ago via auto_init=True can briefly 404 when
+    building a tree on its initial commit — the Git Data API hasn't fully
+    propagated it yet. commit_files must retry rather than fail the
+    deploy."""
+    monkeypatch.setattr("asyncio.sleep", lambda *_a, **_k: _immediate())
+
+    tree_attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tree_attempts
+        method, path = request.method, request.url.path
+
+        if method == "GET" and path == "/repos/acme/panasa-agent-iac/git/ref/heads/main":
+            return httpx.Response(200, json={"object": {"sha": "parent-commit-sha"}})
+        if method == "GET" and path == "/repos/acme/panasa-agent-iac/git/commits/parent-commit-sha":
+            return httpx.Response(200, json={"tree": {"sha": "base-tree-sha"}})
+        if method == "POST" and path == "/repos/acme/panasa-agent-iac/git/blobs":
+            return httpx.Response(201, json={"sha": "blob-sha-1"})
+        if method == "POST" and path == "/repos/acme/panasa-agent-iac/git/trees":
+            tree_attempts += 1
+            if tree_attempts < 3:
+                return httpx.Response(404, json={"message": "Not Found"})
+            return httpx.Response(201, json={"sha": "new-tree-sha"})
+        if method == "POST" and path == "/repos/acme/panasa-agent-iac/git/commits":
+            return httpx.Response(201, json={"sha": "new-commit-sha"})
+        if method == "PATCH" and path == "/repos/acme/panasa-agent-iac/git/refs/heads/main":
+            return httpx.Response(200, json={})
+
+        raise AssertionError(f"Unexpected request: {method} {path}")
+
+    provider = GitHubProvider(token="fake-token", transport=httpx.MockTransport(handler))
+
+    commit_sha = await provider.commit_files(
+        REPO, "main", {"a.tf": "content-a"}, message="generated IaC"
+    )
+
+    assert commit_sha == "new-commit-sha"
+    assert tree_attempts == 3
+
+
+async def _immediate() -> None:
+    return None
 
 
 async def test_create_branch_fetches_base_sha_and_creates_ref(

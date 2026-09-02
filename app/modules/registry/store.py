@@ -221,6 +221,42 @@ class AgentRegistryStore:
         await self._versioner.write(version_record)
         return record, version_record
 
+    async def clone_agent(
+        self,
+        tenant_id: str,
+        source_agent_id: str,
+        new_name: str,
+        created_by: str,
+    ) -> tuple[AgentRecord, AgentVersionRecord]:
+        """Clone / Fork Agent. Copies the source's CURRENT version
+        configuration (system prompt, tools, KB, model, HITL, memory,
+        guardrail — everything create_agent() itself accepts) into a brand
+        new agent_id, owned by the caller's own tenant, starting fresh at
+        DRAFT v1. Deliberately reuses create_agent() rather than duplicating
+        its logic, so a clone gets the exact same circular-dependency
+        validation and DynamoDB item shape as any other new agent.
+
+        Never copies deployment history, run history, or version history —
+        those all live under the SOURCE agent_id; a clone gets a fresh
+        agent_id with none of those records, nothing to explicitly exclude.
+        The source agent is only ever read here, never modified."""
+        source = await self._require_agent(tenant_id, source_agent_id)
+        source_version = await self._versioner.get(source_agent_id, source.current_version)
+        if source_version is None:
+            raise AgentNotFoundError(source_agent_id)
+
+        return await self.create_agent(
+            tenant_id=tenant_id,
+            name=new_name,
+            description=source.description,
+            business_purpose=source.business_purpose,
+            agent_type=source.agent_type,
+            configuration=source_version.configuration,
+            created_by=created_by,
+            tags=dict(source.tags),
+            changelog=f"Cloned from {source_agent_id!r} (v{source.current_version})",
+        )
+
     async def _allocate_agent_id(self, name: str, attempts: int = 5) -> str:
         for _ in range(attempts):
             candidate = _new_agent_id(name)
@@ -436,13 +472,37 @@ class AgentRegistryStore:
         configuration: AgentConfiguration,
         changed_by: str,
         change_description: str,
+        name: str | None = None,
+        description: str | None = None,
+        business_purpose: str | None = None,
+        tags: dict[str, str] | None = None,
     ) -> tuple[AgentRecord, AgentVersionRecord]:
+        """TS01-U-06: name/description/business_purpose/tags are optional —
+        None leaves the existing value untouched, so callers that only
+        change configuration (e.g. a resource-picker-only PUT) behave
+        exactly as before. Editing any field (the Agent Wizard's Edit
+        flow) always creates a new version — R08/R23, never overwrites the
+        previous one — and resets status to DRAFT: the new version hasn't
+        been through the deploy pipeline yet, so it shouldn't read as
+        ACTIVE. live_version (R22 — "previous version stays LIVE") is
+        untouched, so the prior deploy keeps serving until this one does."""
         return await self._create_new_version(
             tenant_id=tenant_id,
             agent_id=agent_id,
             configuration=configuration,
             changed_by=changed_by,
             change_description=change_description,
+            identity_updates={
+                k: v
+                for k, v in {
+                    "name": name,
+                    "description": description,
+                    "business_purpose": business_purpose,
+                    "tags": tags,
+                }.items()
+                if v is not None
+            },
+            status="DRAFT",
         )
 
     async def rollback_agent(
@@ -482,7 +542,12 @@ class AgentRegistryStore:
         change_description: str,
         rolled_back_from_version: int | None = None,
         existing_record: AgentRecord | None = None,
+        identity_updates: dict[str, Any] | None = None,
+        status: AgentStatus | None = None,
     ) -> tuple[AgentRecord, AgentVersionRecord]:
+        """identity_updates/status default to None (untouched) so
+        rollback_agent's call site — which doesn't pass either — keeps its
+        exact prior behaviour; only update_agent opts into them."""
         record = existing_record or await self._require_agent(tenant_id, agent_id)
 
         await self._validate_no_circular_dependency(
@@ -490,9 +555,10 @@ class AgentRegistryStore:
         )
 
         next_version = record.current_version + 1
+        new_name = (identity_updates or {}).get("name", record.name)
         version_record = self._versioner.build_version(
             agent_id=agent_id,
-            agent_name=record.name,
+            agent_name=new_name,
             agent_type=record.agent_type,
             version=next_version,
             configuration=configuration,
@@ -502,9 +568,11 @@ class AgentRegistryStore:
         )
         updated_record = record.model_copy(
             update={
+                **(identity_updates or {}),
                 "current_version": next_version,
                 "updated_by": changed_by,
                 "updated_at": _now(),
+                **({"status": status} if status is not None else {}),
             }
         )
 

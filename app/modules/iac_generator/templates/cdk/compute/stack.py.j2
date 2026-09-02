@@ -1,16 +1,16 @@
-"""Orchestrator compute — ECS Fargate task + service."""
+"""Agent compute — ECS Fargate task + service."""
 
 from aws_cdk import aws_ecs as ecs
 
 
-def add_orchestrator_resources(stack, agent_id: str) -> None:
+def add_compute_resources(stack, agent_id: str) -> None:
     runtime_image = stack.node.try_get_context("runtime_image")
     cluster_arn = stack.node.try_get_context("ecs_cluster_arn")
     cluster = ecs.Cluster.from_cluster_arn(stack, "AgentEcsCluster", cluster_arn=cluster_arn)
 
     task_definition = ecs.FargateTaskDefinition(
         stack,
-        "OrchestratorTaskDef",
+        "ComputeTaskDef",
         family=f"panasa-agent-{agent_id}",
         cpu=512,
         memory_limit_mib=1024,
@@ -31,7 +31,7 @@ def add_orchestrator_resources(stack, agent_id: str) -> None:
 
     ecs.FargateService(
         stack,
-        "OrchestratorService",
+        "ComputeService",
         service_name=f"panasa-agent-{agent_id}",
         cluster=cluster,
         task_definition=task_definition,

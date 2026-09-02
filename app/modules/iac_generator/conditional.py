@@ -10,7 +10,15 @@ from __future__ import annotations
 
 from app.modules.registry.models import AgentConfiguration
 
-_ALWAYS_ON_MODULES = ["base", "api_gateway", "authentication", "orchestrator", "observability"]
+_ALWAYS_ON_MODULES = ["base", "api_gateway", "authentication", "compute", "observability"]
+"""TS01-A-01: "compute" (ECS Fargate task + service that runs every agent's
+own container, terraform/compute/compute.tf.j2) was originally named
+"orchestrator" here, matching CLAUDE.md Section 8's original pseudocode —
+but that collided with the *unrelated* agent_type="orchestrator" role
+(Section 18/39.1's A2A manager agent) added later, making every agent look
+like it had A2A-manager infrastructure in its module list. Every agent,
+standard or orchestrator-role, needs this compute module; it has nothing
+to do with A2A and must stay in _ALWAYS_ON_MODULES for both."""
 
 
 def resolve_required_modules(config: AgentConfiguration) -> list[str]:

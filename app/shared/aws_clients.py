@@ -10,7 +10,10 @@ from app.config import Settings
 
 
 def create_eventbridge_client(settings: Settings) -> Any:
-    return boto3.client("events", region_name=settings.aws_region)
+    kwargs: dict[str, Any] = {"region_name": settings.aws_region}
+    if settings.eventbridge_endpoint:
+        kwargs["endpoint_url"] = settings.eventbridge_endpoint
+    return boto3.client("events", **kwargs)
 
 
 def create_codecommit_client(settings: Settings) -> Any:

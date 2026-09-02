@@ -74,5 +74,22 @@ class PlatformSettingsRecord(BaseModel):
     # changing this later never rewrites an existing repo's workflow file.
     cicd_provider: CICDProvider = "github_actions"
 
+    # Section 47 (R59, corrected 2026-09-01) — "Settings → Deployment →
+    # Customer S3 Bucket" / "S3 Folder Prefix". A KB's data source lives in
+    # THIS bucket, owned entirely by the customer — never a Panasa-owned
+    # bucket, never anything agent-deploy-gated. None means "not configured
+    # yet"; KB upload/sync endpoints surface a clear message rather than a
+    # generic failure until the tenant sets one. kb_s3_prefix is the ONLY
+    # thing that appears ahead of {kb_id}/raw/ inside that bucket — no
+    # vendor name is ever written into a customer's own S3 bucket.
+    kb_s3_bucket: str | None = None
+    kb_s3_prefix: str = "agent-factory"
+
+    # "Settings -> Deployment -> Git Organisation / AWS Region" — per-tenant
+    # overrides of the GIT_ORG/AWS_REGION env vars (still the fallback when
+    # a tenant hasn't set its own, same convention as kb_s3_bucket above).
+    git_organisation: str | None = None
+    aws_region: str | None = None
+
     updated_by: str
     updated_at: str

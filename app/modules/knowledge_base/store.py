@@ -40,6 +40,12 @@ class KnowledgeBaseNotFoundError(Exception):
         super().__init__(f"Knowledge base {kb_id!r} not found")
 
 
+class InvalidSourceConfigError(Exception):
+    """source_config is missing a field required by source_type — mapped to
+    a 422 by the API layer. Currently only source_type="s3" ("Sync from
+    existing S3 path", Section 47) requires anything: source_config.bucket."""
+
+
 class KnowledgeBaseStore:
     def __init__(self, dynamodb_resource: Any, settings: Settings) -> None:
         self._dynamodb = dynamodb_resource
@@ -81,6 +87,7 @@ class KnowledgeBaseStore:
         chunk_overlap_pct: int = 10,
         chunk_strategy: str = "semantic",
         kb_documents_bucket: str | None = None,
+        kb_s3_prefix: str = "agent-factory",
         provisioner: BedrockKnowledgeBaseProvisioner | None = None,
     ) -> KnowledgeBaseRecord:
         """When `provisioner` is given (instructions_kb_api.md /
@@ -88,10 +95,39 @@ class KnowledgeBaseStore:
         Base + S3 data source and stores the resulting bedrock_kb_id/
         bedrock_ds_id/s3_bucket/s3_prefix. A provisioning failure
         (KnowledgeBaseProvisioningError) propagates to the caller before
-        anything is written to DynamoDB — never a half-created record."""
+        anything is written to DynamoDB — never a half-created record.
+
+        kb_documents_bucket is the CUSTOMER'S OWN bucket (Section 47, R59
+        corrected 2026-09-01 — "Settings -> Deployment -> Customer S3
+        Bucket"), never a Panasa-owned one. kb_s3_prefix is the only thing
+        that appears ahead of {kb_id}/raw/ inside it — no tenant_id, no
+        vendor name; the customer's own bucket already scopes this to them.
+
+        source_type == "s3" is the "Sync from existing S3 path" alternative
+        (Section 47): the customer already owns and manages this exact
+        path, so source_config["bucket"] (required — InvalidSourceConfigError
+        if missing) and source_config.get("prefix") (optional, used
+        verbatim) are stored as-is — no {kb_id}/raw/ suffix imposed on a
+        location the customer already structures themselves. This
+        overrides kb_documents_bucket/kb_s3_prefix entirely for this KB.
+        """
         now = _now()
         kb_id = f"{_slugify(name)}-{uuid.uuid4().hex[:6]}"
-        s3_prefix = f"{tenant_id}/{kb_id}/raw/" if kb_documents_bucket else None
+
+        if source_type == "s3":
+            s3_bucket = (source_config or {}).get("bucket")
+            if not s3_bucket:
+                raise InvalidSourceConfigError(
+                    'source_config.bucket is required when source_type is "s3"'
+                )
+            raw_prefix = str((source_config or {}).get("prefix") or "").strip("/")
+            s3_prefix = f"{raw_prefix}/" if raw_prefix else ""
+        elif kb_documents_bucket:
+            s3_bucket = kb_documents_bucket
+            s3_prefix = f"{kb_s3_prefix}/{kb_id}/raw/"
+        else:
+            s3_bucket = None
+            s3_prefix = None
 
         record = KnowledgeBaseRecord(
             kb_id=kb_id,
@@ -106,7 +142,7 @@ class KnowledgeBaseStore:
             chunk_strategy=chunk_strategy,
             status="CREATING" if provisioner is not None else "INDEXING",
             document_count=0,
-            s3_bucket=kb_documents_bucket,
+            s3_bucket=s3_bucket,
             s3_prefix=s3_prefix,
             created_by=created_by,
             created_at=now,

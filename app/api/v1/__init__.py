@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from app.api.v1 import (
     admin_settings,
     agents,
+    audit_log,
     auth,
     bedrock_credentials,
     build_with_ai,
@@ -15,6 +16,7 @@ from app.api.v1 import (
     playground,
     projects,
     prompt_generation,
+    prompts,
     runs,
     skills,
     task_planner,
@@ -35,6 +37,8 @@ router.include_router(playground.router)
 router.include_router(runs.router)
 router.include_router(projects.router)
 router.include_router(skills.router)
+router.include_router(prompts.router)
 router.include_router(hitl.router)
 router.include_router(task_planner.router)
 router.include_router(admin_settings.router)
+router.include_router(audit_log.router)

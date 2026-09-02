@@ -236,6 +236,110 @@ async def test_agent_not_found_returns_404(make_user_and_token) -> None:
     assert response.status_code == 404
 
 
+# ── Clone / Fork ─────────────────────────────────────────────────────────
+
+
+async def test_clone_agent_copies_config_as_new_draft_v1(make_user_and_token) -> None:
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        payload = _minimal_agent_payload()
+        payload["tags"] = {"team": "kyc"}
+        source = client.post("/api/v1/agents", json=payload, headers=_bearer(token)).json()
+        source_id = source["agent_id"]
+
+        response = client.post(
+            f"/api/v1/agents/{source_id}/clone",
+            json={"name": "Copy of KYC Agent"},
+            headers=_bearer(token),
+        )
+        assert response.status_code == 201
+        body = response.json()
+        clone_id = body["agent"]["agent_id"]
+
+        # Editing the source AFTER cloning must never affect the already-
+        # created clone — it's an independent agent, not a live reference.
+        updated = client.put(
+            f"/api/v1/agents/{source_id}",
+            json={
+                "change_description": "post-clone edit",
+                "configuration": {
+                    "model_id": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+                    "model_provider": "bedrock",
+                    "system_prompt": "Edited after cloning — should NOT appear in the clone.",
+                },
+            },
+            headers=_bearer(token),
+        )
+        assert updated.status_code == 200
+
+        clone_after = client.get(f"/api/v1/agents/{clone_id}", headers=_bearer(token)).json()
+
+    assert body["agent"]["name"] == "Copy of KYC Agent"
+    assert clone_id != source_id
+    assert body["agent"]["current_version"] == 1
+    assert body["agent"]["live_version"] is None
+    assert body["agent"]["status"] == "DRAFT"
+    assert body["configuration"]["system_prompt"] == payload["configuration"]["system_prompt"]
+    assert body["agent"]["description"] == payload["description"]
+    assert body["agent"]["business_purpose"] == payload["business_purpose"]
+    assert body["agent"]["tags"] == {"team": "kyc"}
+    # Independence check: the clone's config is untouched by the source's
+    # later edit.
+    assert clone_after["configuration"]["system_prompt"] == payload["configuration"]["system_prompt"]
+
+
+async def test_clone_agent_not_found_returns_404(make_user_and_token) -> None:
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/agents/does-not-exist/clone",
+            json={"name": "Copy"},
+            headers=_bearer(token),
+        )
+
+    assert response.status_code == 404
+
+
+async def test_clone_agent_across_tenants_is_not_found(make_user_and_token) -> None:
+    """R01 tenant isolation — cloning is scoped exactly like every other
+    read: you can't clone an agent belonging to a different tenant."""
+    _, token_a = await make_user_and_token(TENANT_A, role="developer")
+    _, token_b = await make_user_and_token(TENANT_B, role="developer")
+
+    with TestClient(app) as client:
+        source = client.post(
+            "/api/v1/agents", json=_minimal_agent_payload(), headers=_bearer(token_a)
+        ).json()
+
+        response = client.post(
+            f"/api/v1/agents/{source['agent_id']}/clone",
+            json={"name": "Copy"},
+            headers=_bearer(token_b),
+        )
+
+    assert response.status_code == 404
+
+
+async def test_auditor_cannot_clone_agent(make_user_and_token) -> None:
+    _, dev_token = await make_user_and_token(TENANT_A, role="developer")
+    _, auditor_token = await make_user_and_token(TENANT_A, role="auditor")
+
+    with TestClient(app) as client:
+        source = client.post(
+            "/api/v1/agents", json=_minimal_agent_payload(), headers=_bearer(dev_token)
+        ).json()
+
+        response = client.post(
+            f"/api/v1/agents/{source['agent_id']}/clone",
+            json={"name": "Copy"},
+            headers=_bearer(auditor_token),
+        )
+
+    assert response.status_code == 403
+
+
 # ── RBAC ─────────────────────────────────────────────────────────────────
 
 

@@ -83,6 +83,143 @@ async def test_get_connector_404_for_unknown_id(make_user_and_token) -> None:
     assert response.status_code == 404
 
 
+async def test_update_connector_changes_fields(make_user_and_token) -> None:
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/connectors",
+            json={"name": "Doc Verify", "executor_type": "http", "description": "v1"},
+            headers=_bearer(token),
+        )
+        connector_id = created.json()["connector_id"]
+
+        updated = client.put(
+            f"/api/v1/connectors/{connector_id}",
+            json={
+                "name": "Document Verification API",
+                "executor_type": "http",
+                "description": "v2 — verifies identity documents",
+                "endpoint_template": "https://api.docverify.example.com/check",
+                "credentials_required": ["api_key"],
+            },
+            headers=_bearer(token),
+        )
+
+    assert updated.status_code == 200
+    body = updated.json()
+    assert body["connector_id"] == connector_id  # id never changes on update
+    assert body["name"] == "Document Verification API"
+    assert body["description"] == "v2 — verifies identity documents"
+    assert body["endpoint_template"] == "https://api.docverify.example.com/check"
+    assert body["credentials_required"] == ["api_key"]
+
+
+async def test_update_connector_404_for_other_tenant(make_user_and_token) -> None:
+    _, token_a = await make_user_and_token(TENANT_A, role="developer")
+    _, token_b = await make_user_and_token(TENANT_B, role="developer")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/connectors",
+            json={"name": "X", "executor_type": "http", "description": "d"},
+            headers=_bearer(token_a),
+        )
+        connector_id = created.json()["connector_id"]
+
+        response = client.put(
+            f"/api/v1/connectors/{connector_id}",
+            json={"name": "Hijacked", "executor_type": "http", "description": "d"},
+            headers=_bearer(token_b),
+        )
+
+    assert response.status_code == 404
+
+
+async def test_update_connector_404_for_global_connector(make_user_and_token) -> None:
+    """R01/is_global — a tenant must never be able to edit a Panasa-curated
+    global connector (seed_global_connectors reapplies these at every
+    startup; per-tenant edits would just be silently overwritten anyway,
+    but the real point is a tenant has no business editing shared,
+    Panasa-owned catalog entries at all)."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/api/v1/connectors/jira",
+            json={"name": "Hijacked Jira", "executor_type": "http", "description": "d"},
+            headers=_bearer(token),
+        )
+
+    assert response.status_code == 404
+
+
+async def test_update_connector_forbidden_for_auditor(make_user_and_token) -> None:
+    _, token_dev = await make_user_and_token(TENANT_A, role="developer")
+    _, token_auditor = await make_user_and_token(TENANT_A, role="auditor")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/connectors",
+            json={"name": "X", "executor_type": "http", "description": "d"},
+            headers=_bearer(token_dev),
+        )
+        connector_id = created.json()["connector_id"]
+
+        response = client.put(
+            f"/api/v1/connectors/{connector_id}",
+            json={"name": "Y", "executor_type": "http", "description": "d"},
+            headers=_bearer(token_auditor),
+        )
+
+    assert response.status_code == 403
+
+
+async def test_delete_connector_removes_it(make_user_and_token) -> None:
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/connectors",
+            json={"name": "Throwaway", "executor_type": "http", "description": "d"},
+            headers=_bearer(token),
+        )
+        connector_id = created.json()["connector_id"]
+
+        deleted = client.delete(f"/api/v1/connectors/{connector_id}", headers=_bearer(token))
+        assert deleted.status_code == 204
+
+        gone = client.get(f"/api/v1/connectors/{connector_id}", headers=_bearer(token))
+
+    assert gone.status_code == 404
+
+
+async def test_delete_connector_404_for_other_tenant(make_user_and_token) -> None:
+    _, token_a = await make_user_and_token(TENANT_A, role="developer")
+    _, token_b = await make_user_and_token(TENANT_B, role="developer")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/connectors",
+            json={"name": "X", "executor_type": "http", "description": "d"},
+            headers=_bearer(token_a),
+        )
+        connector_id = created.json()["connector_id"]
+
+        response = client.delete(f"/api/v1/connectors/{connector_id}", headers=_bearer(token_b))
+
+    assert response.status_code == 404
+
+
+async def test_delete_connector_404_for_global_connector(make_user_and_token) -> None:
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        response = client.delete("/api/v1/connectors/companies-house", headers=_bearer(token))
+
+    assert response.status_code == 404
+
+
 @pytest.fixture
 def mock_connector_tester() -> Iterator[None]:
     def _handler(request: httpx.Request) -> httpx.Response:

@@ -40,6 +40,7 @@ _BUCKETS = [
     _ENV.get("IAC_OUTPUT_BUCKET", "panasa-iac-artifacts-local"),
     _ENV.get("AUDIT_S3_BUCKET", "panasa-audit-local"),
 ]
+_EVENT_BUS = _ENV.get("EVENTBRIDGE_BUS_NAME", "panasa-agent-builder")
 
 
 def _client(service: str) -> object:
@@ -75,11 +76,25 @@ def _seed_buckets() -> None:
             print(f"  bucket {bucket!r} already exists")
 
 
+def _seed_event_bus() -> None:
+    # app.shared.aws_clients.create_eventbridge_client points at this same
+    # LocalStack endpoint (EVENTBRIDGE_ENDPOINT) once configured — PutEvents
+    # against a custom bus that was never created fails, so it needs the
+    # same "ensure it exists" seeding the buckets/secrets above get.
+    client = _client("events")
+    try:
+        client.create_event_bus(Name=_EVENT_BUS)
+        print(f"  created event bus {_EVENT_BUS!r}")
+    except client.exceptions.ResourceAlreadyExistsException:
+        print(f"  event bus {_EVENT_BUS!r} already exists")
+
+
 def main() -> None:
     print(f"Seeding LocalStack at {_ENDPOINT} ...")
     try:
         _seed_secrets()
         _seed_buckets()
+        _seed_event_bus()
     except Exception as exc:  # noqa: BLE001 — surfaced to the caller, not swallowed
         print(f"LocalStack seeding failed: {exc}", file=sys.stderr)
         sys.exit(1)

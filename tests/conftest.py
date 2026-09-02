@@ -55,6 +55,17 @@ os.environ["DEV_VALIDATION_EXTENDED_MODES_ENABLED"] = "false"
 # Reproduced: test_seed_demo_forbidden_by_default failed against a real
 # .env with SEED_RUNS_ENABLED=true left on from manual testing.
 os.environ["SEED_RUNS_ENABLED"] = "false"
+# Same reasoning again: a developer's real .env may set this true (plus real
+# absolute terraform/tfsec/checkov paths) for their own manual deployment-
+# pipeline testing. Left alone, every test that triggers a deploy without
+# swapping app.state.deployment_pipeline_simulator (most of them — only
+# test_deployment_pipeline_simulator.py does) picks up the real,
+# app-startup-constructed simulator and kicks off a genuine, slow,
+# network-dependent terraform/tfsec/checkov run per deploy — reproduced:
+# the full suite hung for minutes on a real `terraform init` spawned from a
+# background pytest run. Tests that want it enabled do so explicitly via
+# monkeypatch, same pattern as DEV_VALIDATION_EXTENDED_MODES_ENABLED above.
+os.environ["SIMULATE_DEPLOYMENT_PIPELINE"] = "false"
 os.environ.setdefault("JWT_SECRET_ARN", "jwt-secret")
 os.environ.setdefault("IAC_OUTPUT_BUCKET", "panasa-iac-artifacts-test")
 os.environ.setdefault("AUDIT_S3_BUCKET", "panasa-audit-test")

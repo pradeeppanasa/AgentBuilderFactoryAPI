@@ -50,7 +50,13 @@ class BedrockKnowledgeBaseProvisioner:
         place — chunk_strategy/embedding_model changes are Bedrock-side
         immutable-after-create properties for a data source, so a change
         there means deleting and recreating, not a PATCH; that policy
-        decision belongs to the API layer, not this provisioner."""
+        decision belongs to the API layer, not this provisioner.
+
+        The data source's S3 bucket is always `kb.s3_bucket` — the tenant's
+        own configured bucket (Section 47, R59 corrected 2026-09-01),
+        resolved per-request by the API layer before store.create() built
+        this record. `self._kb_documents_bucket` is only a startup-time
+        fallback default for local dev, never used here directly."""
         if self._mock_enabled:
             return f"mock-bedrock-kb-{kb.kb_id}", f"mock-bedrock-ds-{kb.kb_id}"
 
@@ -91,7 +97,7 @@ class BedrockKnowledgeBaseProvisioner:
                 dataSourceConfiguration={
                     "type": "S3",
                     "s3Configuration": {
-                        "bucketArn": f"arn:aws:s3:::{self._kb_documents_bucket}",
+                        "bucketArn": f"arn:aws:s3:::{kb.s3_bucket}",
                         "inclusionPrefixes": [kb.s3_prefix],
                     },
                 },

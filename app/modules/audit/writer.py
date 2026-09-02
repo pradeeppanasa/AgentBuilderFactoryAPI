@@ -80,3 +80,78 @@ class AuditWriter:
 
         log.info("audit.write.succeeded", event_type=event.event_type, s3_key=key)
         return key
+
+    async def list_events(
+        self,
+        tenant_id: str,
+        date_from: str,
+        date_to: str,
+        event_type: AuditEventType | None = None,
+        actor: str | None = None,
+        agent_id: str | None = None,
+        limit: int = 100,
+    ) -> list[AuditEvent]:
+        """Audit Log page (Priority 2 nav addition) — S3 has no query
+        engine, so this lists every object key under
+        audit/{tenant_id}/[{event_type}/] (paginated via
+        list_objects_v2's own continuation token, capped at 500 keys
+        scanned per call so a huge date range can't run away), keeps only
+        the ones whose {date} key segment falls in [date_from, date_to],
+        fetches THOSE bodies, and filters by actor/agent_id after
+        parsing. Bounded, not indexed — fine for this stage's audit
+        volume (same "not built for scale yet" caveat every other
+        S3-backed list in this Runtime carries), never a reason to skip
+        audit logging itself (R15/Section 14)."""
+        if not self._settings.audit_s3_bucket:
+            return []
+
+        prefix = f"audit/{tenant_id}/{event_type}/" if event_type else f"audit/{tenant_id}/"
+        matching_keys: list[str] = []
+        continuation_token: str | None = None
+        scanned = 0
+        while scanned < 500:
+            kwargs: dict[str, Any] = {"Bucket": self._settings.audit_s3_bucket, "Prefix": prefix}
+            if continuation_token:
+                kwargs["ContinuationToken"] = continuation_token
+            try:
+                response = await asyncio.to_thread(self._s3.list_objects_v2, **kwargs)
+            except Exception:
+                log.warning("audit.list.failed", exc_info=True)
+                return []
+
+            for obj in response.get("Contents", []):
+                key = obj["Key"]
+                # Key shape: audit/{tenant_id}/{event_type}/{date}/{uuid}.json
+                parts = key.split("/")
+                if len(parts) < 4:
+                    continue
+                key_date = parts[3]
+                if date_from <= key_date <= date_to:
+                    matching_keys.append(key)
+            scanned += len(response.get("Contents", []))
+
+            if not response.get("IsTruncated"):
+                break
+            continuation_token = response.get("NextContinuationToken")
+
+        events: list[AuditEvent] = []
+        for key in matching_keys:
+            if len(events) >= limit:
+                break
+            try:
+                obj = await asyncio.to_thread(
+                    self._s3.get_object, Bucket=self._settings.audit_s3_bucket, Key=key
+                )
+                body = await asyncio.to_thread(obj["Body"].read)
+                event = AuditEvent.model_validate_json(body)
+            except Exception:
+                log.warning("audit.list.read_failed", s3_key=key, exc_info=True)
+                continue
+            if actor is not None and event.actor != actor:
+                continue
+            if agent_id is not None and event.agent_id != agent_id:
+                continue
+            events.append(event)
+
+        events.sort(key=lambda e: e.occurred_at, reverse=True)
+        return events

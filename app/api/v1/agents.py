@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Literal
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from app.config import settings
@@ -24,6 +24,7 @@ from app.dependencies import (
     get_iac_generator,
     get_iac_validator,
     get_metrics_emitter,
+    get_pipeline_simulator,
     get_platform_settings_store,
     get_registry_store,
     get_tenant_id,
@@ -34,6 +35,7 @@ from app.modules.auth.schemas import CurrentUser
 from app.modules.change_impact.analyzer import ChangeImpactAnalyzer, ImpactAnalysis
 from app.modules.deployment.models import ApprovalMode, DeploymentRecord, initial_stages
 from app.modules.deployment.orchestrator import DeploymentOrchestrator
+from app.modules.deployment.pipeline_simulator import DeploymentPipelineSimulator
 from app.modules.deployment.status_store import DeploymentStatusStore
 from app.modules.git_provider._util import agent_repo_identifier
 from app.modules.git_provider.base import GitProvider
@@ -137,6 +139,15 @@ class AgentListResponse(BaseModel):
 class UpdateAgentRequest(BaseModel):
     configuration: AgentConfiguration
     change_description: str
+    # TS01-U-06 — the Agent Wizard's Edit flow edits these top-level
+    # AgentRecord fields too (Step 2), which `configuration` doesn't
+    # carry. None leaves the existing value untouched, so a
+    # resource-picker-only PUT (e.g. EditAgent.tsx's KB/tool pickers)
+    # behaves exactly as before.
+    name: str | None = None
+    description: str | None = None
+    business_purpose: str | None = None
+    tags: dict[str, str] | None = None
 
 
 class UpdateAgentResponse(BaseModel):
@@ -236,6 +247,57 @@ class DeployResponse(BaseModel):
 
 class DeploymentListResponse(BaseModel):
     items: list[DeploymentRecord]
+
+
+class CloneAgentRequest(BaseModel):
+    name: str
+
+
+@router.post(
+    "/{agent_id}/clone", response_model=AgentDetailResponse, status_code=status.HTTP_201_CREATED
+)
+async def clone_agent(
+    agent_id: str,
+    payload: CloneAgentRequest,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    current_user: Annotated[CurrentUser, Depends(require_role(*_WRITE_ROLES))],
+    store: Annotated[AgentRegistryStore, Depends(get_registry_store)],
+    audit_writer: Annotated[AuditWriter, Depends(get_audit_writer)],
+    metrics_emitter: Annotated[MetricsEmitter, Depends(get_metrics_emitter)],
+) -> AgentDetailResponse:
+    """Clone / Fork Agent — copies the source's current configuration
+    (system prompt, tools, KB, model, HITL, memory, guardrail, everything)
+    into a brand new agent, owned by the caller's own tenant, at DRAFT v1.
+    Never copies deployment/run/version history — those stay under the
+    source agent_id. The source is only ever read here."""
+    try:
+        record, version = await store.clone_agent(
+            tenant_id=tenant_id,
+            source_agent_id=agent_id,
+            new_name=payload.name,
+            created_by=current_user.email,
+        )
+    except AgentNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except CircularDependencyError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    await _record_event(
+        audit_writer=audit_writer,
+        metrics_emitter=metrics_emitter,
+        event_type="config_change",
+        metric_name="AgentCloned",
+        tenant_id=tenant_id,
+        agent_id=record.agent_id,
+        actor=current_user.email,
+        summary=f"Agent {record.agent_id!r} cloned from {agent_id!r}",
+    )
+
+    return AgentDetailResponse(
+        agent=record,
+        configuration=version.configuration,
+        capability_contract=version.capability_contract,
+    )
 
 
 @router.post("", response_model=CreateAgentResponse, status_code=status.HTTP_201_CREATED)
@@ -340,6 +402,10 @@ async def update_agent(
             configuration=payload.configuration,
             changed_by=current_user.email,
             change_description=payload.change_description,
+            name=payload.name,
+            description=payload.description,
+            business_purpose=payload.business_purpose,
+            tags=payload.tags,
         )
     except AgentNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -522,6 +588,8 @@ async def _trigger_deployment(
     deployment_orchestrator: DeploymentOrchestrator,
     deployment_status_store: DeploymentStatusStore,
     platform_settings_store: PlatformSettingsStore,
+    background_tasks: BackgroundTasks,
+    pipeline_simulator: DeploymentPipelineSimulator,
 ) -> _TriggeredDeployment:
     """Shared by deploy_agent and rollback_agent (Phase 13: "Rollback
     endpoint creates new version from old config, triggers deployment") —
@@ -721,6 +789,16 @@ async def _trigger_deployment(
         updated_by=triggered_by,
     )
 
+    if settings.simulate_deployment_pipeline:
+        background_tasks.add_task(
+            pipeline_simulator.run,
+            tenant_id,
+            agent_id,
+            deployment_id,
+            config=configuration,
+            iac_files=iac_result.files,
+        )
+
     return _TriggeredDeployment(
         deployment_id=deployment_id,
         branch=branch,
@@ -745,6 +823,8 @@ async def rollback_agent(
     platform_settings_store: Annotated[PlatformSettingsStore, Depends(get_platform_settings_store)],
     audit_writer: Annotated[AuditWriter, Depends(get_audit_writer)],
     metrics_emitter: Annotated[MetricsEmitter, Depends(get_metrics_emitter)],
+    pipeline_simulator: Annotated[DeploymentPipelineSimulator, Depends(get_pipeline_simulator)],
+    background_tasks: BackgroundTasks,
 ) -> RollbackResponse:
     try:
         record, new_version = await store.rollback_agent(
@@ -778,6 +858,8 @@ async def rollback_agent(
         deployment_orchestrator=deployment_orchestrator,
         deployment_status_store=deployment_status_store,
         platform_settings_store=platform_settings_store,
+        background_tasks=background_tasks,
+        pipeline_simulator=pipeline_simulator,
     )
 
     await _record_event(
@@ -968,6 +1050,8 @@ async def deploy_agent(
     platform_settings_store: Annotated[PlatformSettingsStore, Depends(get_platform_settings_store)],
     audit_writer: Annotated[AuditWriter, Depends(get_audit_writer)],
     metrics_emitter: Annotated[MetricsEmitter, Depends(get_metrics_emitter)],
+    pipeline_simulator: Annotated[DeploymentPipelineSimulator, Depends(get_pipeline_simulator)],
+    background_tasks: BackgroundTasks,
 ) -> DeployResponse:
     record = await store.get_agent(tenant_id, agent_id)
     if record is None:
@@ -994,6 +1078,8 @@ async def deploy_agent(
         deployment_orchestrator=deployment_orchestrator,
         deployment_status_store=deployment_status_store,
         platform_settings_store=platform_settings_store,
+        background_tasks=background_tasks,
+        pipeline_simulator=pipeline_simulator,
     )
 
     await _record_event(
@@ -1048,6 +1134,8 @@ async def approve_deployment(
     deployment_orchestrator: Annotated[
         DeploymentOrchestrator, Depends(get_deployment_orchestrator)
     ],
+    pipeline_simulator: Annotated[DeploymentPipelineSimulator, Depends(get_pipeline_simulator)],
+    background_tasks: BackgroundTasks,
 ) -> DeploymentRecord:
     """Section 45.4/R50 (resolved as configurable — see
     deployment/models.py's module docstring): approve a "manual"-mode
@@ -1115,4 +1203,8 @@ async def approve_deployment(
     await deployment_orchestrator.notify_deployment_approved(
         agent_id, deployment_id, tenant_id, approved_by=current_user.email
     )
+    if settings.simulate_deployment_pipeline:
+        background_tasks.add_task(
+            pipeline_simulator.resume_after_approval, tenant_id, agent_id, deployment_id
+        )
     return updated_record

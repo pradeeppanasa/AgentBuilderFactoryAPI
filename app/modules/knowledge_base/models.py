@@ -62,7 +62,10 @@ class KnowledgeBaseRecord(BaseModel):
     # 2026-08-19) — additive. None for any KB created before this existed,
     # or one whose source_type isn't backed by a real Bedrock KB yet.
     s3_bucket: str | None = None
-    s3_prefix: str | None = None  # "{tenant_id}/{kb_id}/raw/"
+    s3_prefix: str | None = None
+    """"{s3_folder_prefix}/{kb_id}/raw/" for Panasa-managed storage, or the
+    customer's own path verbatim for source_type="s3" (CLAUDE.md Section 47,
+    R59 corrected 2026-09-01) — never "panasa", never the tenant_id."""
     bedrock_kb_id: str | None = None
     bedrock_ds_id: str | None = None
     last_synced_at: str | None = None

@@ -8,7 +8,7 @@ from typing import Any
 from app.modules.iac_generator.conditional import resolve_required_modules
 from app.modules.registry.models import AgentConfiguration
 
-_ALWAYS_ON = {"base", "api_gateway", "authentication", "orchestrator", "observability"}
+_ALWAYS_ON = {"base", "api_gateway", "authentication", "compute", "observability"}
 
 
 def _config(**overrides: Any) -> AgentConfiguration:
@@ -78,6 +78,38 @@ def test_tools_configured_adds_tools_module() -> None:
         )
     )
     assert "tools" in modules
+
+
+def test_ts01_a01_simple_agent_with_one_tool_gets_seven_modules_not_orchestrator() -> None:
+    """TS01-A-01 regression. The bug report's literal expectation was 6
+    modules (no compute/ECS module at all) — that would leave the agent
+    with nowhere to actually run; the real fix (confirmed with the user)
+    is renaming the always-on "orchestrator" module to "compute", not
+    removing it. A standard agent with one tool and guardrails off — the
+    exact KYC Document Verification Agent repro from the bug report — gets
+    7 modules including "compute"; "orchestrator" must never appear as a
+    module name again, for any agent_type."""
+    modules = resolve_required_modules(
+        _config(
+            guardrails={
+                "prompt_injection": False,
+                "pii_detection": False,
+                "toxicity_filter": False,
+            },
+            tools=[
+                {
+                    "tool_id": "companies-house",
+                    "tool_name": "Companies House Lookup",
+                    "executor_type": "http",
+                    "input_schema": {},
+                }
+            ],
+        )
+    )
+    assert set(modules) == _ALWAYS_ON | {"tools", "audit"}
+    assert len(modules) == 7
+    assert "compute" in modules
+    assert "orchestrator" not in modules
 
 
 def test_guardrails_all_disabled_means_no_guardrails_module() -> None:

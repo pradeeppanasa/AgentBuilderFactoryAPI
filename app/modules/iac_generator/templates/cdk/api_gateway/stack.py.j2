@@ -4,7 +4,7 @@ from aws_cdk import aws_apigatewayv2 as apigwv2
 
 
 def add_api_gateway_resources(stack, agent_id: str) -> None:
-    orchestrator_lambda_arn = stack.node.try_get_context("orchestrator_lambda_arn")
+    compute_lambda_arn = stack.node.try_get_context("compute_lambda_arn")
 
     api = apigwv2.CfnApi(
         stack,
@@ -15,10 +15,10 @@ def add_api_gateway_resources(stack, agent_id: str) -> None:
 
     integration = apigwv2.CfnIntegration(
         stack,
-        "AgentOrchestratorIntegration",
+        "AgentComputeIntegration",
         api_id=api.ref,
         integration_type="AWS_PROXY",
-        integration_uri=orchestrator_lambda_arn,
+        integration_uri=compute_lambda_arn,
         integration_method="POST",
         payload_format_version="2.0",
     )

@@ -518,10 +518,10 @@ def _flatten_for_terraform_cli(tf_files: dict[str, str]) -> dict[str, str]:
     return flattened
 
 
-def _run_terraform_fmt(tmpdir: Path) -> CheckResult:
+def _run_terraform_fmt(tmpdir: Path, terraform_binary: str = "terraform") -> CheckResult:
     try:
         result = subprocess.run(  # noqa: S603 — fixed argv, no shell, no user input
-            ["terraform", "fmt", "-check", "-diff"],
+            [terraform_binary, "fmt", "-check", "-diff"],
             cwd=str(tmpdir),
             capture_output=True,
             text=True,
@@ -543,10 +543,10 @@ def _run_terraform_fmt(tmpdir: Path) -> CheckResult:
     )
 
 
-def _run_terraform_validate(tmpdir: Path) -> CheckResult:
+def _run_terraform_validate(tmpdir: Path, terraform_binary: str = "terraform") -> CheckResult:
     try:
         init_result = subprocess.run(  # noqa: S603
-            ["terraform", "init", "-backend=false", "-input=false"],
+            [terraform_binary, "init", "-backend=false", "-input=false"],
             cwd=str(tmpdir),
             capture_output=True,
             text=True,
@@ -569,7 +569,7 @@ def _run_terraform_validate(tmpdir: Path) -> CheckResult:
         )
 
     validate_result = subprocess.run(  # noqa: S603
-        ["terraform", "validate", "-json"],
+        [terraform_binary, "validate", "-json"],
         cwd=str(tmpdir),
         capture_output=True,
         text=True,
@@ -624,6 +624,9 @@ def _parse_terraform_validate_diagnostics(stdout: str, stderr: str) -> str:
 
 
 class IaCValidator:
+    def __init__(self, terraform_binary: str = "terraform") -> None:
+        self._terraform_binary = terraform_binary
+
     async def validate(
         self,
         *,
@@ -679,8 +682,12 @@ class IaCValidator:
             flattened = _flatten_for_terraform_cli(tf_files)
             for name, content in flattened.items():
                 (tmpdir / name).write_text(content, encoding="utf-8")
-            checks.append(await asyncio.to_thread(_run_terraform_fmt, tmpdir))
-            checks.append(await asyncio.to_thread(_run_terraform_validate, tmpdir))
+            checks.append(
+                await asyncio.to_thread(_run_terraform_fmt, tmpdir, self._terraform_binary)
+            )
+            checks.append(
+                await asyncio.to_thread(_run_terraform_validate, tmpdir, self._terraform_binary)
+            )
 
         return IaCValidationReport(
             passed=all(c.passed for c in checks),

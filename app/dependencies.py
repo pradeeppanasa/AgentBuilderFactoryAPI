@@ -21,6 +21,7 @@ from app.modules.bedrock_credentials.store import BedrockCredentialStore
 from app.modules.connectors.catalog import ConnectorCatalogStore
 from app.modules.connectors.tester import ConnectorTester
 from app.modules.deployment.orchestrator import DeploymentOrchestrator
+from app.modules.deployment.pipeline_simulator import DeploymentPipelineSimulator
 from app.modules.deployment.status_store import DeploymentStatusStore
 from app.modules.git_provider.base import GitProvider
 from app.modules.guardrails.engine import GuardrailEngine
@@ -38,6 +39,7 @@ from app.modules.platform.version_service import PlatformVersionService
 from app.modules.platform_settings.store import PlatformSettingsStore
 from app.modules.playground.store import PlaygroundSessionStore
 from app.modules.projects.store import ProjectStore
+from app.modules.prompts.store import PromptStore
 from app.modules.registry.store import AgentRegistryStore
 from app.modules.runs.store import RunStore
 from app.modules.secrets.manager import SecretsManager
@@ -73,6 +75,11 @@ async def get_git_provider(request: Request) -> GitProvider:
 async def get_deployment_orchestrator(request: Request) -> DeploymentOrchestrator:
     orchestrator: DeploymentOrchestrator = request.app.state.deployment_orchestrator
     return orchestrator
+
+
+async def get_pipeline_simulator(request: Request) -> DeploymentPipelineSimulator:
+    simulator: DeploymentPipelineSimulator = request.app.state.deployment_pipeline_simulator
+    return simulator
 
 
 async def get_deployment_status_store(request: Request) -> DeploymentStatusStore:
@@ -195,6 +202,11 @@ async def get_project_store(request: Request) -> ProjectStore:
 
 async def get_skill_store(request: Request) -> SkillStore:
     store: SkillStore = request.app.state.skill_store
+    return store
+
+
+async def get_prompt_store(request: Request) -> PromptStore:
+    store: PromptStore = request.app.state.prompt_store
     return store
 
 

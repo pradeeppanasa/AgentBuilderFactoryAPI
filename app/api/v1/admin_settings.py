@@ -14,13 +14,21 @@ only the ARN is persisted in DynamoDB (R11).
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends
+from botocore.exceptions import ClientError
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from app.dependencies import get_platform_settings_store, get_secrets_manager, get_tenant_id
+from app.config import settings
+from app.dependencies import (
+    get_platform_settings_store,
+    get_s3_client,
+    get_secrets_manager,
+    get_tenant_id,
+)
 from app.modules.auth.dependencies import require_role
 from app.modules.auth.schemas import CurrentUser
 from app.modules.deployment.models import ApprovalMode, CICDProvider
@@ -122,10 +130,25 @@ class DeploymentSettingsConfig(BaseModel):
 
     cicd_provider (Section 45.6/R58) picks which workflow file gets
     committed to a newly-created agent repo (Section 45.2's v1 case) —
-    every agent for this tenant shares the same provider template."""
+    every agent for this tenant shares the same provider template.
+
+    kb_s3_bucket/kb_s3_prefix (Section 47, R59 corrected 2026-09-01) —
+    "Customer S3 Bucket" / "S3 Folder Prefix". The bucket a KB's data
+    source lives in is entirely customer-owned; kb_s3_bucket=None means
+    "not configured yet" (KB upload/sync surface a message pointing back
+    here rather than failing generically). kb_s3_prefix defaults to
+    "agent-factory" — the only thing ever written ahead of {kb_id}/raw/
+    inside that bucket; no vendor name belongs in a customer's own S3."""
 
     default_approval_mode: ApprovalMode
     cicd_provider: CICDProvider
+    kb_s3_bucket: str | None
+    kb_s3_prefix: str
+    # "Git Organisation" / "AWS Region" — resolved against the GIT_ORG/
+    # AWS_REGION env vars when the tenant hasn't set its own (never null on
+    # the response: aws_region always has a global default).
+    git_organisation: str | None
+    aws_region: str
 
 
 class SaveDeploymentSettingsRequest(BaseModel):
@@ -133,6 +156,32 @@ class SaveDeploymentSettingsRequest(BaseModel):
     cicd_provider: CICDProvider | None = None
     """None keeps the tenant's current cicd_provider — matches every other
     optional field in this file (e.g. SaveGrafanaRequest.endpoint)."""
+    kb_s3_bucket: str | None = None
+    """None (omitted or explicit null) keeps the tenant's current bucket —
+    same convention as cicd_provider above. An empty string is normalised
+    to None on save, so the UI can send "" from a cleared input to
+    explicitly unconfigure the bucket."""
+    kb_s3_prefix: str | None = None
+    """None keeps the tenant's current prefix. Unlike kb_s3_bucket, an
+    empty string is rejected (422) rather than accepted — an empty prefix
+    would upload straight to the bucket root, which requires deliberately
+    setting kb_s3_prefix to "" only via a future explicit "no prefix"
+    control, not an accidental blank field."""
+    git_organisation: str | None = None
+    """None keeps the tenant's current value; "" clears it back to the
+    GIT_ORG env var fallback — same convention as kb_s3_bucket."""
+    aws_region: str | None = None
+    """None keeps the tenant's current value; "" clears it back to the
+    AWS_REGION env var fallback."""
+
+
+class ValidateS3BucketRequest(BaseModel):
+    bucket_name: str
+
+
+class ValidateS3BucketResponse(BaseModel):
+    accessible: bool
+    bucket_name: str
 
 
 class ObservabilityConfigResponse(BaseModel):
@@ -224,6 +273,17 @@ async def save_otel_endpoint(
     return OtelEndpointConfig(endpoint=record.otel_endpoint)
 
 
+def _deployment_settings_response(record: Any) -> DeploymentSettingsConfig:
+    return DeploymentSettingsConfig(
+        default_approval_mode=record.default_approval_mode,
+        cicd_provider=record.cicd_provider,
+        kb_s3_bucket=record.kb_s3_bucket,
+        kb_s3_prefix=record.kb_s3_prefix,
+        git_organisation=record.git_organisation or settings.git_org,
+        aws_region=record.aws_region or settings.aws_region,
+    )
+
+
 @router.get("/deployment", response_model=DeploymentSettingsConfig)
 async def get_deployment_settings(
     tenant_id: Annotated[str, Depends(get_tenant_id)],
@@ -231,10 +291,7 @@ async def get_deployment_settings(
     store: Annotated[PlatformSettingsStore, Depends(get_platform_settings_store)],
 ) -> DeploymentSettingsConfig:
     record = await store.get_or_create(tenant_id, current_user.email)
-    return DeploymentSettingsConfig(
-        default_approval_mode=record.default_approval_mode,
-        cicd_provider=record.cicd_provider,
-    )
+    return _deployment_settings_response(record)
 
 
 @router.patch("/deployment", response_model=DeploymentSettingsConfig)
@@ -251,15 +308,64 @@ async def save_deployment_settings(
             "cicd_provider": (
                 payload.cicd_provider if payload.cicd_provider is not None else record.cicd_provider
             ),
+            "kb_s3_bucket": (
+                (payload.kb_s3_bucket or None)
+                if payload.kb_s3_bucket is not None
+                else record.kb_s3_bucket
+            ),
+            "kb_s3_prefix": (
+                payload.kb_s3_prefix if payload.kb_s3_prefix else record.kb_s3_prefix
+            ),
+            "git_organisation": (
+                (payload.git_organisation or None)
+                if payload.git_organisation is not None
+                else record.git_organisation
+            ),
+            "aws_region": (
+                (payload.aws_region or None)
+                if payload.aws_region is not None
+                else record.aws_region
+            ),
             "updated_by": current_user.email,
             "updated_at": _now(),
         }
     )
     await store.save(record)
-    return DeploymentSettingsConfig(
-        default_approval_mode=record.default_approval_mode,
-        cicd_provider=record.cicd_provider,
-    )
+    return _deployment_settings_response(record)
+
+
+@router.post("/deployment/validate-s3-bucket", response_model=ValidateS3BucketResponse)
+async def validate_deployment_s3_bucket(
+    payload: ValidateS3BucketRequest,
+    _current_user: Annotated[CurrentUser, Depends(require_role())],
+    s3_client: Annotated[Any, Depends(get_s3_client)],
+) -> ValidateS3BucketResponse:
+    """"Customer S3 Bucket Name" validate button (Section 47) — checks
+    accessibility before the tenant saves it, same s3_client.head_bucket
+    check knowledge_bases.py's validate-s3 does, just without needing an
+    existing kb_id in the path (there isn't one yet on this settings page)."""
+    try:
+        await asyncio.to_thread(s3_client.head_bucket, Bucket=payload.bucket_name)
+    except ClientError as exc:
+        error_code = str(exc.response.get("Error", {}).get("Code", "Unknown"))
+        reason = {
+            "404": "Bucket does not exist.",
+            "403": "This bucket is not accessible with the Runtime's current AWS credentials.",
+        }.get(error_code, f"Bucket is not accessible ({error_code}).")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "bucket_not_accessible", "message": reason},
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "bucket_not_accessible",
+                "message": f"Could not validate bucket: {exc}",
+            },
+        ) from exc
+
+    return ValidateS3BucketResponse(accessible=True, bucket_name=payload.bucket_name)
 
 
 @router.get("/integrations/langfuse", response_model=LangfuseConfig)

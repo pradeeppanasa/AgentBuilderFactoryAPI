@@ -20,7 +20,9 @@ from app.modules.auth.secrets import fetch_jwt_secret
 from app.modules.bedrock_credentials.store import BedrockCredentialStore
 from app.modules.connectors.catalog import ConnectorCatalogStore
 from app.modules.connectors.tester import ConnectorTester
+from app.modules.deployment.iac_scan_runner import IaCScanRunner
 from app.modules.deployment.orchestrator import DeploymentOrchestrator
+from app.modules.deployment.pipeline_simulator import DeploymentPipelineSimulator
 from app.modules.deployment.status_store import DeploymentStatusStore
 from app.modules.git_provider.factory import create_git_provider
 from app.modules.git_provider.secrets import fetch_git_token
@@ -39,6 +41,7 @@ from app.modules.platform.version_service import PlatformVersionService
 from app.modules.platform_settings.store import PlatformSettingsStore
 from app.modules.playground.store import PlaygroundSessionStore
 from app.modules.projects.store import ProjectStore
+from app.modules.prompts.store import PromptStore
 from app.modules.registry.store import AgentRegistryStore
 from app.modules.runs.store import RunStore
 from app.modules.secrets.manager import SecretsManager
@@ -138,7 +141,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     s3_client = create_s3_client(settings)
     app.state.s3_client = s3_client
     app.state.iac_generator = IaCGenerator(s3_client, settings)
-    app.state.iac_validator = IaCValidator()
+    app.state.iac_validator = IaCValidator(settings.terraform_binary_path)
 
     app.state.redis_client = create_redis_client(settings)
 
@@ -148,6 +151,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     eventbridge_client = create_eventbridge_client(settings)
     app.state.deployment_orchestrator = DeploymentOrchestrator(eventbridge_client, settings)
+    iac_scan_runner = IaCScanRunner(settings, app.state.iac_validator)
+    app.state.deployment_pipeline_simulator = DeploymentPipelineSimulator(
+        deployment_status_store,
+        registry_store,
+        app.state.git_provider,
+        settings,
+        iac_scan_runner=iac_scan_runner,
+    )
 
     app.state.metrics_emitter = MetricsEmitter(create_cloudwatch_client(settings), settings)
     app.state.audit_writer = AuditWriter(s3_client, settings)
@@ -192,6 +203,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     skill_store = SkillStore(dynamodb, settings)
     await skill_store.ensure_table()
     app.state.skill_store = skill_store
+
+    # Prompt Library (Priority 2 nav addition)
+    prompt_store = PromptStore(dynamodb, settings)
+    await prompt_store.ensure_table()
+    app.state.prompt_store = prompt_store
 
     # Section 38.7/38.8 — HITL review queue
     hitl_review_store = HitlReviewStore(dynamodb, settings)

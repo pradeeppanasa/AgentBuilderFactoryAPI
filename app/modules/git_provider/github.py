@@ -7,7 +7,9 @@ so that's what commit_files() does here.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+from collections.abc import Awaitable, Callable
 
 import httpx
 
@@ -15,6 +17,19 @@ from app.modules.git_provider._util import repo_slug_from_url
 from app.modules.git_provider.base import GitProvider
 
 _API_BASE = "https://api.github.com"
+
+# A repo created moments ago via create_repository()'s auto_init=True has
+# its initial commit written, but the Git Data API (blobs/trees/commits)
+# can briefly 404 on that commit's tree sha while it propagates — seen in
+# practice building a tree on top of a just-created repo's base_tree.
+# Retry with backoff rather than surfacing a transient 404 as a deploy
+# failure. Observed delays have exceeded 4s in practice, so this budgets
+# ~30s worst case (1+2+4+8+8+8), capping growth rather than letting it run
+# away — deploy_agent() awaits this inline and the UI's http client has no
+# request timeout, so a generous ceiling here is safe.
+_TREE_PROPAGATION_ATTEMPTS = 7
+_TREE_PROPAGATION_BASE_DELAY_SECONDS = 1.0
+_TREE_PROPAGATION_MAX_DELAY_SECONDS = 8.0
 
 
 class GitHubProvider(GitProvider):
@@ -39,6 +54,23 @@ class GitHubProvider(GitProvider):
     def _repo(repo: str) -> str:
         return repo_slug_from_url(repo)
 
+    @staticmethod
+    async def _post_retrying_404(
+        call: Callable[[], Awaitable[httpx.Response]],
+    ) -> httpx.Response:
+        for attempt in range(_TREE_PROPAGATION_ATTEMPTS):
+            response = await call()
+            is_last_attempt = attempt == _TREE_PROPAGATION_ATTEMPTS - 1
+            if response.status_code != 404 or is_last_attempt:
+                response.raise_for_status()
+                return response
+            delay = min(
+                _TREE_PROPAGATION_BASE_DELAY_SECONDS * (2**attempt),
+                _TREE_PROPAGATION_MAX_DELAY_SECONDS,
+            )
+            await asyncio.sleep(delay)
+        raise AssertionError("unreachable")  # loop always returns or raises
+
     async def repository_exists(self, repo: str) -> bool:
         slug = self._repo(repo)
         response = await self._client.get(f"/repos/{slug}")
@@ -56,6 +88,15 @@ class GitHubProvider(GitProvider):
         response = await self._client.post(
             f"/orgs/{org}/repos", json={"name": name, "private": True, "auto_init": True}
         )
+        if response.status_code == 404:
+            # GIT_ORG isn't always a real GitHub Organization — many
+            # customers configure their own personal account/username
+            # there. /orgs/{org}/repos 404s for a personal account; the
+            # equivalent personal-account endpoint is /user/repos, which
+            # creates under whichever account the token belongs to.
+            response = await self._client.post(
+                "/user/repos", json={"name": name, "private": True, "auto_init": True}
+            )
         response.raise_for_status()
 
     async def create_branch(self, repo: str, branch: str, from_branch: str = "main") -> None:
@@ -97,11 +138,12 @@ class GitHubProvider(GitProvider):
                 {"path": path, "mode": "100644", "type": "blob", "sha": blob.json()["sha"]}
             )
 
-        tree = await self._client.post(
-            f"/repos/{slug}/git/trees",
-            json={"base_tree": base_tree_sha, "tree": tree_entries},
+        tree = await self._post_retrying_404(
+            lambda: self._client.post(
+                f"/repos/{slug}/git/trees",
+                json={"base_tree": base_tree_sha, "tree": tree_entries},
+            )
         )
-        tree.raise_for_status()
         new_tree_sha = tree.json()["sha"]
 
         commit = await self._client.post(

@@ -174,3 +174,62 @@ class ConnectorCatalogStore:
         )
         await asyncio.to_thread(self._table.put_item, Item=record.model_dump(mode="json"))
         return record
+
+    async def get_tenant_owned_connector(
+        self, tenant_id: str, connector_id: str
+    ) -> ConnectorRecord | None:
+        """Like get_connector, but scoped ONLY to the caller's own tenant
+        partition — never falls back to GLOBAL_TENANT_ID. Global connectors
+        are Panasa-curated (seed_global_connectors, re-applied at every
+        startup) and must never be edited or deleted by a tenant; using this
+        instead of get_connector for update/delete is what enforces that,
+        rather than a separate is_global check after the fact."""
+        response = await asyncio.to_thread(
+            self._table.get_item, Key={"tenant_id": tenant_id, "connector_id": connector_id}
+        )
+        item = response.get("Item")
+        if item is None:
+            return None
+        return ConnectorRecord(**decimal_to_native(item))
+
+    async def update_connector(
+        self,
+        tenant_id: str,
+        connector_id: str,
+        name: str,
+        executor_type: ExecutorType,
+        description: str,
+        input_schema: dict[str, Any] | None = None,
+        output_schema: dict[str, Any] | None = None,
+        endpoint_template: str | None = None,
+        credentials_required: list[str] | None = None,
+    ) -> ConnectorRecord | None:
+        existing = await self.get_tenant_owned_connector(tenant_id, connector_id)
+        if existing is None:
+            return None
+        updated = existing.model_copy(
+            update={
+                "name": name,
+                "executor_type": executor_type,
+                "description": description,
+                "input_schema": input_schema if input_schema is not None else existing.input_schema,
+                "output_schema": output_schema
+                if output_schema is not None
+                else existing.output_schema,
+                "endpoint_template": endpoint_template,
+                "credentials_required": credentials_required
+                if credentials_required is not None
+                else existing.credentials_required,
+            }
+        )
+        await asyncio.to_thread(self._table.put_item, Item=updated.model_dump(mode="json"))
+        return updated
+
+    async def delete_connector(self, tenant_id: str, connector_id: str) -> bool:
+        existing = await self.get_tenant_owned_connector(tenant_id, connector_id)
+        if existing is None:
+            return False
+        await asyncio.to_thread(
+            self._table.delete_item, Key={"tenant_id": tenant_id, "connector_id": connector_id}
+        )
+        return True

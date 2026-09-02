@@ -35,6 +35,16 @@ class CreateConnectorRequest(BaseModel):
     credentials_required: list[str] = []
 
 
+class UpdateConnectorRequest(BaseModel):
+    name: str
+    executor_type: ExecutorType
+    description: str
+    input_schema: dict[str, Any] = {}
+    output_schema: dict[str, Any] = {}
+    endpoint_template: str | None = None
+    credentials_required: list[str] = []
+
+
 class ConnectorTestRequest(BaseModel):
     endpoint_params: dict[str, str] = {}
     credentials: dict[str, str] = {}
@@ -125,6 +135,53 @@ async def get_connector(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"Connector {connector_id!r} not found"
         )
     return record
+
+
+@router.put("/{connector_id}", response_model=ConnectorRecord)
+async def update_connector(
+    connector_id: str,
+    payload: UpdateConnectorRequest,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    _current_user: Annotated[CurrentUser, Depends(require_role(*_WRITE_ROLES))],
+    store: Annotated[ConnectorCatalogStore, Depends(get_connector_catalog_store)],
+) -> ConnectorRecord:
+    # get_tenant_owned_connector (not get_connector) — never falls back to
+    # the GLOBAL partition, so a global/Panasa-curated connector 404s here
+    # exactly like one that doesn't exist at all, rather than being editable.
+    existing = await store.get_tenant_owned_connector(tenant_id, connector_id)
+    if existing is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Connector {connector_id!r} not found or is a global connector",
+        )
+    updated = await store.update_connector(
+        tenant_id=tenant_id,
+        connector_id=connector_id,
+        name=payload.name,
+        executor_type=payload.executor_type,
+        description=payload.description,
+        input_schema=payload.input_schema,
+        output_schema=payload.output_schema,
+        endpoint_template=payload.endpoint_template,
+        credentials_required=payload.credentials_required,
+    )
+    assert updated is not None  # existing was just confirmed present above
+    return updated
+
+
+@router.delete("/{connector_id}", response_model=None, status_code=status.HTTP_204_NO_CONTENT)
+async def delete_connector(
+    connector_id: str,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    _current_user: Annotated[CurrentUser, Depends(require_role(*_WRITE_ROLES))],
+    store: Annotated[ConnectorCatalogStore, Depends(get_connector_catalog_store)],
+) -> None:
+    deleted = await store.delete_connector(tenant_id, connector_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Connector {connector_id!r} not found or is a global connector",
+        )
 
 
 @router.post("/{connector_id}/test", response_model=ConnectorTestResult)

@@ -58,10 +58,15 @@ async def test_deployment_settings_default_to_automated(make_user_and_token) -> 
         response = client.get("/api/v1/admin/settings/deployment", headers=_bearer(admin_token))
 
     assert response.status_code == 200
-    assert response.json() == {
-        "default_approval_mode": "automated",
-        "cicd_provider": "github_actions",
-    }
+    body = response.json()
+    assert body["default_approval_mode"] == "automated"
+    assert body["cicd_provider"] == "github_actions"
+    assert body["kb_s3_bucket"] is None
+    assert body["kb_s3_prefix"] == "agent-factory"
+    # git_organisation/aws_region fall back to the GIT_ORG/AWS_REGION env
+    # vars when the tenant hasn't set its own — aws_region always has a
+    # global default so it's never null on the response.
+    assert body["aws_region"]
 
 
 async def test_save_and_read_back_deployment_settings(make_user_and_token) -> None:
@@ -74,10 +79,145 @@ async def test_save_and_read_back_deployment_settings(make_user_and_token) -> No
             headers=_bearer(admin_token),
         )
         assert saved.status_code == 200
-        assert saved.json() == {"default_approval_mode": "manual", "cicd_provider": "gitlab_ci"}
+        saved_body = saved.json()
+        assert saved_body["default_approval_mode"] == "manual"
+        assert saved_body["cicd_provider"] == "gitlab_ci"
+        assert saved_body["kb_s3_bucket"] is None
+        assert saved_body["kb_s3_prefix"] == "agent-factory"
 
         fetched = client.get("/api/v1/admin/settings/deployment", headers=_bearer(admin_token))
-        assert fetched.json() == {"default_approval_mode": "manual", "cicd_provider": "gitlab_ci"}
+        fetched_body = fetched.json()
+        assert fetched_body["default_approval_mode"] == "manual"
+        assert fetched_body["cicd_provider"] == "gitlab_ci"
+        assert fetched_body["kb_s3_bucket"] is None
+        assert fetched_body["kb_s3_prefix"] == "agent-factory"
+
+
+async def test_save_and_read_back_kb_s3_settings(make_user_and_token) -> None:
+    """CLAUDE.md Section 47 (R59 corrected 2026-09-01) — "Settings ->
+    Deployment -> Customer S3 Bucket / S3 Folder Prefix"."""
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        saved = client.patch(
+            "/api/v1/admin/settings/deployment",
+            json={
+                "default_approval_mode": "automated",
+                "kb_s3_bucket": "acme-customer-bucket",
+                "kb_s3_prefix": "knowledge",
+            },
+            headers=_bearer(admin_token),
+        )
+        assert saved.status_code == 200
+        assert saved.json()["kb_s3_bucket"] == "acme-customer-bucket"
+        assert saved.json()["kb_s3_prefix"] == "knowledge"
+
+        # Omitting kb_s3_bucket/kb_s3_prefix on a later save keeps them.
+        resaved = client.patch(
+            "/api/v1/admin/settings/deployment",
+            json={"default_approval_mode": "manual"},
+            headers=_bearer(admin_token),
+        )
+        assert resaved.json()["kb_s3_bucket"] == "acme-customer-bucket"
+        assert resaved.json()["kb_s3_prefix"] == "knowledge"
+
+        # An explicit empty string unconfigures the bucket (matches every
+        # other optional-field convention in this file).
+        cleared = client.patch(
+            "/api/v1/admin/settings/deployment",
+            json={"default_approval_mode": "manual", "kb_s3_bucket": ""},
+            headers=_bearer(admin_token),
+        )
+        assert cleared.json()["kb_s3_bucket"] is None
+        assert cleared.json()["kb_s3_prefix"] == "knowledge"
+
+
+async def test_save_and_read_back_git_org_and_aws_region(make_user_and_token) -> None:
+    """"Settings -> Deployment -> Git Organisation / AWS Region"."""
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        saved = client.patch(
+            "/api/v1/admin/settings/deployment",
+            json={
+                "default_approval_mode": "automated",
+                "git_organisation": "acme-corp",
+                "aws_region": "us-east-1",
+            },
+            headers=_bearer(admin_token),
+        )
+        assert saved.status_code == 200
+        assert saved.json()["git_organisation"] == "acme-corp"
+        assert saved.json()["aws_region"] == "us-east-1"
+
+        # Omitting on a later save keeps them.
+        resaved = client.patch(
+            "/api/v1/admin/settings/deployment",
+            json={"default_approval_mode": "manual"},
+            headers=_bearer(admin_token),
+        )
+        assert resaved.json()["git_organisation"] == "acme-corp"
+        assert resaved.json()["aws_region"] == "us-east-1"
+
+        # Explicit empty string clears back to the env var fallback.
+        cleared = client.patch(
+            "/api/v1/admin/settings/deployment",
+            json={"default_approval_mode": "manual", "git_organisation": ""},
+            headers=_bearer(admin_token),
+        )
+        assert cleared.json()["git_organisation"] != "acme-corp"
+        assert cleared.json()["aws_region"] == "us-east-1"
+
+
+async def test_validate_s3_bucket_accessible(make_user_and_token) -> None:
+    import boto3
+
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+    bucket = "settings-validate-test-bucket"
+    s3 = boto3.client("s3", region_name="eu-west-2")
+    try:
+        s3.create_bucket(
+            Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": "eu-west-2"}
+        )
+    except s3.exceptions.BucketAlreadyOwnedByYou:
+        pass
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/admin/settings/deployment/validate-s3-bucket",
+            json={"bucket_name": bucket},
+            headers=_bearer(admin_token),
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"accessible": True, "bucket_name": bucket}
+
+
+async def test_validate_s3_bucket_inaccessible_returns_422(make_user_and_token) -> None:
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/admin/settings/deployment/validate-s3-bucket",
+            json={"bucket_name": "this-bucket-does-not-exist-anywhere"},
+            headers=_bearer(admin_token),
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["error"] == "bucket_not_accessible"
+
+
+async def test_developer_cannot_validate_s3_bucket(make_user_and_token) -> None:
+    _, dev_token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/admin/settings/deployment/validate-s3-bucket",
+            json={"bucket_name": "whatever"},
+            headers=_bearer(dev_token),
+        )
+
+    assert response.status_code == 403
 
 
 async def test_deployment_settings_forbidden_for_developer(make_user_and_token) -> None:

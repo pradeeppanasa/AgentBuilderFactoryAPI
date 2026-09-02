@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     dynamodb_skills_table: str = "panasa-skills"
     dynamodb_transcripts_table: str = "panasa-transcripts"
     dynamodb_reports_table: str = "panasa-reports"
+    dynamodb_prompts_table: str = "panasa-prompts"
 
     # ── Advanced Config: KB / Guardrail Policy / Playground libraries
     # (CLAUDE_Advanced_Config.md Section 4/8, Section 37.12) ──────────────
@@ -101,12 +102,32 @@ class Settings(BaseSettings):
     # Never set true in prototype/enterprise deployments.
     mock_git_provider: bool = False
 
+    # ── Local IaC scan tooling (deployment/iac_scan_runner.py) ───────────
+    # Absolute paths, not bare command names — local dev installs these
+    # after the Runtime process (or its parent shell) already started, so a
+    # PATH update doesn't reliably propagate without a full session
+    # restart. Bare "terraform"/"tfsec" remain the defaults for
+    # environments (CI, containers) where PATH is set up before the
+    # process starts. checkov has no bare-command default: it's installed
+    # into its own isolated venv (never the Runtime's own — its dependency
+    # tree has pinned-version conflicts with this project's), so there is
+    # no "checkov" on PATH to fall back to; None skips the checkov scan
+    # exactly like a missing terraform/tfsec binary skips theirs.
+    terraform_binary_path: str = "terraform"
+    tfsec_binary_path: str = "tfsec"
+    checkov_python_path: str | None = None
+
     # ── Knowledge Base — S3 + Bedrock provisioning (instructions_kb_api.md /
     # CLAUDE.md Section 43) ─────────────────────────────────────────────
     kb_documents_bucket: str | None = None
-    """None disables real S3/Bedrock provisioning for new KBs — create()
-    falls back to its original DynamoDB-only behaviour (status=INDEXING,
-    no s3_bucket/s3_prefix), same as every KB created before this existed."""
+    """Local-dev / Prototype-mode fallback only (CLAUDE.md Section 47, R59
+    corrected 2026-09-01) — a real deployment configures the tenant's own
+    bucket via Settings -> Deployment -> Customer S3 Bucket instead
+    (PlatformSettingsRecord.kb_s3_bucket), which always wins when set. If
+    neither is set, real S3/Bedrock provisioning is disabled for new KBs —
+    create() falls back to its original DynamoDB-only behaviour
+    (status=INDEXING, no s3_bucket/s3_prefix), same as every KB created
+    before this existed."""
     bedrock_kb_role_arn: str | None = None
     opensearch_collection_arn: str | None = None
 
@@ -124,6 +145,18 @@ class Settings(BaseSettings):
     # ── Deployment pipeline ───────────────────────────────────────
     eventbridge_bus_name: str = "panasa-agent-builder"
     step_functions_arn: str | None = None
+
+    # In a real deployment, panasa-deployments' stage results are written by
+    # the customer's own CI/CD (R03/F2, deployment/models.py's module
+    # docstring) — never by this Runtime. Locally there is no bootstrapped
+    # Step Functions/CodeBuild pipeline and the generated per-agent GitHub
+    # Actions workflow has no path back to DynamoDB Local, so nothing ever
+    # writes those results and the Console's deployment status page sits at
+    # PENDING forever. When true, deployment/pipeline_simulator.py fabricates
+    # stage progression through to ACTIVE so the status UI can be exercised
+    # locally. Never set true in prototype/enterprise deployments serving
+    # real traffic — it never runs an actual scan, plan, or apply.
+    simulate_deployment_pipeline: bool = False
 
     # ── IaC & Git ───────────────────────────────────────────────────
     iac_output_bucket: str | None = None
@@ -226,6 +259,7 @@ class Settings(BaseSettings):
     dynamodb_endpoint: str | None = None
     secrets_manager_endpoint: str | None = None  # e.g. http://localstack:4566
     s3_endpoint: str | None = None  # e.g. http://localstack:4566
+    eventbridge_endpoint: str | None = None  # e.g. http://localstack:4566
 
     # ── CORS (TS02-A-02) ────────────────────────────────────────────────
     # Comma-separated list of allowed origins. Deliberately NOT ["*"] —
