@@ -14,7 +14,7 @@ per settings page.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.modules.deployment.models import ApprovalMode, CICDProvider
 
@@ -90,6 +90,28 @@ class PlatformSettingsRecord(BaseModel):
     # a tenant hasn't set its own, same convention as kb_s3_bucket above).
     git_organisation: str | None = None
     aws_region: str | None = None
+
+    # "Settings -> Deployment -> AWS Target" (Generic Agent Runtime wiring,
+    # 2026-09-03). A real `terraform apply` needs to know WHICH pre-existing
+    # customer VPC/ECS cluster/subnets an agent's compute module deploys
+    # into — R03/F0 forbid the Runtime from ever reading Terraform state to
+    # discover this itself, so the customer states it once here instead
+    # (rendered into each deploy's generated terraform.auto.tfvars.json,
+    # app/modules/iac_generator/tfvars.py) rather than being asked on every
+    # single deploy. None/empty means "not configured yet" — same convention
+    # as kb_s3_bucket above; the deploy flow surfaces a clear message rather
+    # than pushing Terraform that can never apply.
+    agent_vpc_id: str | None = None
+    agent_subnet_ids: list[str] = Field(default_factory=list)
+    agent_ecs_cluster_arn: str | None = None
+    agent_runtime_ecr_registry: str | None = None
+    """Repository URL of the *shared* `agent-runtime` ECR repo (created once
+    in the customer's own bootstrap/stage1, never per-agent — F6/R21's
+    per-agent isolation is about tool Lambdas, not the one reusable runtime
+    image every agent's ECS task pulls). `runtime_image` is computed as
+    f"{this}:latest" — see tfvars.py."""
+    bedrock_endpoint_cidr: str | None = None
+    opensearch_endpoint_cidr: str | None = None
 
     updated_by: str
     updated_at: str

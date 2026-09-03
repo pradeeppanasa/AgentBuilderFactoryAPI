@@ -149,6 +149,16 @@ class DeploymentSettingsConfig(BaseModel):
     # the response: aws_region always has a global default).
     git_organisation: str | None
     aws_region: str
+    # "AWS Target" (Generic Agent Runtime, 2026-09-03) — see
+    # PlatformSettingsRecord.agent_vpc_id's docstring. All None/empty until
+    # the tenant configures a real target; the deploy flow's generated
+    # terraform.auto.tfvars.json is incomplete until then (tfvars.py).
+    agent_vpc_id: str | None
+    agent_subnet_ids: list[str]
+    agent_ecs_cluster_arn: str | None
+    agent_runtime_ecr_registry: str | None
+    bedrock_endpoint_cidr: str | None
+    opensearch_endpoint_cidr: str | None
 
 
 class SaveDeploymentSettingsRequest(BaseModel):
@@ -173,6 +183,23 @@ class SaveDeploymentSettingsRequest(BaseModel):
     aws_region: str | None = None
     """None keeps the tenant's current value; "" clears it back to the
     AWS_REGION env var fallback."""
+    agent_vpc_id: str | None = None
+    """None keeps the tenant's current value; "" clears it back to
+    unconfigured — same convention as kb_s3_bucket."""
+    agent_subnet_ids: list[str] | None = None
+    """None keeps the tenant's current list; [] explicitly clears it."""
+    agent_ecs_cluster_arn: str | None = None
+    """None keeps the tenant's current value; "" clears it back to
+    unconfigured."""
+    agent_runtime_ecr_registry: str | None = None
+    """None keeps the tenant's current value; "" clears it back to
+    unconfigured."""
+    bedrock_endpoint_cidr: str | None = None
+    """None keeps the tenant's current value; "" clears it back to
+    unconfigured."""
+    opensearch_endpoint_cidr: str | None = None
+    """None keeps the tenant's current value; "" clears it back to
+    unconfigured."""
 
 
 class ValidateS3BucketRequest(BaseModel):
@@ -281,6 +308,12 @@ def _deployment_settings_response(record: Any) -> DeploymentSettingsConfig:
         kb_s3_prefix=record.kb_s3_prefix,
         git_organisation=record.git_organisation or settings.git_org,
         aws_region=record.aws_region or settings.aws_region,
+        agent_vpc_id=record.agent_vpc_id,
+        agent_subnet_ids=record.agent_subnet_ids,
+        agent_ecs_cluster_arn=record.agent_ecs_cluster_arn,
+        agent_runtime_ecr_registry=record.agent_runtime_ecr_registry,
+        bedrock_endpoint_cidr=record.bedrock_endpoint_cidr,
+        opensearch_endpoint_cidr=record.opensearch_endpoint_cidr,
     )
 
 
@@ -325,6 +358,36 @@ async def save_deployment_settings(
                 (payload.aws_region or None)
                 if payload.aws_region is not None
                 else record.aws_region
+            ),
+            "agent_vpc_id": (
+                (payload.agent_vpc_id or None)
+                if payload.agent_vpc_id is not None
+                else record.agent_vpc_id
+            ),
+            "agent_subnet_ids": (
+                payload.agent_subnet_ids
+                if payload.agent_subnet_ids is not None
+                else record.agent_subnet_ids
+            ),
+            "agent_ecs_cluster_arn": (
+                (payload.agent_ecs_cluster_arn or None)
+                if payload.agent_ecs_cluster_arn is not None
+                else record.agent_ecs_cluster_arn
+            ),
+            "agent_runtime_ecr_registry": (
+                (payload.agent_runtime_ecr_registry or None)
+                if payload.agent_runtime_ecr_registry is not None
+                else record.agent_runtime_ecr_registry
+            ),
+            "bedrock_endpoint_cidr": (
+                (payload.bedrock_endpoint_cidr or None)
+                if payload.bedrock_endpoint_cidr is not None
+                else record.bedrock_endpoint_cidr
+            ),
+            "opensearch_endpoint_cidr": (
+                (payload.opensearch_endpoint_cidr or None)
+                if payload.opensearch_endpoint_cidr is not None
+                else record.opensearch_endpoint_cidr
             ),
             "updated_by": current_user.email,
             "updated_at": _now(),

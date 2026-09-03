@@ -127,6 +127,22 @@ async def test_commit_files_marks_existing_files_as_update(
     assert body["commit_message"] == "generated IaC"
 
 
+async def test_file_exists_true_when_head_returns_200(
+    provider: GitLabProvider, recorder: _Recorder
+) -> None:
+    recorder.file_exists.add("README.md")
+    assert await provider.file_exists(REPO, "README.md", branch="main") is True
+
+
+async def test_file_exists_false_when_head_returns_404(
+    provider: GitLabProvider, recorder: _Recorder
+) -> None:
+    exists = await provider.file_exists(
+        REPO, ".gitlab-ci.yml", branch="main"
+    )
+    assert exists is False
+
+
 async def test_create_pull_request_returns_iid_as_string(
     provider: GitLabProvider, recorder: _Recorder
 ) -> None:

@@ -68,13 +68,20 @@ class GitLabProvider(GitProvider):
         )
         response.raise_for_status()
 
-    async def _action_for_path(self, project_id: str, branch: str, path: str) -> str:
+    async def _file_exists_by_project_id(self, project_id: str, branch: str, path: str) -> bool:
         encoded_path = quote(path, safe="")
         response = await self._client.head(
             f"/projects/{project_id}/repository/files/{encoded_path}",
             params={"ref": branch},
         )
-        return "update" if response.status_code == 200 else "create"
+        return response.status_code == 200
+
+    async def _action_for_path(self, project_id: str, branch: str, path: str) -> str:
+        exists = await self._file_exists_by_project_id(project_id, branch, path)
+        return "update" if exists else "create"
+
+    async def file_exists(self, repo: str, path: str, branch: str = "main") -> bool:
+        return await self._file_exists_by_project_id(self._project_id(repo), branch, path)
 
     async def commit_files(
         self, repo: str, branch: str, files: dict[str, str], message: str

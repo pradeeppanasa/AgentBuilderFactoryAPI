@@ -5,10 +5,11 @@
 ## agent.knowledge_base.kb_name directly (CLAUDE.md Section 6 IaC validation
 ## suite's naming-convention check) — kb_name remains available on the
 ## config for display purposes elsewhere, just not as the Terraform
-## resource identifier.
+## resource identifier. opensearch_collection_name() truncates for long
+## agent_ids — AWS caps collection names at 32 characters (naming.py).
 
 resource "aws_opensearchserverless_collection" "agent_kb" {
-  name = "panasa-{{ agent_id }}-kb"
+  name = "{{ opensearch_collection_name(agent_id) }}"
   type = "VECTORSEARCH"
 {{ macros.panasa_tags(agent_id, tenant_id, version) }}
 }
@@ -39,6 +40,49 @@ resource "aws_bedrockagent_knowledge_base" "agent_kb" {
 {{ macros.panasa_tags(agent_id, tenant_id, version) }}
 }
 
+resource "aws_iam_role_policy" "agent_kb_retrieve" {
+  # rag_client.py — the runtime queries this agent's own KB at chat time;
+  # the module is only resolved at all when knowledge_base.enabled is
+  # already true (conditional.py), so this needs no further guard.
+  name = "panasa-{{ agent_id }}-kb-retrieve"
+  role = aws_iam_role.agent_execution_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = ["bedrock-agent-runtime:Retrieve", "bedrock-agent-runtime:RetrieveAndGenerate"]
+      # NOT aws_bedrockagent_knowledge_base.agent_kb.arn above: the KB
+      # rag_client.py actually queries is whichever one KBConfig.kb_id
+      # references, provisioned by the Factory Runtime's own API directly
+      # against Bedrock (app/modules/knowledge_base/provisioner.py,
+      # KnowledgeBaseRecord.bedrock_kb_id) — a separate, already-working
+      # provisioning path from this Terraform resource, which exists for
+      # the IaC validation suite's structural checks but isn't what's
+      # actually queried. Scoped to any KB in this account/region rather
+      # than the one specific (unused-at-runtime) ARN above.
+      Resource = "arn:aws:bedrock:${var.aws_region}:${data.aws_caller_identity.current.account_id}:knowledge-base/*"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "kb_config_read" {
+  # rag_client.py resolves KBConfig.kb_id -> bedrock_kb_id by reading its
+  # own tenant's row in the knowledge base catalog
+  # (app/modules/knowledge_base/store.py's {tenant_id, kb_id} key schema).
+  name = "panasa-{{ agent_id }}-kb-config-read"
+  role = aws_iam_role.agent_execution_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "dynamodb:GetItem"
+      Resource = "arn:aws:dynamodb:${var.aws_region}:${data.aws_caller_identity.current.account_id}:table/{{ dynamodb_knowledge_bases_table }}"
+    }]
+  })
+}
+
 {% if agent.knowledge_base.s3_bucket %}
 resource "aws_iam_role_policy" "agent_kb_read" {
   name = "panasa-{{ agent_id }}-kb-read"
@@ -47,8 +91,8 @@ resource "aws_iam_role_policy" "agent_kb_read" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect   = "Allow"
-      Action   = ["s3:GetObject", "s3:ListBucket"]
+      Effect = "Allow"
+      Action = ["s3:GetObject", "s3:ListBucket"]
       Resource = [
         "arn:aws:s3:::{{ agent.knowledge_base.s3_bucket }}",
         "arn:aws:s3:::{{ agent.knowledge_base.s3_bucket }}/*",

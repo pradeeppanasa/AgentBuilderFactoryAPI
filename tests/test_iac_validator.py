@@ -292,7 +292,7 @@ async def test_naming_convention_accepts_truncated_guardrail_name_for_long_agent
     naming_check = _checks_by_name(report)["naming_convention"]
     assert naming_check.passed, naming_check.detail
 
-    guardrail_tf = files[f"terraform/agents/{long_agent_id}/guardrails/guardrails.tf"]
+    guardrail_tf = files[f"terraform/agents/{long_agent_id}/guardrails__guardrails.tf"]
     assert 'name                      = "panasa-' in guardrail_tf
     # The rendered name itself must respect the real AWS limit.
     for line in guardrail_tf.splitlines():

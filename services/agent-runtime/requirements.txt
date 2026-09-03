@@ -1,0 +1,11 @@
+# Generic Agent Runtime — a separate deployable from the Factory Runtime
+# (F8/R10: zero shared code, its own pinned versions). Only what main.py's
+# import graph actually uses; no langgraph/opentelemetry/langchain-aws —
+# not imported anywhere in this service, so not listed here (R20's
+# "conditional, only what's needed" spirit applies to dependencies too).
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+boto3==1.35.90
+litellm==1.96.2
+structlog==24.4.0

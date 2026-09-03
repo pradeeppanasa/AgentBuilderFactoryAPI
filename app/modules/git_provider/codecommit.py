@@ -54,6 +54,23 @@ class CodeCommitProvider(GitProvider):
 
         await asyncio.to_thread(_create)
 
+    async def file_exists(self, repo: str, path: str, branch: str = "main") -> bool:
+        repo_name = self._repo_name(repo)
+
+        def _get() -> bool:
+            try:
+                self._client.get_file(
+                    repositoryName=repo_name, filePath=path, commitSpecifier=branch
+                )
+                return True
+            except ClientError as exc:
+                code = exc.response["Error"]["Code"]
+                if code in ("FileDoesNotExistException", "CommitDoesNotExistException"):
+                    return False
+                raise
+
+        return await asyncio.to_thread(_get)
+
     async def commit_files(
         self, repo: str, branch: str, files: dict[str, str], message: str
     ) -> str:

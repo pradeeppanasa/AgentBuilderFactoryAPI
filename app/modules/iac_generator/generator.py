@@ -56,7 +56,9 @@ class IaCGenerator:
         backend = self._backends[self._settings.iac_tool]
         resolved_modules = resolve_required_modules(config)
 
-        files = backend.render(agent_id, tenant_id, version, config, resolved_modules)
+        files = backend.render(
+            agent_id, tenant_id, version, config, resolved_modules, self._settings
+        )
         archive = _build_zip(files)
 
         iac_version = f"1.0.{version}"

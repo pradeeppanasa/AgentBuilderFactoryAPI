@@ -1,8 +1,21 @@
 """Terraform backend — renders Jinja2 .tf.j2 templates per resolved module.
 
-Output layout: terraform/agents/{agent_id}/{module}/{file}.tf — matches the
-naming convention already used elsewhere for generated per-agent Terraform
-(e.g. F6's network.tf, Section 19's schedule_{schedule_id}.tf).
+Output layout: terraform/agents/{agent_id}/{module}__{file}.tf — flat, not
+nested per-module subdirectories. `terraform init`/`plan`/`apply` only ever
+look at .tf files sitting directly in the working directory they're run
+from; they do NOT recurse into subdirectories the way this generated
+config's cross-module resource references need (e.g. compute.tf's
+`aws_iam_role.agent_execution_role`, defined in authentication.tf, has to
+resolve within a single Terraform root module). An earlier nested layout
+(terraform/agents/{agent_id}/{module}/{file}.tf) only ever worked for
+IaCValidator's own local validation, which flattens into a temporary
+directory purely for that subprocess call (validator.py's
+_flatten_for_terraform_cli) — the customer's real CI/CD, given the actual
+nested repo layout, would have found zero .tf files in its working
+directory and failed immediately. This generates the SAME flat layout
+IaCValidator already proved works, so what the CI/CD applies for real is
+exactly what local validation already checked — see the Generic Agent
+Runtime instruction, 2026-09-03.
 """
 
 from __future__ import annotations
@@ -11,8 +24,16 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from app.config import Settings
 from app.modules.iac_generator.backends.base import IaCBackend
-from app.modules.iac_generator.naming import bedrock_guardrail_name
+from app.modules.iac_generator.naming import (
+    alb_name,
+    bedrock_guardrail_name,
+    opensearch_collection_name,
+    target_group_name,
+    tool_lambda_name,
+    tool_role_name,
+)
 from app.modules.registry.models import AgentConfiguration
 
 _TEMPLATES_ROOT = Path(__file__).parent.parent / "templates" / "terraform"
@@ -35,6 +56,11 @@ class TerraformBackend(IaCBackend):
         # long agent_ids get truncated instead of exceeding AWS's 50-char
         # Bedrock Guardrail name limit.
         self._env.globals["bedrock_guardrail_name"] = bedrock_guardrail_name
+        self._env.globals["alb_name"] = alb_name
+        self._env.globals["target_group_name"] = target_group_name
+        self._env.globals["opensearch_collection_name"] = opensearch_collection_name
+        self._env.globals["tool_lambda_name"] = tool_lambda_name
+        self._env.globals["tool_role_name"] = tool_role_name
 
     def render(
         self,
@@ -43,12 +69,37 @@ class TerraformBackend(IaCBackend):
         version: int,
         config: AgentConfiguration,
         resolved_modules: list[str],
+        settings: Settings | None = None,
     ) -> dict[str, str]:
         context = {
             "agent_id": agent_id,
             "tenant_id": tenant_id,
             "version": version,
             "agent": config,
+            # Generic Agent Runtime instruction (2026-09-03) — the runtime's
+            # own DynamoDB permissions (authentication.tf.j2) need the real
+            # table names. These are platform-wide constants (same for
+            # every tenant/agent), not customer-configured deploy targets —
+            # unlike PlatformSettingsRecord's AWS Target fields (tfvars.py),
+            # baking them straight into the .tf file is fine, same as
+            # bedrock_guardrail_name(agent_id) above.
+            "dynamodb_agents_table": (
+                settings.dynamodb_agents_table if settings else "panasa-agents"
+            ),
+            "dynamodb_versions_table": (
+                settings.dynamodb_versions_table if settings else "panasa-agent-versions"
+            ),
+            "dynamodb_memory_table": (
+                settings.dynamodb_memory_table if settings else "panasa-memory"
+            ),
+            "dynamodb_guardrail_policies_table": (
+                settings.dynamodb_guardrail_policies_table
+                if settings
+                else "panasa-guardrail-policies"
+            ),
+            "dynamodb_knowledge_bases_table": (
+                settings.dynamodb_knowledge_bases_table if settings else "panasa-knowledge-bases"
+            ),
         }
         files: dict[str, str] = {}
 
@@ -60,6 +111,6 @@ class TerraformBackend(IaCBackend):
                 relative_template = f"{module}/{template_path.name}"
                 rendered = self._env.get_template(relative_template).render(**context)
                 output_name = template_path.name.removesuffix(".j2")
-                files[f"terraform/agents/{agent_id}/{module}/{output_name}"] = rendered
+                files[f"terraform/agents/{agent_id}/{module}__{output_name}"] = rendered
 
         return files

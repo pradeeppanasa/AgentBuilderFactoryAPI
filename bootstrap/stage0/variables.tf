@@ -34,7 +34,7 @@ variable "state_bucket_object_lock_retention_days" {
 }
 
 variable "mirrored_image_names" {
-  description = "ECR repositories created to receive Panasa's mirrored images (bootstrap/scripts/mirror_images.sh, F13/A13). One repository per image family; tags distinguish versions."
+  description = "ECR repositories created to receive Panasa's mirrored images (bootstrap/scripts/mirror_images.sh, F13/A13). One repository per image family; tags distinguish versions. agent-runtime is the Generic Agent Runtime image (services/agent-runtime/, 2026-09-03) — one shared image every deployed agent's ECS task pulls, never rebuilt per agent."
   type        = list(string)
   default = [
     "agent-factory-runtime",
@@ -42,6 +42,7 @@ variable "mirrored_image_names" {
     "langfuse-web",
     "langfuse-worker",
     "code-sandbox",
+    "agent-runtime",
   ]
 }
 

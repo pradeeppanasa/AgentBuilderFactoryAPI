@@ -157,6 +157,59 @@ async def test_deploy_v2_plus_opens_pr_against_existing_repo(make_user_and_token
     assert "pending" in pr_description.lower()
 
 
+async def test_deploy_v2_plus_skips_workflow_file_already_committed(
+    make_user_and_token,
+) -> None:
+    """Normal repeat-deploy case: the workflow file was already committed
+    (by v1 or an earlier v2+ deploy) and must never be silently rewritten —
+    a customer may have edited their copy (Section 45.6/R58)."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/agents", json=_minimal_agent_payload(), headers=_bearer(token)
+        ).json()
+        agent_id = created["agent_id"]
+        repo = f"test-org/panasa-iac-{agent_id}"
+
+        fake_git = FakeGitProvider(
+            existing_repos={repo}, existing_files={".github/workflows/panasa-deploy.yml"}
+        )
+        app.state.git_provider = fake_git
+
+        client.post(f"/api/v1/agents/{agent_id}/deploy", headers=_bearer(token))
+
+    _repo, _branch, committed_files, _message = fake_git.committed_files[0]
+    assert ".github/workflows/panasa-deploy.yml" not in committed_files
+
+
+async def test_deploy_v2_plus_commits_missing_workflow_file(make_user_and_token) -> None:
+    """The bug this guards against: a repo can exist without ever having
+    received the workflow file — e.g. create_repository() succeeded on an
+    earlier attempt but that same attempt's commit_files() call then failed
+    (expired token, transient network error). The next deploy must still
+    commit the workflow file rather than treating "repo exists" as proof it
+    was already delivered."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/agents", json=_minimal_agent_payload(), headers=_bearer(token)
+        ).json()
+        agent_id = created["agent_id"]
+        repo = f"test-org/panasa-iac-{agent_id}"
+
+        # existing_repos but no existing_files — repo exists, workflow file
+        # was never actually delivered to it.
+        fake_git = FakeGitProvider(existing_repos={repo})
+        app.state.git_provider = fake_git
+
+        client.post(f"/api/v1/agents/{agent_id}/deploy", headers=_bearer(token))
+
+    _repo, _branch, committed_files, _message = fake_git.committed_files[0]
+    assert ".github/workflows/panasa-deploy.yml" in committed_files
+
+
 async def test_deploy_git_provider_failure_returns_structured_502_not_bare_500(
     make_user_and_token,
 ) -> None:

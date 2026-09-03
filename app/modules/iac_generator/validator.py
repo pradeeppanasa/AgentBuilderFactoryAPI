@@ -36,7 +36,12 @@ from typing import Any
 
 import hcl2
 
-from app.modules.iac_generator.naming import bedrock_guardrail_name
+from app.modules.iac_generator.naming import (
+    alb_name,
+    bedrock_guardrail_name,
+    opensearch_collection_name,
+    target_group_name,
+)
 from app.modules.iac_generator.validation_models import CheckResult, IaCValidationReport
 from app.modules.registry.models import AgentConfiguration
 from app.shared.logging import get_logger
@@ -45,11 +50,42 @@ log = get_logger()
 
 _LAMBDA_ASSUME_SERVICE = "lambda.amazonaws.com"
 
-# Actions AWS defines with no resource-level IAM permissions at all — a bare
-# Resource = "*" is the API's own constraint here, not a least-privilege
-# gap. Same documented-exception pattern as bootstrap/stage0/iam.tf's
-# ecs:RegisterTaskDefinition statement. Extend deliberately, not casually.
-_RESOURCE_WILDCARD_EXEMPT_ACTIONS = frozenset({"xray:PutTraceSegments", "xray:PutTelemetryRecords"})
+# Two justified categories of Resource = "*", each requiring its own
+# comment at the call site explaining which one applies — extend
+# deliberately, not casually:
+#
+#   1. Actions AWS defines with NO resource-level IAM permissions at all —
+#      a bare Resource = "*" is the API's own constraint, not a
+#      least-privilege gap. xray:Put*, ecr:GetAuthorizationToken (account-
+#      wide token, not scoped to any one repo). Same documented-exception
+#      pattern as bootstrap/stage0/iam.tf's ecs:RegisterTaskDefinition
+#      statement.
+#   2. Actions that DO support resource-level scoping in principle, but
+#      the specific ARN isn't derivable inside a generated agent's own
+#      Terraform — only for a shared, non-sensitive resource every agent
+#      equally needs (never for anything agent-specific or secret):
+#        - ecr:BatchCheckLayerAvailability/GetDownloadUrlForLayer/
+#          BatchGetImage — the one shared agent-runtime image every
+#          agent's ECS task pulls (authentication.tf.j2's
+#          agent_ecs_image_pull); its repo ARN is a customer-supplied
+#          deploy target (tfvars.py), not a resource this Terraform
+#          creates.
+#        - bedrock:InvokeModel/InvokeModelWithResponseStream — the whole
+#          point of a config-driven model_id/model_provider
+#          (authentication.tf.j2's agent_llm_inference) is that it isn't
+#          knowable at Terraform render time.
+_RESOURCE_WILDCARD_EXEMPT_ACTIONS = frozenset(
+    {
+        "xray:PutTraceSegments",
+        "xray:PutTelemetryRecords",
+        "ecr:GetAuthorizationToken",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchGetImage",
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream",
+    }
+)
 
 # resource type -> its user-facing "identity" attribute, for the naming
 # convention check. Deliberately an explicit allowlist rather than "check
@@ -73,6 +109,8 @@ _NAMEABLE_RESOURCE_TYPES: dict[str, str] = {
     "aws_opensearchserverless_collection": "name",
     "aws_bedrockagent_knowledge_base": "name",
     "aws_lambda_function": "function_name",
+    "aws_lb": "name",
+    "aws_lb_target_group": "name",
 }
 
 # Resource types the generated templates tag (app/modules/iac_generator/
@@ -97,6 +135,8 @@ _TAGGABLE_RESOURCE_TYPES = frozenset(
         "aws_opensearchserverless_collection",
         "aws_bedrockagent_knowledge_base",
         "aws_lambda_function",
+        "aws_lb",
+        "aws_lb_target_group",
     }
 )
 _REQUIRED_TAG_KEYS = frozenset({"agent_id", "tenant_id", "version", "managed_by"})
@@ -274,6 +314,16 @@ def _check_naming_convention(blocks: list[ResourceBlock], agent_id: str) -> Chec
     # check compares against that exact expected name rather than the
     # literal panasa-{agent_id}- prefix every other resource type uses.
     expected_guardrail_name = bedrock_guardrail_name(agent_id)
+    # Application Load Balancers and target groups are capped at 32 chars —
+    # tighter than the guardrail's 50 — so they get the exact same
+    # truncated-name special case (Generic Agent Runtime instruction,
+    # 2026-09-03).
+    expected_truncated_names = {
+        "aws_bedrock_guardrail": expected_guardrail_name,
+        "aws_lb": alb_name(agent_id),
+        "aws_lb_target_group": target_group_name(agent_id),
+        "aws_opensearchserverless_collection": opensearch_collection_name(agent_id),
+    }
     violations = []
     for block in blocks:
         attr = _NAMEABLE_RESOURCE_TYPES.get(block.resource_type)
@@ -282,11 +332,12 @@ def _check_naming_convention(blocks: list[ResourceBlock], agent_id: str) -> Chec
         value = block.attrs.get(attr)
         if not isinstance(value, str):
             continue
-        if block.resource_type == "aws_bedrock_guardrail":
-            if value != expected_guardrail_name:
+        expected = expected_truncated_names.get(block.resource_type)
+        if expected is not None:
+            if value != expected:
                 violations.append(
                     f"{block.resource_type}.{block.resource_name}.{attr} = {value!r} "
-                    f"(expected {expected_guardrail_name!r})"
+                    f"(expected {expected!r})"
                 )
             continue
         if not value.startswith(prefix):

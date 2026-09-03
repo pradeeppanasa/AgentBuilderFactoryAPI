@@ -23,13 +23,18 @@ _API_BASE = "https://api.github.com"
 # can briefly 404 on that commit's tree sha while it propagates — seen in
 # practice building a tree on top of a just-created repo's base_tree.
 # Retry with backoff rather than surfacing a transient 404 as a deploy
-# failure. Observed delays have exceeded 4s in practice, so this budgets
-# ~30s worst case (1+2+4+8+8+8), capping growth rather than letting it run
-# away — deploy_agent() awaits this inline and the UI's http client has no
-# request timeout, so a generous ceiling here is safe.
-_TREE_PROPAGATION_ATTEMPTS = 7
+# failure. Widened twice now: an initial 4-attempt/0.5s-base budget (~4.5s
+# worst case) proved too tight, then a 7-attempt/1s-8s-capped budget
+# (~30s worst case) *also* proved too tight — reproduced live, a deploy's
+# tree-creation call still 404'd after exhausting all 7 attempts, and the
+# identical call succeeded moments later when retried by hand. Budgets
+# ~75s worst case now (1+2+4+8+15+15+15+15 across 8 waits, 9 attempts),
+# capping growth rather than letting it run away — deploy_agent() awaits
+# this inline and the UI's http client has no request timeout, so a
+# generous ceiling here is safe.
+_TREE_PROPAGATION_ATTEMPTS = 9
 _TREE_PROPAGATION_BASE_DELAY_SECONDS = 1.0
-_TREE_PROPAGATION_MAX_DELAY_SECONDS = 8.0
+_TREE_PROPAGATION_MAX_DELAY_SECONDS = 15.0
 
 
 class GitHubProvider(GitProvider):
@@ -110,6 +115,16 @@ class GitHubProvider(GitProvider):
             json={"ref": f"refs/heads/{branch}", "sha": base_sha},
         )
         response.raise_for_status()
+
+    async def file_exists(self, repo: str, path: str, branch: str = "main") -> bool:
+        slug = self._repo(repo)
+        response = await self._client.get(
+            f"/repos/{slug}/contents/{path}", params={"ref": branch}
+        )
+        if response.status_code == 404:
+            return False
+        response.raise_for_status()
+        return True
 
     async def commit_files(
         self, repo: str, branch: str, files: dict[str, str], message: str

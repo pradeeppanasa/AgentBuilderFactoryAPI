@@ -141,6 +141,12 @@ class ToolConfig(BaseModel):
     tool_name: str
     executor_type: str  # http | lambda | sql | mcp | builtin
     endpoint: str | None = None
+    endpoint_cidr: str | None = None
+    """F6/R17 default-deny egress — the CIDR the generated
+    base/network.tf.j2 security group allowlists for this tool's `endpoint`
+    (its own `variable "tool_{tool_id}_cidr"`). Only meaningful alongside
+    `endpoint`; the admin who wires up an HTTP tool with a real endpoint is
+    the one who knows what IP range it resolves to."""
     lambda_arn: str | None = None
     input_schema: dict[str, Any] = Field(default_factory=dict)
     credentials_secret_arn: str | None = None  # Reference ONLY — never the secret value

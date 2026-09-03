@@ -8,8 +8,12 @@ resource "aws_sns_topic" "human_review_notifications" {
 }
 
 resource "aws_sqs_queue" "human_review_queue" {
-  name                       = "panasa-{{ agent_id }}-human-review"
-  visibility_timeout_seconds = {{ agent.human_review.approval_timeout_hours * 3600 }}
+  name = "panasa-{{ agent_id }}-human-review"
+  # AWS caps SQS visibility_timeout_seconds at 43200 (12h) — approval_timeout_hours
+  # can be configured well beyond that (HumanReviewConfig's own default,
+  # 24h, already exceeds it), so this clamps rather than passing the raw
+  # value straight through and failing terraform_validate/apply.
+  visibility_timeout_seconds = {{ [agent.human_review.approval_timeout_hours * 3600, 43200] | min }}
 {{ macros.panasa_tags(agent_id, tenant_id, version) }}
 }
 

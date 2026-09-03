@@ -6,6 +6,7 @@ R08: PUT/rollback never overwrite a version — they always create a new one.
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -41,6 +42,7 @@ from app.modules.git_provider._util import agent_repo_identifier
 from app.modules.git_provider.base import GitProvider
 from app.modules.iac_generator.cicd_templates import generate_cicd_workflow
 from app.modules.iac_generator.generator import IaCGenerator
+from app.modules.iac_generator.tfvars import render_terraform_tfvars
 from app.modules.iac_generator.validation_models import (
     IaCValidationReport,
     TerraformValidationMode,
@@ -677,17 +679,51 @@ async def _trigger_deployment(
                 agent_id=agent_id, version=version, deployment_id=deployment_id
             ),
         }
-        if not repo_already_existed:
-            # Section 45.6/R58 — the workflow file is a per-repo artifact,
-            # committed once alongside the repo's very first Terraform.
-            # Changing the tenant's cicd_provider/approval_mode later never
-            # rewrites an already-created repo's workflow file (same
-            # "read once, at creation" rule as approval_mode itself — see
-            # PlatformSettingsRecord.cicd_provider's docstring).
-            workflow_path, workflow_content = generate_cicd_workflow(
-                tenant_settings.cicd_provider, approval_mode
-            )
+        # Section 45.6/R58 — the workflow file is a per-repo artifact,
+        # committed once alongside the repo's first real Terraform content.
+        # Changing the tenant's cicd_provider/approval_mode later never
+        # rewrites an already-committed workflow file (same "read once, at
+        # creation" rule as approval_mode itself — see
+        # PlatformSettingsRecord.cicd_provider's docstring).
+        #
+        # `repo_already_existed` alone isn't a reliable "already committed"
+        # signal: create_repository() can succeed and then this same
+        # attempt's commit_files() call can still fail (expired token,
+        # transient network error) before ever writing the workflow file —
+        # a retried deploy then sees an existing repo that never actually
+        # got it. Checking the file's real presence on the default branch
+        # covers both the normal v2+ case (already there, skip) and that
+        # failed-first-attempt case (repo exists, file doesn't).
+        workflow_path, workflow_content = generate_cicd_workflow(
+            tenant_settings.cicd_provider, approval_mode, agent_id
+        )
+        if not repo_already_existed or not await git_provider.file_exists(
+            repo, workflow_path, branch=settings.git_default_branch
+        ):
             files[workflow_path] = workflow_content
+
+        # Generic Agent Runtime instruction (2026-09-03) — unlike the
+        # workflow file above, tfvars values are as config-driven as the
+        # Terraform itself: regenerated on every deploy so a tenant fixing
+        # a wrong VPC ID/subnet takes effect on the very next deploy rather
+        # than being stuck like the workflow file deliberately is.
+        files[f"terraform/agents/{agent_id}/terraform.auto.tfvars.json"] = render_terraform_tfvars(
+            tenant_settings, settings.aws_region, configuration, iac_result.modules
+        )
+
+        # Part 6 — the generated workflow's final step POSTs this file's
+        # content straight to POST /internal/deployment-complete after a
+        # real terraform apply succeeds. Regenerated every deploy (this
+        # exact deployment_id/version pair only exists for this one run).
+        files[f"terraform/agents/{agent_id}/deployment-metadata.json"] = json.dumps(
+            {
+                "agent_id": agent_id,
+                "tenant_id": tenant_id,
+                "deployment_id": deployment_id,
+                "version": version,
+                "status": "ACTIVE",
+            }
+        )
 
         pull_request_id: str | None
         if repo_already_existed:

@@ -66,6 +66,31 @@ os.environ["SEED_RUNS_ENABLED"] = "false"
 # background pytest run. Tests that want it enabled do so explicitly via
 # monkeypatch, same pattern as DEV_VALIDATION_EXTENDED_MODES_ENABLED above.
 os.environ["SIMULATE_DEPLOYMENT_PIPELINE"] = "false"
+# That fix above was incomplete: app.state.iac_validator (app/main.py) is
+# built from settings.terraform_binary_path unconditionally at startup —
+# not gated by SIMULATE_DEPLOYMENT_PIPELINE at all — and IaCScanRunner reads
+# settings.tfsec_binary_path/checkov_python_path the same way. Any test that
+# exercises either (e.g. POST /agents/{id}/generate-iac, which always runs
+# the real IaCValidator per its own docstring) still picked up a developer's
+# real absolute tool paths from .env and shelled out for real — reproduced:
+# with only the override above, the full suite still spawned a real
+# `terraform.exe` (the real Winget-installed absolute path from .env) against
+# real generated Terraform (real provider blocks -> `terraform init` tries to
+# fetch the AWS provider plugin from the network) and hung for minutes.
+#
+# Deliberately NOT the plain "terraform"/"tfsec" command names: on a dev
+# machine that has either genuinely on PATH (as this one does — installed
+# earlier in this session for manual testing), that would still shell out
+# for real, just non-deterministically depending on what happens to be
+# installed. A binary name guaranteed not to exist anywhere forces
+# subprocess.run's FileNotFoundError every time, which is exactly what
+# validator.py's/iac_scan_runner.py's own "tool not found -> skip,
+# passed=True" fallback is designed to handle — the automated suite's
+# baseline must be deterministic regardless of the dev machine's tool
+# installs, same rationale as every override above.
+os.environ["TERRAFORM_BINARY_PATH"] = "panasa-test-terraform-not-installed"
+os.environ["TFSEC_BINARY_PATH"] = "panasa-test-tfsec-not-installed"
+os.environ["CHECKOV_PYTHON_PATH"] = ""
 os.environ.setdefault("JWT_SECRET_ARN", "jwt-secret")
 os.environ.setdefault("IAC_OUTPUT_BUCKET", "panasa-iac-artifacts-test")
 os.environ.setdefault("AUDIT_S3_BUCKET", "panasa-audit-test")

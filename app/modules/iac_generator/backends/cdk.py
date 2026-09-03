@@ -16,6 +16,7 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from app.config import Settings
 from app.modules.iac_generator.backends.base import IaCBackend
 from app.modules.registry.models import AgentConfiguration
 
@@ -44,8 +45,10 @@ class CDKBackend(IaCBackend):
         version: int,
         config: AgentConfiguration,
         resolved_modules: list[str],
+        settings: Settings | None = None,
     ) -> dict[str, str]:
-        # tenant_id: not yet consumed here — see IaCBackend.render's docstring.
+        # tenant_id/settings: not yet consumed here — see IaCBackend.render's docstring.
+        del settings
         context = {"agent_id": agent_id, "version": version, "agent": config}
         files: dict[str, str] = {}
 

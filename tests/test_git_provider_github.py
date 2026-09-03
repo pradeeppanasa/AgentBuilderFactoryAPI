@@ -45,6 +45,15 @@ class _Recorder:
         if method == "GET" and path == "/repos/acme/panasa-agent-iac/git/ref/heads/main":
             return httpx.Response(200, json={"object": {"sha": "base-sha"}})
 
+        if method == "GET" and path == "/repos/acme/panasa-agent-iac/contents/README.md":
+            return httpx.Response(200, json={"name": "README.md"})
+
+        if (
+            method == "GET"
+            and path == "/repos/acme/panasa-agent-iac/contents/.github/workflows/panasa-deploy.yml"
+        ):
+            return httpx.Response(404, json={"message": "Not Found"})
+
         if method == "POST" and path == "/repos/acme/panasa-agent-iac/git/refs":
             return httpx.Response(201, json={"ref": "refs/heads/deploy-branch"})
 
@@ -187,6 +196,21 @@ async def test_commit_files_retries_tree_creation_on_transient_404(
 
 async def _immediate() -> None:
     return None
+
+
+async def test_file_exists_true_for_200(provider: GitHubProvider, recorder: _Recorder) -> None:
+    assert await provider.file_exists(REPO, "README.md", branch="main") is True
+
+    request = recorder.requests[-1]
+    assert request.url.path == "/repos/acme/panasa-agent-iac/contents/README.md"
+    assert dict(request.url.params) == {"ref": "main"}
+
+
+async def test_file_exists_false_for_404(provider: GitHubProvider, recorder: _Recorder) -> None:
+    exists = await provider.file_exists(
+        REPO, ".github/workflows/panasa-deploy.yml", branch="main"
+    )
+    assert exists is False
 
 
 async def test_create_branch_fetches_base_sha_and_creates_ref(

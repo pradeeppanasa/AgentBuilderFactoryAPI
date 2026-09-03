@@ -86,7 +86,10 @@ def test_terraform_output_files_are_scoped_to_agent_and_module() -> None:
     modules = resolve_required_modules(config)
     files = terraform_backend.render("agent-42", "tenant-a", 3, config, modules)
     assert all(path.startswith("terraform/agents/agent-42/") for path in files)
-    assert any("/tools/" in path for path in files)
+    # Flat layout, not nested per-module directories (Generic Agent Runtime
+    # instruction, 2026-09-03) — terraform init/apply only look at .tf files
+    # sitting directly in the working directory they're run from.
+    assert any("/tools__" in path for path in files)
 
 
 # ── CDK backend ──────────────────────────────────────────────────────────
@@ -179,7 +182,7 @@ async def test_generator_uploads_zip_and_returns_metadata() -> None:
     obj = s3_client.get_object(Bucket=TEST_IAC_BUCKET, Key=result.s3_key)
     with zipfile.ZipFile(io.BytesIO(obj["Body"].read())) as archive:
         names = archive.namelist()
-        assert any(name.startswith("terraform/agents/agent-99/tools/") for name in names)
+        assert any(name.startswith("terraform/agents/agent-99/tools__") for name in names)
 
 
 async def test_generator_switches_backend_via_settings(monkeypatch: pytest.MonkeyPatch) -> None:

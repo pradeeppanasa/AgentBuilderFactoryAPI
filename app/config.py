@@ -201,6 +201,18 @@ class Settings(BaseSettings):
     jwt_access_token_expire_minutes: int = 30
     jwt_refresh_token_expire_days: int = 30
 
+    # ── Internal webhook (Generic Agent Runtime instruction, 2026-09-03) ──
+    # POST /api/v1/internal/deployment-complete — the customer CI/CD's
+    # final step calls this after a real terraform apply succeeds, since
+    # it has no other way to tell the Runtime a deployment finished (F2's
+    # "customer CI/CD writes directly to DynamoDB" describes a Lambda/
+    # Step-Functions pipeline this codebase doesn't actually run yet; a
+    # plain GitHub Actions `curl` is what's real today). None disables the
+    # endpoint (401 on every call) rather than leaving it open — a tenant
+    # must explicitly configure this shared secret before external CI/CD
+    # can flip any agent's status.
+    internal_webhook_secret: str | None = None
+
     # ── Database (Phase 3 — user accounts) ─────────────────────────────
     database_url: str = "postgresql+asyncpg://panasa:panasa@localhost:5432/panasa_agent_builder"
 

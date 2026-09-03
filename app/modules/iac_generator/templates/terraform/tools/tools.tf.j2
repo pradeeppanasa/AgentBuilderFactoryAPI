@@ -5,7 +5,10 @@
 
 {% for tool in agent.tools %}
 resource "aws_lambda_function" "tool_{{ tool.tool_id | replace("-", "_") }}" {
-  function_name = "panasa-{{ agent_id }}-tool-{{ tool.tool_id }}"
+  # tool_lambda_name()/tool_role_name() (naming.py) truncate for long
+  # agent_id+tool_id combinations — AWS caps Lambda function names and IAM
+  # role names at 64 characters each.
+  function_name = "{{ tool_lambda_name(agent_id, tool.tool_id) }}"
   role          = aws_iam_role.tool_{{ tool.tool_id | replace("-", "_") }}_role.arn
   handler       = "handler.lambda_handler"
   runtime       = "python3.12"
@@ -26,7 +29,7 @@ resource "aws_lambda_function" "tool_{{ tool.tool_id | replace("-", "_") }}" {
 }
 
 resource "aws_iam_role" "tool_{{ tool.tool_id | replace("-", "_") }}_role" {
-  name = "panasa-{{ agent_id }}-tool-{{ tool.tool_id }}-role"
+  name = "{{ tool_role_name(agent_id, tool.tool_id) }}"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -55,3 +58,29 @@ resource "aws_iam_role_policy" "tool_{{ tool.tool_id | replace("-", "_") }}_secr
 }
 {% endif %}
 {% endfor %}
+
+{% if agent.tools %}
+resource "aws_iam_role_policy" "agent_invoke_tools" {
+  # tool_executor.py — the ECS task role (agent_execution_role,
+  # authentication.tf) needs permission to invoke its own agent's tool
+  # Lambdas defined above. Distinct from each tool's OWN role
+  # (tool_*_role, granted only secretsmanager:GetSecretValue on its one
+  # credential) — that role is who the Lambda runs as, this is who's
+  # allowed to invoke it.
+  name = "panasa-{{ agent_id }}-invoke-tools"
+  role = aws_iam_role.agent_execution_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = "lambda:InvokeFunction"
+      Resource = [
+{% for tool in agent.tools %}
+        aws_lambda_function.tool_{{ tool.tool_id | replace("-", "_") }}.arn{{ "," if not loop.last }}
+{% endfor %}
+      ]
+    }]
+  })
+}
+{% endif %}

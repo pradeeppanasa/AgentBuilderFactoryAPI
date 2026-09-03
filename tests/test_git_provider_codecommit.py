@@ -31,9 +31,19 @@ class _FakeCodeCommitClient:
             {"main": "commit-0"} if REPO_NAME in self.repositories else {}
         )
         self.pull_requests: dict[str, dict[str, Any]] = {}
+        self.files_by_branch: dict[str, set[str]] = {}
         self._commit_counter = 0
         self._pr_counter = 0
         self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def get_file(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("get_file", kwargs))
+        branch = kwargs["commitSpecifier"]
+        if branch not in self.branches:
+            raise _client_error("CommitDoesNotExistException", "GetFile")
+        if kwargs["filePath"] not in self.files_by_branch.get(branch, set()):
+            raise _client_error("FileDoesNotExistException", "GetFile")
+        return {"filePath": kwargs["filePath"]}
 
     def get_repository(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("get_repository", kwargs))
@@ -152,6 +162,27 @@ async def test_commit_files_into_brand_new_repo_omits_parent_commit_id(
     assert fake_client.branches["main"] == "commit-1"
     commit_call = next(c for c in fake_client.calls if c[0] == "create_commit")
     assert "parentCommitId" not in commit_call[1]
+
+
+async def test_file_exists_true_when_present_on_branch(
+    provider: CodeCommitProvider, fake_client: _FakeCodeCommitClient
+) -> None:
+    fake_client.files_by_branch["main"] = {"README.md"}
+    assert await provider.file_exists(REPO_NAME, "README.md", branch="main") is True
+
+
+async def test_file_exists_false_when_absent_on_branch(
+    provider: CodeCommitProvider, fake_client: _FakeCodeCommitClient
+) -> None:
+    exists = await provider.file_exists(REPO_NAME, "buildspec.yml", branch="main")
+    assert exists is False
+
+
+async def test_file_exists_false_when_branch_does_not_exist(
+    provider: CodeCommitProvider, fake_client: _FakeCodeCommitClient
+) -> None:
+    exists = await provider.file_exists(REPO_NAME, "buildspec.yml", branch="does-not-exist")
+    assert exists is False
 
 
 async def test_create_branch(

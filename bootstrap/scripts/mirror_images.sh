@@ -26,6 +26,7 @@ IMAGES=(
   "langfuse-web:${LANGFUSE_VERSION}"
   "langfuse-worker:${LANGFUSE_VERSION}"
   "code-sandbox:${VERSION}"
+  "agent-runtime:${VERSION}"
 )
 
 for IMAGE in "${IMAGES[@]}"; do

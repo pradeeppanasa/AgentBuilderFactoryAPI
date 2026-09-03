@@ -169,6 +169,84 @@ async def test_save_and_read_back_git_org_and_aws_region(make_user_and_token) ->
         assert cleared.json()["aws_region"] == "us-east-1"
 
 
+async def test_deployment_settings_aws_target_defaults_unconfigured(
+    make_user_and_token,
+) -> None:
+    """"Settings -> Deployment -> AWS Target" (Generic Agent Runtime wiring)
+    — all None/empty until the tenant configures a real deploy target."""
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/admin/settings/deployment", headers=_bearer(admin_token))
+
+    body = response.json()
+    assert body["agent_vpc_id"] is None
+    assert body["agent_subnet_ids"] == []
+    assert body["agent_ecs_cluster_arn"] is None
+    assert body["agent_runtime_ecr_registry"] is None
+    assert body["bedrock_endpoint_cidr"] is None
+    assert body["opensearch_endpoint_cidr"] is None
+
+
+async def test_save_and_read_back_aws_target_settings(make_user_and_token) -> None:
+    _, admin_token = await make_user_and_token(TENANT_A, role="admin")
+
+    with TestClient(app) as client:
+        saved = client.patch(
+            "/api/v1/admin/settings/deployment",
+            json={
+                "default_approval_mode": "automated",
+                "agent_vpc_id": "vpc-0123456789abcdef0",
+                "agent_subnet_ids": ["subnet-aaa", "subnet-bbb"],
+                "agent_ecs_cluster_arn": "arn:aws:ecs:eu-west-2:111122223333:cluster/acme",
+                "agent_runtime_ecr_registry": (
+                    "111122223333.dkr.ecr.eu-west-2.amazonaws.com/agent-runtime"
+                ),
+                "bedrock_endpoint_cidr": "10.0.1.0/24",
+                "opensearch_endpoint_cidr": "10.0.2.0/24",
+            },
+            headers=_bearer(admin_token),
+        )
+        assert saved.status_code == 200
+        saved_body = saved.json()
+        assert saved_body["agent_vpc_id"] == "vpc-0123456789abcdef0"
+        assert saved_body["agent_subnet_ids"] == ["subnet-aaa", "subnet-bbb"]
+        assert saved_body["agent_ecs_cluster_arn"] == (
+            "arn:aws:ecs:eu-west-2:111122223333:cluster/acme"
+        )
+        assert saved_body["agent_runtime_ecr_registry"] == (
+            "111122223333.dkr.ecr.eu-west-2.amazonaws.com/agent-runtime"
+        )
+        assert saved_body["bedrock_endpoint_cidr"] == "10.0.1.0/24"
+        assert saved_body["opensearch_endpoint_cidr"] == "10.0.2.0/24"
+
+        # Omitting on a later save keeps them.
+        resaved = client.patch(
+            "/api/v1/admin/settings/deployment",
+            json={"default_approval_mode": "manual"},
+            headers=_bearer(admin_token),
+        )
+        assert resaved.json()["agent_vpc_id"] == "vpc-0123456789abcdef0"
+        assert resaved.json()["agent_subnet_ids"] == ["subnet-aaa", "subnet-bbb"]
+
+        # Explicit empty clears back to unconfigured.
+        cleared = client.patch(
+            "/api/v1/admin/settings/deployment",
+            json={
+                "default_approval_mode": "manual",
+                "agent_vpc_id": "",
+                "agent_subnet_ids": [],
+            },
+            headers=_bearer(admin_token),
+        )
+        assert cleared.json()["agent_vpc_id"] is None
+        assert cleared.json()["agent_subnet_ids"] == []
+        # Untouched fields stay put.
+        assert cleared.json()["agent_ecs_cluster_arn"] == (
+            "arn:aws:ecs:eu-west-2:111122223333:cluster/acme"
+        )
+
+
 async def test_validate_s3_bucket_accessible(make_user_and_token) -> None:
     import boto3
 

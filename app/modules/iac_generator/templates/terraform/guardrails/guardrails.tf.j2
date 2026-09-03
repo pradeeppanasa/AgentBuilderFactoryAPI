@@ -45,9 +45,37 @@ resource "aws_iam_role_policy" "guardrail_invoke" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
+      Effect = "Allow"
+      Action = "bedrock:ApplyGuardrail"
+      # NOT aws_bedrock_guardrail.agent_guardrail.guardrail_arn above: the
+      # guardrail this agent's runtime actually calls at request time is
+      # whichever one its GuardrailConfig references, provisioned by the
+      # Factory Runtime's own API directly against Bedrock
+      # (app/modules/guardrails/provisioner.py, GuardrailPolicyRecord.
+      # bedrock_guardrail_id) — a separate, already-working provisioning
+      # path from this Terraform resource, which exists for the IaC
+      # validation suite's structural checks but isn't what's actually
+      # invoked. Scoped to any guardrail in this account/region rather
+      # than the one specific (unused-at-runtime) ARN above.
+      Resource = "arn:aws:bedrock:${var.aws_region}:${data.aws_caller_identity.current.account_id}:guardrail/*"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "guardrail_config_read" {
+  # guardrail.py resolves AgentConfiguration.guardrail_policy_id ->
+  # bedrock_guardrail_id by reading its own tenant's row in the guardrail
+  # policy catalog (see agent_kb_retrieve's comment above for the same
+  # pattern applied to Knowledge Bases).
+  name = "panasa-{{ agent_id }}-guardrail-config-read"
+  role = aws_iam_role.agent_execution_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
       Effect   = "Allow"
-      Action   = "bedrock:ApplyGuardrail"
-      Resource = aws_bedrock_guardrail.agent_guardrail.guardrail_arn
+      Action   = "dynamodb:GetItem"
+      Resource = "arn:aws:dynamodb:${var.aws_region}:${data.aws_caller_identity.current.account_id}:table/{{ dynamodb_guardrail_policies_table }}"
     }]
   })
 }

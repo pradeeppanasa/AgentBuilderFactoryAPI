@@ -58,6 +58,14 @@ class BitbucketProvider(GitProvider):
         )
         response.raise_for_status()
 
+    async def file_exists(self, repo: str, path: str, branch: str = "main") -> bool:
+        slug = self._repo(repo)
+        response = await self._client.get(f"/repositories/{slug}/src/{branch}/{path}")
+        if response.status_code == 404:
+            return False
+        response.raise_for_status()
+        return True
+
     async def commit_files(
         self, repo: str, branch: str, files: dict[str, str], message: str
     ) -> str:

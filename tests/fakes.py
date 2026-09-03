@@ -18,8 +18,16 @@ from app.modules.git_provider.base import GitProvider
 class FakeGitProvider(GitProvider):
     """Records calls instead of talking to a real git host."""
 
-    def __init__(self, existing_repos: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        existing_repos: set[str] | None = None,
+        existing_files: set[str] | None = None,
+    ) -> None:
         self.existing_repos: set[str] = existing_repos or set()
+        self.existing_files: set[str] = existing_files or set()
+        """Paths that already exist on a repo's default branch — e.g. a
+        CI/CD workflow file committed by an earlier deploy. Not keyed by
+        repo since every test here exercises a single agent/repo."""
         self.created_repos: list[str] = []
         self.created_branches: list[tuple[str, str, str]] = []
         self.committed_files: list[tuple[str, str, dict[str, str], str]] = []
@@ -36,6 +44,9 @@ class FakeGitProvider(GitProvider):
 
     async def create_branch(self, repo: str, branch: str, from_branch: str = "main") -> None:
         self.created_branches.append((repo, branch, from_branch))
+
+    async def file_exists(self, repo: str, path: str, branch: str = "main") -> bool:
+        return path in self.existing_files
 
     async def commit_files(
         self, repo: str, branch: str, files: dict[str, str], message: str
@@ -84,6 +95,11 @@ class FailingGitProvider(GitProvider):
     async def create_branch(self, repo: str, branch: str, from_branch: str = "main") -> None:
         raise AssertionError(
             "create_branch should never be reached — repository_exists fails first"
+        )
+
+    async def file_exists(self, repo: str, path: str, branch: str = "main") -> bool:
+        raise AssertionError(
+            "file_exists should never be reached — repository_exists fails first"
         )
 
     async def commit_files(

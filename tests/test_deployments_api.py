@@ -46,6 +46,9 @@ class FakeGitProvider(GitProvider):
     async def create_branch(self, repo: str, branch: str, from_branch: str = "main") -> None:
         pass
 
+    async def file_exists(self, repo: str, path: str, branch: str = "main") -> bool:
+        return False
+
     async def commit_files(
         self, repo: str, branch: str, files: dict[str, str], message: str
     ) -> str:

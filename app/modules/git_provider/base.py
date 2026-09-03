@@ -38,6 +38,23 @@ class GitProvider(ABC):
     async def create_branch(self, repo: str, branch: str, from_branch: str = "main") -> None: ...
 
     @abstractmethod
+    async def file_exists(self, repo: str, path: str, branch: str = "main") -> bool:
+        """Does `path` already exist in `repo` on `branch`?
+
+        Used to decide whether a per-repo-lifetime artifact (the CI/CD
+        workflow file, Section 45.6/R58) still needs committing. Repo
+        existence alone (repository_exists()) isn't a reliable proxy for
+        this: create_repository() can succeed and then the very next
+        commit_files() call can fail (an expired git token, a transient
+        network error) before ever writing the workflow file — the repo
+        now "already exists" but never got its first real content. A
+        direct existence check on the file itself covers both the normal
+        v2+ case (already there, skip) and that failed-first-attempt edge
+        case (missing despite the repo existing) without conflating them.
+        """
+        ...
+
+    @abstractmethod
     async def commit_files(
         self, repo: str, branch: str, files: dict[str, str], message: str
     ) -> str:

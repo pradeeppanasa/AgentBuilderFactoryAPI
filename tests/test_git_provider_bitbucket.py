@@ -36,6 +36,14 @@ class _Recorder:
         if method == "POST" and path.endswith(f"/repositories/{SLUG}/refs/branches"):
             return httpx.Response(201, json={"name": "deploy-branch"})
 
+        if method == "GET" and path.endswith(f"/repositories/{SLUG}/src/main/README.md"):
+            return httpx.Response(200, text="# hello")
+
+        if method == "GET" and path.endswith(
+            f"/repositories/{SLUG}/src/main/bitbucket-pipelines.yml"
+        ):
+            return httpx.Response(404, json={"error": {"message": "Not found"}})
+
         if method == "POST" and path.endswith(f"/repositories/{SLUG}/src"):
             return httpx.Response(201, text="")
 
@@ -96,6 +104,19 @@ async def test_create_branch(provider: BitbucketProvider, recorder: _Recorder) -
     await provider.create_branch(REPO, "deploy-branch", from_branch="main")
     body = json.loads(recorder.requests[-1].content)
     assert body == {"name": "deploy-branch", "target": {"hash": "main"}}
+
+
+async def test_file_exists_true_for_200(
+    provider: BitbucketProvider, recorder: _Recorder
+) -> None:
+    assert await provider.file_exists(REPO, "README.md", branch="main") is True
+
+
+async def test_file_exists_false_for_404(
+    provider: BitbucketProvider, recorder: _Recorder
+) -> None:
+    exists = await provider.file_exists(REPO, "bitbucket-pipelines.yml", branch="main")
+    assert exists is False
 
 
 async def test_commit_files_pushes_then_reads_back_commit_hash(

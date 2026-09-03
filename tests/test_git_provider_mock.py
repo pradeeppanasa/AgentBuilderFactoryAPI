@@ -19,6 +19,7 @@ from app.modules.git_provider.mock import MockGitProvider
 async def test_mock_git_provider_never_raises() -> None:
     provider = MockGitProvider()
 
+    assert await provider.file_exists("https://github.com/org/repo", "README.md") is False
     await provider.create_branch("https://github.com/org/repo", "feature/x")
     commit_sha = await provider.commit_files(
         "https://github.com/org/repo", "feature/x", {"main.tf": "# empty"}, "message"

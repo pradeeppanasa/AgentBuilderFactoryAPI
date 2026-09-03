@@ -31,6 +31,10 @@ class MockGitProvider(GitProvider):
     async def create_branch(self, repo: str, branch: str, from_branch: str = "main") -> None:
         log.info("git.mock.create_branch", repo=repo, branch=branch, from_branch=from_branch)
 
+    async def file_exists(self, repo: str, path: str, branch: str = "main") -> bool:
+        log.info("git.mock.file_exists", repo=repo, path=path, branch=branch)
+        return False
+
     async def commit_files(
         self, repo: str, branch: str, files: dict[str, str], message: str
     ) -> str:

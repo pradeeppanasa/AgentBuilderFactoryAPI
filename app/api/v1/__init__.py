@@ -11,6 +11,7 @@ from app.api.v1 import (
     deployments,
     guardrail_policies,
     hitl,
+    internal,
     knowledge_bases,
     platform,
     playground,
@@ -39,6 +40,7 @@ router.include_router(projects.router)
 router.include_router(skills.router)
 router.include_router(prompts.router)
 router.include_router(hitl.router)
+router.include_router(internal.router)
 router.include_router(task_planner.router)
 router.include_router(admin_settings.router)
 router.include_router(audit_log.router)

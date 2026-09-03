@@ -20,6 +20,29 @@ resource "aws_security_group" "agent_sg" {
   description = "Default-deny egress; every rule below is explicit (R17)"
   vpc_id      = var.vpc_id
 
+  # Generic Agent Runtime instruction (2026-09-03): one shared security
+  # group for the API Gateway VPC Link's ENIs, the internal ALB (compute.tf),
+  # and the ECS task itself — self-referencing ingress covers both hops
+  # (VPC Link to ALB on 80, ALB to ECS task on 8080) without needing a
+  # separate security group per component. Ingress is unrelated to F6/R17's
+  # default-deny EGRESS principle below. AWS's security group description
+  # field rejects "->" (validated regex), hence "to" rather than an arrow.
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    self        = true
+    description = "API Gateway VPC Link to internal ALB"
+  }
+
+  ingress {
+    from_port   = 8080
+    to_port     = 8080
+    protocol    = "tcp"
+    self        = true
+    description = "Internal ALB to agent-runtime container"
+  }
+
   egress {
     from_port   = 443
     to_port     = 443
