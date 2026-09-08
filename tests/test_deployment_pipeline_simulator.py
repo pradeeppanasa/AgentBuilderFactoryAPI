@@ -19,12 +19,74 @@ from fastapi.testclient import TestClient
 from app.config import settings
 from app.main import app
 from app.modules.deployment.iac_scan_runner import IaCScanResult
-from app.modules.deployment.pipeline_simulator import DeploymentPipelineSimulator
+from app.modules.deployment.pipeline_simulator import (
+    DeploymentPipelineSimulator,
+    _format_security_findings,
+)
 from app.modules.iac_generator.validation_models import CheckResult, IaCValidationReport
-from app.modules.security.models import SecurityScanSummary
+from app.modules.security.models import SecurityFinding, SecurityScanSummary
 from tests.fakes import FakeGitProvider
 
 TENANT_A = "tenant-a"
+
+
+def test_format_security_findings_returns_bare_summary_when_no_findings() -> None:
+    """The stage's output_summary must stay exactly what it always was
+    when there's nothing to add — no dangling blank section."""
+    summary = SecurityScanSummary(
+        scan_type="iac_scan", passed=True, findings=[], summary="tfsec + checkov: 0 findings"
+    )
+
+    assert _format_security_findings(summary) == "tfsec + checkov: 0 findings"
+
+
+def test_format_security_findings_lists_each_finding_worst_first() -> None:
+    """The real bug this fixes: IaCScanRunner already computes full,
+    sanitised finding detail (severity/category/description/location) —
+    it was being thrown away, leaving only the aggregate counts a user had
+    already seen in the Console's own stage tracker with nowhere to go
+    look for what any of them actually were."""
+    summary = SecurityScanSummary(
+        scan_type="iac_scan",
+        passed=True,
+        findings=[
+            SecurityFinding(
+                scan_type="iac_scan",
+                severity="MEDIUM",
+                category="aws-s3-encryption",
+                description="Bucket not encrypted",
+                location="audit__audit.tf",
+            ),
+            SecurityFinding(
+                scan_type="iac_scan",
+                severity="CRITICAL",
+                category="iam_privilege_escalation",
+                description="Wildcard IAM action",
+                location="compute__compute.tf",
+            ),
+            SecurityFinding(
+                scan_type="iac_scan",
+                severity="HIGH",
+                category="aws-ecs-no-plaintext-secrets",
+                description="Plaintext secret in task definition",
+                location=None,
+            ),
+        ],
+        summary="tfsec + checkov: 1 critical, 1 high, 1 medium",
+    )
+
+    lines = _format_security_findings(summary).splitlines()
+
+    assert lines[0] == "tfsec + checkov: 1 critical, 1 high, 1 medium"
+    assert lines[1] == ""
+    assert lines[2].startswith("CRITICAL")
+    assert "iam_privilege_escalation" in lines[2]
+    assert "(compute__compute.tf)" in lines[2]
+    assert lines[3].startswith("HIGH")
+    assert "aws-ecs-no-plaintext-secrets" in lines[3]
+    assert "(" not in lines[3]  # no location supplied — no trailing "()"
+    assert lines[4].startswith("MEDIUM")
+    assert "(audit__audit.tf)" in lines[4]
 
 
 class _StubScanRunner:

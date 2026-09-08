@@ -14,6 +14,7 @@ from typing import Annotated, Any
 import redis.asyncio as redis
 from fastapi import Depends, Request
 
+from app.modules.audit.security_log import SecurityAuditLogStore
 from app.modules.audit.writer import AuditWriter
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
@@ -40,12 +41,14 @@ from app.modules.platform_settings.store import PlatformSettingsStore
 from app.modules.playground.store import PlaygroundSessionStore
 from app.modules.projects.store import ProjectStore
 from app.modules.prompts.store import PromptStore
+from app.modules.registry.config_validator import AgentConfigValidator
 from app.modules.registry.store import AgentRegistryStore
 from app.modules.runs.store import RunStore
 from app.modules.secrets.manager import SecretsManager
 from app.modules.skills.store import SkillStore
 from app.modules.task_planner.session_store import BuildWithAISessionStore
 from app.modules.telemetry.emitter import TelemetryConfig, TelemetryEmitter
+from app.modules.tool_registry.store import ToolRegistryStore
 
 
 async def get_tenant_id(current_user: Annotated[CurrentUser, Depends(get_current_user)]) -> str:
@@ -123,6 +126,21 @@ async def get_metrics_emitter(request: Request) -> MetricsEmitter:
 async def get_audit_writer(request: Request) -> AuditWriter:
     writer: AuditWriter = request.app.state.audit_writer
     return writer
+
+
+async def get_security_audit_log_store(request: Request) -> SecurityAuditLogStore:
+    store: SecurityAuditLogStore = request.app.state.security_audit_log_store
+    return store
+
+
+async def get_tool_registry_store(request: Request) -> ToolRegistryStore:
+    store: ToolRegistryStore = request.app.state.tool_registry_store
+    return store
+
+
+async def get_agent_config_validator(request: Request) -> AgentConfigValidator:
+    validator: AgentConfigValidator = request.app.state.agent_config_validator
+    return validator
 
 
 async def get_platform_version_service(request: Request) -> PlatformVersionService:

@@ -67,8 +67,14 @@ class BitbucketProvider(GitProvider):
         return True
 
     async def commit_files(
-        self, repo: str, branch: str, files: dict[str, str], message: str
+        self,
+        repo: str,
+        branch: str,
+        files: dict[str, str],
+        message: str,
+        omit_base_tree: bool = False,  # GitHub-only optimisation — see base.py; no-op here
     ) -> str:
+        del omit_base_tree
         slug = self._repo(repo)
         form_files = {path: (None, content.encode("utf-8")) for path, content in files.items()}
         response = await self._client.post(

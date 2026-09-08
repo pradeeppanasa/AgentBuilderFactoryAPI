@@ -79,3 +79,15 @@ output "runtime_env_summary" {
 output "platform_upgrade_state_machine_arn" {
   value = aws_sfn_state_machine.platform_upgrade.arn
 }
+
+# Sprint 3 Phase 6 (S-04) — for the GitHub Secrets setup docs: the
+# customer sets AWS_ACCOUNT_ID (this account's ID) and AWS_REGION in
+# every agent repo's GitHub Secrets; AWS_ACCESS_KEY_ID/
+# AWS_SECRET_ACCESS_KEY are never set at all. panasa_deploy_role_arn
+# itself is not a secret a workflow needs — it's assembled from
+# AWS_ACCOUNT_ID + the fixed role name — but is surfaced here so an
+# operator can confirm bootstrap created the expected role before the
+# first real deploy.
+output "panasa_deploy_role_arn" {
+  value = aws_iam_role.panasa_deploy.arn
+}

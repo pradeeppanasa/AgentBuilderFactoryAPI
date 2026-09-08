@@ -7,17 +7,21 @@ R08: PUT/rollback never overwrite a version — they always create a new one.
 from __future__ import annotations
 
 import json
+import secrets
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Literal
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+import redis.asyncio as redis
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.dependencies import (
+    get_agent_config_validator,
     get_audit_writer,
     get_deployment_orchestrator,
     get_deployment_status_store,
@@ -27,9 +31,14 @@ from app.dependencies import (
     get_metrics_emitter,
     get_pipeline_simulator,
     get_platform_settings_store,
+    get_redis_client,
     get_registry_store,
+    get_secrets_manager,
+    get_security_audit_log_store,
     get_tenant_id,
 )
+from app.middleware.rate_limit import check_reveal_rate_limit
+from app.modules.audit.security_log import SecurityAuditLogStore
 from app.modules.audit.writer import AuditEvent, AuditWriter
 from app.modules.auth.dependencies import require_role
 from app.modules.auth.schemas import CurrentUser
@@ -40,8 +49,10 @@ from app.modules.deployment.pipeline_simulator import DeploymentPipelineSimulato
 from app.modules.deployment.status_store import DeploymentStatusStore
 from app.modules.git_provider._util import agent_repo_identifier
 from app.modules.git_provider.base import GitProvider
+from app.modules.git_provider.github import MissingWorkflowScopeError
 from app.modules.iac_generator.cicd_templates import generate_cicd_workflow
 from app.modules.iac_generator.generator import IaCGenerator
+from app.modules.iac_generator.policy_check_script import generate_policy_check_script
 from app.modules.iac_generator.tfvars import render_terraform_tfvars
 from app.modules.iac_generator.validation_models import (
     IaCValidationReport,
@@ -50,6 +61,7 @@ from app.modules.iac_generator.validation_models import (
 from app.modules.iac_generator.validator import IaCValidator
 from app.modules.observability.metrics import MetricsEmitter
 from app.modules.platform_settings.store import PlatformSettingsStore
+from app.modules.registry.config_validator import AgentConfigValidator
 from app.modules.registry.diff import ConfigDiff, compute_config_diff
 from app.modules.registry.models import (
     AgentCapabilityContract,
@@ -61,10 +73,12 @@ from app.modules.registry.models import (
     VersionStatus,
 )
 from app.modules.registry.store import AgentRegistryStore
+from app.modules.secrets.manager import SecretNotFoundError, SecretsManager
 from app.shared.exceptions import (
     AgentNotFoundError,
     CircularDependencyError,
     InvalidRollbackError,
+    NoApiKeyProvisionedError,
     VersionNotFoundError,
 )
 
@@ -86,6 +100,10 @@ async def _record_event(
     agent_id: str | None,
     actor: str,
     summary: str,
+    security_audit_log_store: SecurityAuditLogStore | None = None,
+    security_event_type: str | None = None,
+    security_action: str | None = None,
+    source_ip: str = "",
 ) -> None:
     """Phase 14: one audit event + one CloudWatch metric per key operation
     (config_change, deploy, rollback here; block lives in
@@ -93,6 +111,13 @@ async def _record_event(
     guardrail_decision/tool_call have no call site in this Runtime at all).
     Both are fire-and-forget/best-effort by design (see their own modules'
     docstrings) — neither can fail the request that triggered them.
+
+    security_audit_log_store/security_event_type (Sprint 3 Phase 2, CLAUDE.md
+    Section 61) are optional and additive — a second, separate write to
+    panasa-audit-log using Section 61's own (much larger) event taxonomy
+    (agent.created/agent.updated/...), alongside the existing S3 AuditEvent
+    write above. Only passed at call sites Phase 2 explicitly names; not
+    every _record_event caller has a Section 61.2 event type yet.
     """
     await audit_writer.write(
         AuditEvent(
@@ -105,6 +130,27 @@ async def _record_event(
         )
     )
     await metrics_emitter.emit(metric_name, dimensions={"tenant_id": tenant_id})
+
+    if security_audit_log_store is not None and security_event_type is not None:
+        await security_audit_log_store.write_event(
+            tenant_id=tenant_id,
+            event_type=security_event_type,
+            agent_id=agent_id or "",
+            principal_id=actor,
+            action=security_action or security_event_type,
+            resource=agent_id or "",
+            result="success",
+            source_ip=source_ip,
+        )
+
+
+def _generate_api_key() -> str:
+    """Sprint 3 Phase 8 (S-02). `sk-` prefix matches the UI mockup (CLAUDE.md
+    Section 56.3, "API Key: sk-****...****"). 32 bytes of urlsafe randomness
+    (secrets.token_urlsafe, stdlib CSPRNG) — plenty of entropy for a bearer
+    credential validated via hmac.compare_digest (services/agent-runtime/
+    auth.py), never guessed via brute force."""
+    return f"sk-{secrets.token_urlsafe(32)}"
 
 
 class CreateAgentRequest(BaseModel):
@@ -125,6 +171,35 @@ class CreateAgentResponse(BaseModel):
     version: int
     status: AgentStatus
     created_at: str
+    # Sprint 3 Phase 8 (S-02, R60/R61) — the raw key value, shown exactly
+    # once, at the moment it's generated (never recoverable afterwards;
+    # a lost key requires POST .../credentials/rotate for a fresh one).
+    # None in enterprise mode — R60: Terraform's random_password inside the
+    # customer VPC provisions that agent's key, never this Runtime.
+    api_key: str | None = None
+
+
+class RotateApiKeyResponse(BaseModel):
+    agent_id: str
+    api_key_secret_arn: str
+    # Raw new key value, shown exactly once — same one-time-reveal
+    # convention as CreateAgentResponse.api_key (R61).
+    api_key: str
+    previous_key_valid_until: str  # ISO 8601, for human/UI display
+    rotated_at: str
+
+
+class RevokeApiKeyResponse(BaseModel):
+    agent_id: str
+    api_key_revoked: bool
+    updated_at: str
+
+
+class RevealApiKeyResponse(BaseModel):
+    agent_id: str
+    # Raw current key value — R63: returned once per request, never cached
+    # in the response object or persisted anywhere by this Runtime.
+    api_key: str
 
 
 class AgentDetailResponse(BaseModel):
@@ -310,7 +385,19 @@ async def create_agent(
     store: Annotated[AgentRegistryStore, Depends(get_registry_store)],
     audit_writer: Annotated[AuditWriter, Depends(get_audit_writer)],
     metrics_emitter: Annotated[MetricsEmitter, Depends(get_metrics_emitter)],
+    security_audit_log_store: Annotated[
+        SecurityAuditLogStore, Depends(get_security_audit_log_store)
+    ],
+    agent_config_validator: Annotated[AgentConfigValidator, Depends(get_agent_config_validator)],
+    secrets_manager: Annotated[SecretsManager, Depends(get_secrets_manager)],
 ) -> CreateAgentResponse:
+    validation_errors = await agent_config_validator.validate(payload.configuration, tenant_id)
+    if validation_errors:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"errors": validation_errors},
+        )
+
     try:
         record, _version = await store.create_agent(
             tenant_id=tenant_id,
@@ -335,13 +422,48 @@ async def create_agent(
         agent_id=record.agent_id,
         actor=current_user.email,
         summary=f"Agent {record.agent_id!r} created (v{record.current_version})",
+        security_audit_log_store=security_audit_log_store,
+        security_event_type="agent.created",
+        security_action="create",
     )
+
+    # Sprint 3 Phase 8 (S-02, R60) — prototype mode only. Enterprise mode
+    # leaves api_key_secret_arn unset here; it's populated later from
+    # Terraform's own random_password output (Section 56.5/56.6, DEP-INF-
+    # 01/02/03 — a separate, not-yet-built deployment-pipeline gap tracked
+    # in CLAUDE.md Section 59/60, out of this Sprint 3 security phase).
+    raw_api_key: str | None = None
+    if settings.deployment_mode == "prototype":
+        raw_api_key = _generate_api_key()
+        api_key_secret_arn = await secrets_manager.create_secret(
+            f"panasa-{record.agent_id}-api-key", raw_api_key
+        )
+        record = await store.provision_api_key(
+            tenant_id=tenant_id,
+            agent_id=record.agent_id,
+            api_key_secret_arn=api_key_secret_arn,
+            updated_by=current_user.email,
+        )
+        await _record_event(
+            audit_writer=audit_writer,
+            metrics_emitter=metrics_emitter,
+            event_type="config_change",
+            metric_name="AgentCredentialCreated",
+            tenant_id=tenant_id,
+            agent_id=record.agent_id,
+            actor=current_user.email,
+            summary=f"API key provisioned for agent {record.agent_id!r}",
+            security_audit_log_store=security_audit_log_store,
+            security_event_type="credential.created",
+            security_action="create",
+        )
 
     return CreateAgentResponse(
         agent_id=record.agent_id,
         version=record.current_version,
         status=record.status,
         created_at=record.created_at,
+        api_key=raw_api_key,
     )
 
 
@@ -396,7 +518,18 @@ async def update_agent(
     store: Annotated[AgentRegistryStore, Depends(get_registry_store)],
     audit_writer: Annotated[AuditWriter, Depends(get_audit_writer)],
     metrics_emitter: Annotated[MetricsEmitter, Depends(get_metrics_emitter)],
+    security_audit_log_store: Annotated[
+        SecurityAuditLogStore, Depends(get_security_audit_log_store)
+    ],
+    agent_config_validator: Annotated[AgentConfigValidator, Depends(get_agent_config_validator)],
 ) -> UpdateAgentResponse:
+    validation_errors = await agent_config_validator.validate(payload.configuration, tenant_id)
+    if validation_errors:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"errors": validation_errors},
+        )
+
     try:
         record, _version = await store.update_agent(
             tenant_id=tenant_id,
@@ -426,6 +559,9 @@ async def update_agent(
             f"Agent {agent_id!r} updated to v{record.current_version}: "
             f"{payload.change_description}"
         ),
+        security_audit_log_store=security_audit_log_store,
+        security_event_type="agent.updated",
+        security_action="update",
     )
 
     return UpdateAgentResponse(
@@ -444,6 +580,9 @@ async def delete_agent(
     store: Annotated[AgentRegistryStore, Depends(get_registry_store)],
     audit_writer: Annotated[AuditWriter, Depends(get_audit_writer)],
     metrics_emitter: Annotated[MetricsEmitter, Depends(get_metrics_emitter)],
+    security_audit_log_store: Annotated[
+        SecurityAuditLogStore, Depends(get_security_audit_log_store)
+    ],
 ) -> DeleteAgentResponse:
     try:
         record = await store.soft_delete_agent(
@@ -461,6 +600,13 @@ async def delete_agent(
         agent_id=agent_id,
         actor=current_user.email,
         summary=f"Agent {agent_id!r} soft-deleted (status={record.status})",
+        # Sprint 4 Phase 2 (S-05) — Section 61.2's own taxonomy name, added
+        # alongside the existing "config_change" old-taxonomy write (Section
+        # 14) rather than replacing it — see _record_event's own docstring
+        # for why both systems coexist.
+        security_audit_log_store=security_audit_log_store,
+        security_event_type="agent.deleted",
+        security_action="delete",
     )
 
     return DeleteAgentResponse(
@@ -697,10 +843,23 @@ async def _trigger_deployment(
         workflow_path, workflow_content = generate_cicd_workflow(
             tenant_settings.cicd_provider, approval_mode, agent_id
         )
-        if not repo_already_existed or not await git_provider.file_exists(
+        workflow_already_committed = repo_already_existed and await git_provider.file_exists(
             repo, workflow_path, branch=settings.git_default_branch
-        ):
+        )
+        if not workflow_already_committed:
             files[workflow_path] = workflow_content
+
+        # Same signal, a second use: whether this repo has ever received a
+        # real deploy's content before — true v1 (repo didn't exist) is one
+        # case, but a repo that "exists" only because an earlier attempt's
+        # create_repository() succeeded and then that same attempt's own
+        # commit_files() failed (expired token, GitHub's Git Data API
+        # eventual consistency — see GitProvider.commit_files's docstring)
+        # is functionally identical: nothing but the auto-init commit is
+        # really there. Both get the same omit_base_tree=True treatment
+        # below, regardless of which of the two branches immediately after
+        # this actually runs (push straight to main, or branch + PR).
+        repo_has_no_real_content_yet = not workflow_already_committed
 
         # Generic Agent Runtime instruction (2026-09-03) — unlike the
         # workflow file above, tfvars values are as config-driven as the
@@ -725,6 +884,15 @@ async def _trigger_deployment(
             }
         )
 
+        # CLAUDE.md instruction (2026-09-07, item 5) — the generated GitHub
+        # Actions workflow's POLICY_CHECK stage runs this directly (`python
+        # {path} {tf_dir}`); regenerated every deploy, same reasoning as
+        # tfvars.json above (pure, agent-independent code — nothing to
+        # preserve between deploys, always current with this Runtime's own
+        # checks).
+        policy_check_script_path, policy_check_script_content = generate_policy_check_script()
+        files[policy_check_script_path] = policy_check_script_content
+
         pull_request_id: str | None
         if repo_already_existed:
             branch = f"deploy/v{version}-{deployment_id}"
@@ -734,6 +902,15 @@ async def _trigger_deployment(
                 branch,
                 files,
                 message=f"Agent {agent_id} v{version} — generated {iac_result.tool} IaC",
+                # See repo_has_no_real_content_yet's definition above — a
+                # repo that "exists" only via a prior attempt's
+                # create_repository() call, never a real commit, needs the
+                # exact same base_tree-skipping treatment as true v1 below.
+                # `branch` was just cut from the default branch, which is
+                # itself still just the auto-init commit in that case, so
+                # `files` (complete/exhaustive, same as the v1 case) is
+                # equally safe to commit without a base_tree reference.
+                omit_base_tree=repo_has_no_real_content_yet,
             )
             pull_request_id = await git_provider.create_pull_request(
                 repo,
@@ -751,8 +928,32 @@ async def _trigger_deployment(
                 branch,
                 files,
                 message=f"Agent {agent_id} v{version} — generated {iac_result.tool} IaC",
+                # `files` is complete and exhaustive here — the repo has
+                # nothing on it yet but create_repository()'s own auto-init
+                # commit, which `files` already supersedes (its own
+                # README.md). Safe to skip base_tree entirely (GitHub only
+                # — see GitProvider.commit_files's docstring) rather than
+                # depend on that just-created commit's tree being
+                # queryable yet.
+                omit_base_tree=True,
             )
             pull_request_id = None
+    except MissingWorkflowScopeError as exc:
+        message = str(exc)
+        await deployment_status_store.update_stage(
+            agent_id,
+            deployment_id,
+            stage="GENERATING_IAC",
+            stage_status="FAILED",
+            output_summary=message,
+            overall_status="FAILED",
+            failure_reason=message,
+            failed_stage="GENERATING_IAC",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"error": "git_provider_missing_workflow_scope", "message": message},
+        ) from exc
     except httpx.HTTPStatusError as exc:
         message = (
             f"Git provider rejected the request ({exc.response.status_code}). "
@@ -860,6 +1061,9 @@ async def rollback_agent(
     audit_writer: Annotated[AuditWriter, Depends(get_audit_writer)],
     metrics_emitter: Annotated[MetricsEmitter, Depends(get_metrics_emitter)],
     pipeline_simulator: Annotated[DeploymentPipelineSimulator, Depends(get_pipeline_simulator)],
+    security_audit_log_store: Annotated[
+        SecurityAuditLogStore, Depends(get_security_audit_log_store)
+    ],
     background_tasks: BackgroundTasks,
 ) -> RollbackResponse:
     try:
@@ -910,6 +1114,9 @@ async def rollback_agent(
             f"Agent {agent_id!r} rolled back to v{payload.target_version} "
             f"(new v{triggered.updated_record.current_version}): {payload.reason}"
         ),
+        security_audit_log_store=security_audit_log_store,
+        security_event_type="agent.version_rolled_back",
+        security_action="rollback",
     )
 
     return RollbackResponse(
@@ -954,8 +1161,7 @@ async def generate_iac(
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=(
-                    f"Validation mode {validation_mode!r} requires the developer "
-                    "or admin role."
+                    f"Validation mode {validation_mode!r} requires the developer " "or admin role."
                 ),
             )
 
@@ -1244,3 +1450,217 @@ async def approve_deployment(
             pipeline_simulator.resume_after_approval, tenant_id, agent_id, deployment_id
         )
     return updated_record
+
+
+@router.post("/{agent_id}/credentials/rotate", response_model=RotateApiKeyResponse)
+async def rotate_agent_api_key(
+    agent_id: str,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    current_user: Annotated[CurrentUser, Depends(require_role(*_WRITE_ROLES))],
+    store: Annotated[AgentRegistryStore, Depends(get_registry_store)],
+    secrets_manager: Annotated[SecretsManager, Depends(get_secrets_manager)],
+    audit_writer: Annotated[AuditWriter, Depends(get_audit_writer)],
+    metrics_emitter: Annotated[MetricsEmitter, Depends(get_metrics_emitter)],
+    security_audit_log_store: Annotated[
+        SecurityAuditLogStore, Depends(get_security_audit_log_store)
+    ],
+) -> RotateApiKeyResponse:
+    """S-02 dual-key rotation (CLAUDE.md Section 64.4). Generates a brand
+    new Secrets Manager secret (never reuses/overwrites the old ARN in
+    place) so both the old and new value can validate simultaneously
+    during the 24h grace window — services/agent-runtime/auth.py's
+    ApiKeyAuthProvider (Phase 1) already implements that dual-key check.
+
+    Enterprise-mode agents are never rotated here — R60: their key is
+    Terraform-generated inside the customer VPC, this Runtime has no way
+    to reach it (a real reveal/rotate for those is customer CI/CD's job,
+    tracked separately under DEP-INF-01/02, Section 59/60 — out of this
+    Sprint 3 security phase)."""
+    if settings.deployment_mode != "prototype":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "API key rotation for enterprise-mode agents is managed by your own "
+                "Terraform/CI-CD (R60) — not available via this endpoint."
+            ),
+        )
+
+    raw_api_key = _generate_api_key()
+    new_secret_name = f"panasa-{agent_id}-api-key-{int(time.time())}"
+    new_api_key_secret_arn = await secrets_manager.create_secret(new_secret_name, raw_api_key)
+    # 24h dual-key grace window (Section 64.4) — epoch seconds, matching
+    # services/agent-runtime/auth.py's `time.time() < previous_key_expires_at`.
+    previous_key_expires_at = int(time.time()) + (24 * 3600)
+
+    try:
+        record = await store.rotate_api_key(
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            new_api_key_secret_arn=new_api_key_secret_arn,
+            previous_key_expires_at=previous_key_expires_at,
+            updated_by=current_user.email,
+        )
+    except AgentNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except NoApiKeyProvisionedError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    assert record.rotated_at is not None  # rotate_api_key always sets this
+    await _record_event(
+        audit_writer=audit_writer,
+        metrics_emitter=metrics_emitter,
+        event_type="config_change",
+        metric_name="AgentCredentialRotated",
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        actor=current_user.email,
+        summary=f"API key rotated for agent {agent_id!r}",
+        security_audit_log_store=security_audit_log_store,
+        security_event_type="credential.rotated",
+        security_action="rotate",
+    )
+
+    return RotateApiKeyResponse(
+        agent_id=agent_id,
+        api_key_secret_arn=new_api_key_secret_arn,
+        api_key=raw_api_key,
+        previous_key_valid_until=datetime.fromtimestamp(previous_key_expires_at, UTC).isoformat(),
+        rotated_at=record.rotated_at,
+    )
+
+
+@router.post("/{agent_id}/credentials/revoke", response_model=RevokeApiKeyResponse)
+async def revoke_agent_api_key(
+    agent_id: str,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    current_user: Annotated[CurrentUser, Depends(require_role(*_WRITE_ROLES))],
+    store: Annotated[AgentRegistryStore, Depends(get_registry_store)],
+    audit_writer: Annotated[AuditWriter, Depends(get_audit_writer)],
+    metrics_emitter: Annotated[MetricsEmitter, Depends(get_metrics_emitter)],
+    security_audit_log_store: Annotated[
+        SecurityAuditLogStore, Depends(get_security_audit_log_store)
+    ],
+) -> RevokeApiKeyResponse:
+    """S-02 emergency revocation — denies both the current and any
+    in-grace-window previous key immediately (services/agent-runtime/
+    auth.py checks api_key_revoked before comparing any secret value, so
+    revocation takes effect without waiting on the 5-minute value-cache
+    TTL). Idempotent: revoking an already-revoked agent is a no-op
+    success. There is no un-revoke endpoint — CLAUDE.md's own S-02 scope
+    and Section 61.2 audit taxonomy name only credential.created/rotated/
+    revoked, not a reactivation event; recovery is a fresh rotate."""
+    try:
+        record = await store.revoke_api_key(
+            tenant_id=tenant_id, agent_id=agent_id, updated_by=current_user.email
+        )
+    except AgentNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    await _record_event(
+        audit_writer=audit_writer,
+        metrics_emitter=metrics_emitter,
+        event_type="config_change",
+        metric_name="AgentCredentialRevoked",
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        actor=current_user.email,
+        summary=f"API key revoked for agent {agent_id!r}",
+        security_audit_log_store=security_audit_log_store,
+        security_event_type="credential.revoked",
+        security_action="revoke",
+    )
+
+    return RevokeApiKeyResponse(
+        agent_id=agent_id,
+        api_key_revoked=record.api_key_revoked,
+        updated_at=record.updated_at,
+    )
+
+
+@router.post("/{agent_id}/integration/reveal-api-key", response_model=RevealApiKeyResponse)
+async def reveal_api_key(
+    agent_id: str,
+    request: Request,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    current_user: Annotated[CurrentUser, Depends(require_role(*_WRITE_ROLES))],
+    store: Annotated[AgentRegistryStore, Depends(get_registry_store)],
+    secrets_manager: Annotated[SecretsManager, Depends(get_secrets_manager)],
+    redis_client: Annotated[redis.Redis, Depends(get_redis_client)],
+    audit_writer: Annotated[AuditWriter, Depends(get_audit_writer)],
+    metrics_emitter: Annotated[MetricsEmitter, Depends(get_metrics_emitter)],
+    security_audit_log_store: Annotated[
+        SecurityAuditLogStore, Depends(get_security_audit_log_store)
+    ],
+) -> RevealApiKeyResponse:
+    """Sprint 4 Phase 1 (S-06, CLAUDE.md Section 56.7/57, R60-R63) — shows
+    the raw current API key value again after creation/rotation, for a
+    caller who lost it. Prototype mode only (R62): enterprise-mode agents
+    have no key for this Runtime to reveal at all — Terraform's
+    random_password generates it inside the customer's own VPC (R60), and
+    the business app retrieves it from the customer's own Secrets Manager,
+    never through this endpoint.
+
+    Rate-limited to 3 reveals/hour/agent (R63's own hardening — a leaked
+    key is really addressed by rotate/revoke, not by slowing this down,
+    but the limit still makes credential-stuffing-style probing of this
+    endpoint impractical) and every call is audit-logged with source IP
+    BEFORE the key is returned, whether or not the call ultimately
+    succeeds past that point — matching R63's "every call... is recorded"
+    wording exactly (not just successful ones)."""
+    if settings.deployment_mode != "prototype":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "API key reveal is not available for enterprise-mode agents (R62) — "
+                "the key is managed entirely in your own AWS account's Secrets Manager."
+            ),
+        )
+
+    source_ip = request.client.host if request.client else ""
+
+    record = await store.get_agent(tenant_id, agent_id)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent {agent_id!r} not found"
+        )
+
+    await _record_event(
+        audit_writer=audit_writer,
+        metrics_emitter=metrics_emitter,
+        event_type="config_change",
+        metric_name="AgentCredentialRevealed",
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        actor=current_user.email,
+        summary=f"API key reveal requested for agent {agent_id!r}",
+        security_audit_log_store=security_audit_log_store,
+        security_event_type="credential.revealed",
+        security_action="reveal",
+        source_ip=source_ip,
+    )
+
+    if record.api_key_secret_arn is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Agent {agent_id!r} has no API key provisioned to reveal",
+        )
+
+    allowed = await check_reveal_rate_limit(tenant_id, agent_id, redis_client)
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Reveal rate limit exceeded. Max 3 per hour.",
+        )
+
+    try:
+        api_key = await secrets_manager.get_secret_value(record.api_key_secret_arn)
+    except SecretNotFoundError as exc:
+        # The ARN is on the record but the secret itself is gone — a
+        # data-integrity problem this Runtime can't self-heal from, not a
+        # client error.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="This agent's API key secret could not be found",
+        ) from exc
+
+    return RevealApiKeyResponse(agent_id=agent_id, api_key=api_key)

@@ -1,0 +1,4 @@
+# Shared code for per-tool Lambda handlers (Sprint 3 Phase 5 — SSRF guard
+# only, for now; DEP-INF-05's actual tool handler code is a separate,
+# already-tracked gap — see shared/ssrf_guard.py's module docstring).
+requests==2.34.2

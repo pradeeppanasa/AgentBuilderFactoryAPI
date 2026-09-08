@@ -27,17 +27,30 @@ _TMP_DB_DIR = tempfile.mkdtemp(prefix="panasa-test-db-")
 os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_TMP_DB_DIR}/test.db"
 # Forced empty, not just left alone: a developer's real .env (e.g. from
 # scripts/local-setup.sh) sets DYNAMODB_ENDPOINT/SECRETS_MANAGER_ENDPOINT/
-# S3_ENDPOINT to point at a real local Docker stack. pydantic-settings reads
-# .env directly regardless of os.environ, so without this override the app
-# would silently redirect boto3 at that REAL stack instead of moto's mocks —
-# reproduced: it fetches the real LocalStack "jwt-secret" (a different value
-# than TEST_JWT_SECRET below), and every JWT signature check then fails with
-# 401. `settings.*_endpoint: str | None` treats "" as falsy, same as None,
-# so the app's client factories skip adding a custom endpoint_url entirely
+# S3_ENDPOINT/EVENTBRIDGE_ENDPOINT to point at a real local Docker stack.
+# pydantic-settings reads .env directly regardless of os.environ, so
+# without this override the app would silently redirect boto3 at that REAL
+# stack instead of moto's mocks — reproduced: it fetches the real
+# LocalStack "jwt-secret" (a different value than TEST_JWT_SECRET below),
+# and every JWT signature check then fails with 401.
+# `settings.*_endpoint: str | None` treats "" as falsy, same as None, so
+# the app's client factories skip adding a custom endpoint_url entirely
 # and boto3 hits moto's normally-intercepted default AWS hostnames.
+#
+# EVENTBRIDGE_ENDPOINT was missing from this list until it was caught here:
+# every deploy-triggering test (test_deploy_api.py, test_deployment_
+# approval_api.py, test_phase17_e2e_scenario.py, ...) goes through
+# DeploymentOrchestrator.trigger_deployment()'s real EventBridge
+# put_events call, which was silently hitting the real LocalStack
+# container on :4566 instead of moto — each such test took as long as a
+# real network round-trip to a container that's been running under heavy
+# manual-testing load for hours, rather than the ~1s an in-memory mock
+# takes. Reproduced: a `netstat`-equivalent on the hung pytest process
+# showed an ESTABLISHED connection to ::1:4566 mid-test.
 os.environ["DYNAMODB_ENDPOINT"] = ""
 os.environ["SECRETS_MANAGER_ENDPOINT"] = ""
 os.environ["S3_ENDPOINT"] = ""
+os.environ["EVENTBRIDGE_ENDPOINT"] = ""
 # Same reasoning: a real .env sets LANGFUSE_HOST=http://langfuse:3000 (a
 # Docker-internal-only hostname). Left alone, check_observability() makes a
 # real httpx call that hangs until ConnectTimeout instead of resolving to
@@ -113,7 +126,7 @@ TEST_AUDIT_BUCKET = os.environ["AUDIT_S3_BUCKET"]
 TEST_EVENTBRIDGE_BUS = os.environ["EVENTBRIDGE_BUS_NAME"]
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture(autouse=True, scope="session")
 def aws_credentials() -> None:
     os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
     os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
@@ -122,7 +135,19 @@ def aws_credentials() -> None:
     os.environ.setdefault("AWS_DEFAULT_REGION", "eu-west-2")
 
 
-@pytest.fixture(autouse=True)
+# Perf refactor (2026-09-08): mocked_aws used to be function-scoped — a
+# brand new moto backend per test, meaning every one of the ~800 tests in
+# this suite re-ran the FastAPI app's lifespan, which calls ensure_table()
+# for ~20 DynamoDB tables, EVERY time. That table-creation cost (confirmed
+# the dominant cost across the full suite: individual files run at
+# ~1-2s/test, but the full run took 30-40 minutes) is now paid ONCE per
+# pytest session instead of once per test. _reset_aws_state below restores
+# the "every test starts from an empty slate" guarantee tests still need,
+# without paying to recreate table/bucket *schema* every time.
+_BASELINE_SECRET_NAMES = {"jwt-secret", "git-token"}
+
+
+@pytest.fixture(autouse=True, scope="session")
 def mocked_aws(aws_credentials: None) -> Iterator[None]:
     with mock_aws():
         import boto3
@@ -142,6 +167,81 @@ def mocked_aws(aws_credentials: None) -> Iterator[None]:
         )
         boto3.client("events", region_name="eu-west-2").create_event_bus(Name=TEST_EVENTBRIDGE_BUS)
         yield
+
+
+@pytest.fixture(autouse=True)
+async def _reset_aws_state(mocked_aws: None) -> None:
+    """Runs before every test (function-scoped, unlike mocked_aws above) —
+    wipes DATA, never SCHEMA: every DynamoDB table's items, every S3
+    bucket's objects, and every Secrets Manager secret except the two
+    conftest-owned baseline ones. Recreating schema (tables/buckets) is
+    exactly the per-test cost the session-scoped mocked_aws fixture above
+    exists to avoid; wiping only the data inside it is cheap (test data
+    volumes are a handful of items/objects/secrets per test) and preserves
+    every test's existing "I start from nothing" assumption.
+
+    Secrets are force-deleted (ForceDeleteWithoutRecovery) so a name is
+    immediately reusable next test — real AWS's default 7-30 day recovery
+    window would otherwise block recreation with the same name, which
+    tests like test_admin_settings_api.py's Langfuse/Datadog/New Relic
+    integration-secret tests rely on being possible (they all create a
+    secret under the same tenant-scoped name whenever `existing_arn` is
+    None, which is every time under per-test-isolated state).
+
+    One deliberate exception to "wipe everything": ToolRegistryStore
+    (Sprint 3 Phase 7, S-13a) seeds panasa-tool-registry with 4 APPROVED
+    tools ONLY on the run that actually creates the table — by design, so
+    an operator's later edits to a seeded row are never silently reset on
+    restart (see that store's own docstring). Under session-scoped
+    mocked_aws the table is created exactly once, by whichever test runs
+    first; a blind item-wipe here would delete those 4 seed rows on every
+    test AFTER that one and never restore them (ensure_table() sees the
+    table already exists and correctly skips reseeding, same as it would
+    against a real, already-provisioned AWS account) — every agent-config
+    test that references jira_search/kb_search/etc. would then fail
+    AgentConfigValidator's registry check. Re-seed it every time instead
+    of excluding it from the wipe, so its content stays identical to a
+    freshly-created table on every test, matching what tests got for free
+    under the old per-test-fresh-backend design.
+    """
+    import boto3
+
+    from app.config import settings
+    from app.modules.tool_registry.store import ToolRegistryStore
+
+    dynamodb = boto3.resource("dynamodb", region_name="eu-west-2")
+    tool_registry_table_wiped = False
+    for table in dynamodb.tables.all():
+        key_names = [k["AttributeName"] for k in table.key_schema]
+        with table.batch_writer() as batch:
+            for item in table.scan().get("Items", []):
+                batch.delete_item(Key={k: item[k] for k in key_names})
+        if table.name == settings.dynamodb_tool_registry_table:
+            tool_registry_table_wiped = True
+
+    if tool_registry_table_wiped:
+        await ToolRegistryStore(dynamodb, settings)._seed_initial_entries()  # noqa: SLF001
+
+    s3 = boto3.resource("s3", region_name="eu-west-2")
+    for bucket in s3.buckets.all():
+        bucket.objects.all().delete()
+
+    # ECR: full delete (not just images), unlike DynamoDB above — a
+    # repository has no expensive schema worth preserving the way a table
+    # with a GSI does, and several tests (test_platform_version_service.py,
+    # test_platform_upgrade_api.py) need the repository to be genuinely
+    # ABSENT, not just empty, for their "no repository yet" cases. Both
+    # files share the literal repo name "agent-builder-runtime", so this
+    # also prevents cross-file image/tag pollution between them.
+    ecr = boto3.client("ecr", region_name="eu-west-2")
+    for repo in ecr.describe_repositories().get("repositories", []):
+        ecr.delete_repository(repositoryName=repo["repositoryName"], force=True)
+
+    secretsmanager = boto3.client("secretsmanager", region_name="eu-west-2")
+    for page in secretsmanager.get_paginator("list_secrets").paginate():
+        for entry in page["SecretList"]:
+            if entry["Name"] not in _BASELINE_SECRET_NAMES:
+                secretsmanager.delete_secret(SecretId=entry["ARN"], ForceDeleteWithoutRecovery=True)
 
 
 @pytest.fixture(autouse=True)

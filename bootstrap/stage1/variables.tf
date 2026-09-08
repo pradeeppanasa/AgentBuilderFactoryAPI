@@ -158,6 +158,37 @@ variable "git_credentials_secret_name" {
   default     = "git-token"
 }
 
+variable "github_org" {
+  description = <<-EOT
+    GitHub org/user that owns the per-agent IaC repos (Section 45.2:
+    panasa-iac-{agent_id}) and the Factory's own bootstrap repo, if any —
+    same value as the Runtime's own .env GIT_ORG (Section 45.12). Scopes
+    github_oidc.tf's trust policy so only workflows running under this
+    org's repos can assume the deploy role. Required when git_provider =
+    "github" and create_github_oidc_provider or existing_github_oidc_
+    provider_arn is set; ignored otherwise.
+  EOT
+  type        = string
+  default     = ""
+}
+
+variable "create_github_oidc_provider" {
+  description = "False if this AWS account already has a token.actions.githubusercontent.com OIDC provider from unrelated CI/CD — an account may only have one per URL. Set existing_github_oidc_provider_arn instead."
+  type        = bool
+  default     = true
+}
+
+variable "existing_github_oidc_provider_arn" {
+  description = "Required when create_github_oidc_provider = false."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.create_github_oidc_provider || var.existing_github_oidc_provider_arn != ""
+    error_message = "existing_github_oidc_provider_arn is required when create_github_oidc_provider is false."
+  }
+}
+
 variable "git_token_value" {
   description = <<-EOT
     Git PAT/token, supplied only via -var/TF_VAR_ at apply time (e.g. `TF_VAR_git_token_value=$(cat token.txt) terraform apply`) — never committed to a

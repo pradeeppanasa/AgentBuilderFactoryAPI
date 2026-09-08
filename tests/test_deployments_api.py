@@ -50,7 +50,12 @@ class FakeGitProvider(GitProvider):
         return False
 
     async def commit_files(
-        self, repo: str, branch: str, files: dict[str, str], message: str
+        self,
+        repo: str,
+        branch: str,
+        files: dict[str, str],
+        message: str,
+        omit_base_tree: bool = False,
     ) -> str:
         return "fake-commit-sha"
 

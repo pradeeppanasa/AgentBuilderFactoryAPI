@@ -119,17 +119,22 @@ async def test_diff_between_versions_reports_changed_and_added_fields(make_user_
         update_payload["temperature"] = 0.9
         update_payload["tools"] = [
             {
-                "tool_id": "jira",
+                "tool_id": "jira_search",
                 "tool_name": "Jira",
                 "executor_type": "http",
                 "input_schema": {},
             }
         ]
-        client.put(
+        # Sprint 3 Phase 7 (S-13a) — jira_search is one of the 4 tools
+        # seeded APPROVED in the tool registry at startup (Section 62.2);
+        # every configured tool also needs a tool_policies entry (S-08).
+        update_payload["tool_policies"] = [{"tool": "jira_search", "allowed": True, "risk": "LOW"}]
+        put_response = client.put(
             f"/api/v1/agents/{agent_id}",
             json={"configuration": update_payload, "change_description": "Add Jira tool"},
             headers=_bearer(token),
         )
+        assert put_response.status_code == 200, put_response.text
 
         response = client.get(f"/api/v1/agents/{agent_id}/versions/2/diff", headers=_bearer(token))
 

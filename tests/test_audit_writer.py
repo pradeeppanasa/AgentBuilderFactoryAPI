@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -16,10 +17,17 @@ from app.modules.audit.writer import AuditEvent, AuditWriter
 @pytest.fixture
 def s3_client() -> Any:
     client = boto3.client("s3", region_name="eu-west-2")
-    client.create_bucket(
-        Bucket="test-audit-bucket",
-        CreateBucketConfiguration={"LocationConstraint": "eu-west-2"},
-    )
+    # conftest.py's mocked_aws is session-scoped (perf refactor, 2026-09-08)
+    # — this bucket now persists across the whole pytest session instead of
+    # a fresh one per test, so a second test in this file hitting an
+    # unguarded create_bucket would raise BucketAlreadyOwnedByYou. Objects
+    # inside it still get wiped between tests (conftest.py's
+    # _reset_aws_state), so the count assertions below stay correct.
+    with contextlib.suppress(client.exceptions.BucketAlreadyOwnedByYou):
+        client.create_bucket(
+            Bucket="test-audit-bucket",
+            CreateBucketConfiguration={"LocationConstraint": "eu-west-2"},
+        )
     return client
 
 
@@ -90,9 +98,7 @@ async def test_list_events_returns_events_in_date_range(s3_client: Any) -> None:
 
     today = datetime.now(UTC).date().isoformat()
     await writer.write(_event(summary="In range", occurred_at=f"{today}T10:00:00+00:00"))
-    await writer.write(
-        _event(summary="Out of range", occurred_at="2020-01-01T10:00:00+00:00")
-    )
+    await writer.write(_event(summary="Out of range", occurred_at="2020-01-01T10:00:00+00:00"))
 
     events = await writer.list_events(tenant_id="tenant-a", date_from=today, date_to=today)
 
@@ -143,6 +149,8 @@ async def test_list_events_returns_empty_when_bucket_not_configured() -> None:
     stub_settings = settings.model_copy(update={"audit_s3_bucket": None})
     writer = AuditWriter(None, stub_settings)
 
-    events = await writer.list_events(tenant_id="tenant-a", date_from="2020-01-01", date_to="2020-01-01")
+    events = await writer.list_events(
+        tenant_id="tenant-a", date_from="2020-01-01", date_to="2020-01-01"
+    )
 
     assert events == []

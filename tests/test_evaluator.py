@@ -7,6 +7,7 @@ environmentVariablesOverride (see that file's module docstring).
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 import boto3
@@ -28,17 +29,22 @@ class _RecordingCodeBuildClient:
 @pytest.fixture
 def codebuild_client():
     client = boto3.client("codebuild", region_name="eu-west-2")
-    client.create_project(
-        name=codebuild_project_name(),
-        source={"type": "GITHUB", "location": "https://github.com/example/repo.git"},
-        artifacts={"type": "NO_ARTIFACTS"},
-        environment={
-            "type": "LINUX_CONTAINER",
-            "image": "aws/codebuild/standard:7.0",
-            "computeType": "BUILD_GENERAL1_SMALL",
-        },
-        serviceRole="arn:aws:iam::123456789012:role/service-role/test",
-    )
+    # conftest.py's mocked_aws is session-scoped (perf refactor,
+    # 2026-09-08) — this project now persists across the whole pytest
+    # session instead of a fresh one per test, so a second test hitting an
+    # unguarded create_project would raise ResourceAlreadyExistsException.
+    with contextlib.suppress(client.exceptions.ResourceAlreadyExistsException):
+        client.create_project(
+            name=codebuild_project_name(),
+            source={"type": "GITHUB", "location": "https://github.com/example/repo.git"},
+            artifacts={"type": "NO_ARTIFACTS"},
+            environment={
+                "type": "LINUX_CONTAINER",
+                "image": "aws/codebuild/standard:7.0",
+                "computeType": "BUILD_GENERAL1_SMALL",
+            },
+            serviceRole="arn:aws:iam::123456789012:role/service-role/test",
+        )
     return _RecordingCodeBuildClient(client)
 
 

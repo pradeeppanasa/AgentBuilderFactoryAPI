@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -18,14 +19,23 @@ def cloudwatch_client() -> Any:
 
 
 async def test_emit_writes_a_metric_datapoint(cloudwatch_client: Any) -> None:
+    # Perf refactor (2026-09-08): conftest.py's mocked_aws is now
+    # session-scoped, and real CloudWatch has no delete-metric-data API for
+    # conftest.py's generic per-test reset to call even if it wanted to —
+    # datapoints from every other test in the suite that emits
+    # "AgentCreated"/tenant_id="tenant-a" (a very common combination;
+    # "tenant-a" is this codebase's standard test tenant constant) would
+    # otherwise sum into this assertion too. A random dimension value makes
+    # this test's own datapoint uncollidable with anything else.
+    tenant_id = f"tenant-{uuid.uuid4().hex}"
     emitter = MetricsEmitter(cloudwatch_client, settings)
-    await emitter.emit("AgentCreated", dimensions={"tenant_id": "tenant-a"})
+    await emitter.emit("AgentCreated", dimensions={"tenant_id": tenant_id})
 
     now = datetime.now(UTC)
     stats = cloudwatch_client.get_metric_statistics(
         Namespace=settings.cloudwatch_metrics_namespace,
         MetricName="AgentCreated",
-        Dimensions=[{"Name": "tenant_id", "Value": "tenant-a"}],
+        Dimensions=[{"Name": "tenant_id", "Value": tenant_id}],
         StartTime=now - timedelta(minutes=5),
         EndTime=now + timedelta(minutes=5),
         Period=60,
@@ -35,13 +45,16 @@ async def test_emit_writes_a_metric_datapoint(cloudwatch_client: Any) -> None:
 
 
 async def test_emit_defaults_to_count_unit_and_value_one(cloudwatch_client: Any) -> None:
+    # Same reasoning as above — a random metric name (not one any real app
+    # code path would ever emit) instead of a shared, collidable one.
+    metric_name = f"TestMetric-{uuid.uuid4().hex}"
     emitter = MetricsEmitter(cloudwatch_client, settings)
-    await emitter.emit("AgentUpdated")  # no dimensions, no explicit value/unit
+    await emitter.emit(metric_name)  # no dimensions, no explicit value/unit
 
     now = datetime.now(UTC)
     stats = cloudwatch_client.get_metric_statistics(
         Namespace=settings.cloudwatch_metrics_namespace,
-        MetricName="AgentUpdated",
+        MetricName=metric_name,
         StartTime=now - timedelta(minutes=5),
         EndTime=now + timedelta(minutes=5),
         Period=60,

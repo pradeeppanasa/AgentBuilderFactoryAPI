@@ -11,7 +11,7 @@ import json
 import httpx
 import pytest
 
-from app.modules.git_provider.github import GitHubProvider
+from app.modules.git_provider.github import GitHubProvider, MissingWorkflowScopeError
 
 REPO = "https://github.com/acme/panasa-agent-iac"
 
@@ -20,10 +20,22 @@ class _Recorder:
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
         self._blob_counter = 0
+        self.oauth_scopes_header: str | None = "repo, workflow"
+        """None simulates a fine-grained PAT/GitHub App token (no
+        X-OAuth-Scopes header at all) — set per test to simulate a classic
+        PAT with/without the 'workflow' scope."""
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         method, path = request.method, request.url.path
+
+        if method == "GET" and path == "/user":
+            headers = (
+                {"x-oauth-scopes": self.oauth_scopes_header}
+                if self.oauth_scopes_header is not None
+                else {}
+            )
+            return httpx.Response(200, json={"login": "acme-bot"}, headers=headers)
 
         if method == "GET" and path == "/repos/acme/panasa-agent-iac":
             return httpx.Response(200, json={"full_name": "acme/panasa-agent-iac"})
@@ -250,6 +262,108 @@ async def test_commit_files_does_blob_tree_commit_ref_dance(
     commit_body = json.loads(commit_request.content)
     assert commit_body["message"] == "generated IaC"
     assert commit_body["parents"] == ["parent-commit-sha"]
+
+
+async def test_commit_files_with_omit_base_tree_skips_parent_commit_lookup(
+    provider: GitHubProvider, recorder: _Recorder
+) -> None:
+    """The v1 direct-to-main case (agents.py): `files` is already complete
+    and exhaustive, so there's no need to fetch the just-created auto-init
+    commit's tree sha at all — sidesteps the exact GitHub eventual-
+    consistency 404 _post_retrying_404 exists for, rather than just
+    retrying it for longer."""
+    commit_sha = await provider.commit_files(
+        REPO,
+        "deploy-branch",
+        {"README.md": "generated readme"},
+        message="generated IaC",
+        omit_base_tree=True,
+    )
+
+    assert commit_sha == "new-commit-sha"
+    methods_and_paths = [(r.method, r.url.path) for r in recorder.requests]
+    assert (
+        "GET",
+        "/repos/acme/panasa-agent-iac/git/commits/parent-commit-sha",
+    ) not in methods_and_paths
+
+    tree_request = next(r for r in recorder.requests if r.url.path.endswith("/git/trees"))
+    tree_body = json.loads(tree_request.content)
+    assert "base_tree" not in tree_body
+    assert {entry["path"] for entry in tree_body["tree"]} == {"README.md"}
+
+
+async def test_commit_files_raises_clear_error_when_token_lacks_workflow_scope(
+    provider: GitHubProvider, recorder: _Recorder
+) -> None:
+    """The real bug this guards against: a token with only 'repo' scope
+    makes GitHub's trees endpoint 404 on ANY tree containing a
+    .github/workflows/ path — on every attempt, forever, no matter how
+    long _post_retrying_404 waits. Caught here, before ever attempting the
+    doomed tree call, with a message that actually explains what's wrong
+    instead of a bare 404."""
+    recorder.oauth_scopes_header = "repo"
+
+    with pytest.raises(MissingWorkflowScopeError, match="workflow"):
+        await provider.commit_files(
+            REPO,
+            "deploy-branch",
+            {".github/workflows/panasa-deploy.yml": "name: Panasa Deploy"},
+            message="generated IaC",
+        )
+
+    # Fails fast — never even reaches the blob/tree endpoints.
+    methods_and_paths = [(r.method, r.url.path) for r in recorder.requests]
+    assert ("POST", "/repos/acme/panasa-agent-iac/git/blobs") not in methods_and_paths
+    assert not any(path.endswith("/git/trees") for _method, path in methods_and_paths)
+
+
+async def test_commit_files_proceeds_when_token_has_workflow_scope(
+    provider: GitHubProvider, recorder: _Recorder
+) -> None:
+    recorder.oauth_scopes_header = "repo, workflow"
+
+    commit_sha = await provider.commit_files(
+        REPO,
+        "deploy-branch",
+        {".github/workflows/panasa-deploy.yml": "name: Panasa Deploy"},
+        message="generated IaC",
+    )
+
+    assert commit_sha == "new-commit-sha"
+
+
+async def test_commit_files_skips_scope_check_when_no_workflow_file_committed(
+    provider: GitHubProvider, recorder: _Recorder
+) -> None:
+    """No .github/workflows/ path in this commit — the extra /user round
+    trip only makes sense when it's actually relevant (Section 45.6/R58:
+    the workflow file is committed once per repo, not every deploy)."""
+    recorder.oauth_scopes_header = "repo"  # would raise if the check ran
+
+    commit_sha = await provider.commit_files(
+        REPO, "deploy-branch", {"a.tf": "content"}, message="generated IaC"
+    )
+
+    assert commit_sha == "new-commit-sha"
+    assert ("GET", "/user") not in [(r.method, r.url.path) for r in recorder.requests]
+
+
+async def test_commit_files_skips_scope_check_when_header_absent(
+    provider: GitHubProvider, recorder: _Recorder
+) -> None:
+    """Fine-grained PATs and GitHub App tokens don't send X-OAuth-Scopes at
+    all — this must never false-flag those as missing the scope."""
+    recorder.oauth_scopes_header = None
+
+    commit_sha = await provider.commit_files(
+        REPO,
+        "deploy-branch",
+        {".github/workflows/panasa-deploy.yml": "name: Panasa Deploy"},
+        message="generated IaC",
+    )
+
+    assert commit_sha == "new-commit-sha"
 
 
 async def test_create_pull_request_returns_number_as_string(

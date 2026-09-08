@@ -17,7 +17,7 @@ import json
 import re
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
@@ -37,11 +37,12 @@ from app.modules.registry.models import (
     normalise_agent_type,
 )
 from app.modules.registry.versioner import AgentVersioner
-from app.shared.dynamodb_types import decimal_to_native
+from app.shared.dynamodb_types import decimal_to_native, native_to_decimal
 from app.shared.exceptions import (
     AgentNotFoundError,
     CircularDependencyError,
     InvalidRollbackError,
+    NoApiKeyProvisionedError,
     VersionNotFoundError,
 )
 
@@ -85,8 +86,15 @@ def _agent_item(record: AgentRecord) -> dict[str, Any]:
     hash key — DynamoDB rejects a PutItem where a GSI key attribute is
     present with a NULL type, so it must be OMITTED (not written as
     null/None) for the many agents that have no project_id (every flat
-    /api/v1/agents agent, Section 5.1 — project scoping is Section 38-only)."""
-    item = record.model_dump(mode="json")
+    /api/v1/agents agent, Section 5.1 — project scoping is Section 38-only).
+
+    native_to_decimal (Sprint 3 Phase 9) — boto3's Table resource rejects
+    bare Python floats outright; AgentRecord had no float field at all
+    until current_month_spend_usd (Section 67.3), so this conversion was
+    never needed here before (see app/modules/guardrails/store.py and
+    app/modules/runs/store.py for the same pattern already established
+    elsewhere, just never wired into this particular store)."""
+    item = cast("dict[str, Any]", native_to_decimal(record.model_dump(mode="json")))
     if item.get("project_id") is None:
         item.pop("project_id", None)
     return item
@@ -348,9 +356,7 @@ class AgentRegistryStore:
         updated_record = record.model_copy(
             update={"status": "DEPLOYING", "updated_by": updated_by, "updated_at": _now()}
         )
-        await asyncio.to_thread(
-            self._agents_table.put_item, Item=_agent_item(updated_record)
-        )
+        await asyncio.to_thread(self._agents_table.put_item, Item=_agent_item(updated_record))
         return updated_record
 
     async def mark_deployment_blocked(
@@ -369,9 +375,7 @@ class AgentRegistryStore:
         updated_record = record.model_copy(
             update={"status": new_status, "updated_by": updated_by, "updated_at": _now()}
         )
-        await asyncio.to_thread(
-            self._agents_table.put_item, Item=_agent_item(updated_record)
-        )
+        await asyncio.to_thread(self._agents_table.put_item, Item=_agent_item(updated_record))
         return updated_record
 
     async def mark_deployment_active(
@@ -390,9 +394,7 @@ class AgentRegistryStore:
                 "updated_at": _now(),
             }
         )
-        await asyncio.to_thread(
-            self._agents_table.put_item, Item=_agent_item(updated_record)
-        )
+        await asyncio.to_thread(self._agents_table.put_item, Item=_agent_item(updated_record))
         return updated_record
 
     async def mark_deployment_failed(
@@ -407,9 +409,73 @@ class AgentRegistryStore:
         updated_record = record.model_copy(
             update={"status": new_status, "updated_by": updated_by, "updated_at": _now()}
         )
-        await asyncio.to_thread(
-            self._agents_table.put_item, Item=_agent_item(updated_record)
+        await asyncio.to_thread(self._agents_table.put_item, Item=_agent_item(updated_record))
+        return updated_record
+
+    async def provision_api_key(
+        self, tenant_id: str, agent_id: str, api_key_secret_arn: str, updated_by: str
+    ) -> AgentRecord:
+        """Sprint 3 Phase 8 (S-02) — records the Secrets Manager ARN backing
+        a freshly-created agent's initial API key. Never the value itself
+        (R61) — the caller (app/api/v1/agents.py's create_agent) already
+        generated and stored the secret before calling this."""
+        record = await self._require_agent(tenant_id, agent_id)
+        updated_record = record.model_copy(
+            update={
+                "api_key_secret_arn": api_key_secret_arn,
+                "updated_by": updated_by,
+                "updated_at": _now(),
+            }
         )
+        await asyncio.to_thread(self._agents_table.put_item, Item=_agent_item(updated_record))
+        return updated_record
+
+    async def rotate_api_key(
+        self,
+        tenant_id: str,
+        agent_id: str,
+        new_api_key_secret_arn: str,
+        previous_key_expires_at: int,
+        updated_by: str,
+    ) -> AgentRecord:
+        """S-02 dual-key rotation (Section 64.4): moves the CURRENT arn to
+        previous_api_key_secret_arn with a grace-period expiry, and sets the
+        new arn as current. services/agent-runtime/auth.py's
+        ApiKeyAuthProvider (Phase 1, built ahead of this endpoint existing)
+        already accepts either key until previous_key_expires_at.
+
+        Raises NoApiKeyProvisionedError if the agent has no key to rotate
+        yet (e.g. an enterprise-mode agent — R60) — rotation only ever
+        moves an existing key, it never provisions a first one.
+        """
+        record = await self._require_agent(tenant_id, agent_id)
+        if record.api_key_secret_arn is None:
+            raise NoApiKeyProvisionedError(agent_id)
+        updated_record = record.model_copy(
+            update={
+                "previous_api_key_secret_arn": record.api_key_secret_arn,
+                "previous_key_expires_at": previous_key_expires_at,
+                "api_key_secret_arn": new_api_key_secret_arn,
+                "rotated_at": _now(),
+                "updated_by": updated_by,
+                "updated_at": _now(),
+            }
+        )
+        await asyncio.to_thread(self._agents_table.put_item, Item=_agent_item(updated_record))
+        return updated_record
+
+    async def revoke_api_key(self, tenant_id: str, agent_id: str, updated_by: str) -> AgentRecord:
+        """S-02 revocation. Idempotent — revoking an already-revoked agent
+        is a no-op success, not an error (there's no meaningful state-
+        machine violation the way e.g. double-approving a deployment is).
+        Sets api_key_revoked only; both api_key_secret_arn and
+        previous_api_key_secret_arn are left untouched so a subsequent
+        rotation still has a current key to move into the previous slot."""
+        record = await self._require_agent(tenant_id, agent_id)
+        updated_record = record.model_copy(
+            update={"api_key_revoked": True, "updated_by": updated_by, "updated_at": _now()}
+        )
+        await asyncio.to_thread(self._agents_table.put_item, Item=_agent_item(updated_record))
         return updated_record
 
     async def list_agents(
@@ -577,9 +643,7 @@ class AgentRegistryStore:
         )
 
         await self._versioner.write(version_record)
-        await asyncio.to_thread(
-            self._agents_table.put_item, Item=_agent_item(updated_record)
-        )
+        await asyncio.to_thread(self._agents_table.put_item, Item=_agent_item(updated_record))
         return updated_record, version_record
 
     # ── Delete (soft — DEPRECATED status) ───────────────────────────────
@@ -592,9 +656,7 @@ class AgentRegistryStore:
         updated_record = record.model_copy(
             update={"status": "DEPRECATED", "updated_by": updated_by, "updated_at": _now()}
         )
-        await asyncio.to_thread(
-            self._agents_table.put_item, Item=_agent_item(updated_record)
-        )
+        await asyncio.to_thread(self._agents_table.put_item, Item=_agent_item(updated_record))
         return updated_record
 
     # ── Project lifecycle (Section 38.11) — draft/published/deprecated/

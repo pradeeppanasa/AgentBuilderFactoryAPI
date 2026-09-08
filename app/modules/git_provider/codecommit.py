@@ -72,8 +72,14 @@ class CodeCommitProvider(GitProvider):
         return await asyncio.to_thread(_get)
 
     async def commit_files(
-        self, repo: str, branch: str, files: dict[str, str], message: str
+        self,
+        repo: str,
+        branch: str,
+        files: dict[str, str],
+        message: str,
+        omit_base_tree: bool = False,  # GitHub-only optimisation — see base.py; no-op here
     ) -> str:
+        del omit_base_tree
         repo_name = self._repo_name(repo)
 
         def _commit() -> str:

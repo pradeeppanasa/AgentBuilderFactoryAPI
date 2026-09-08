@@ -34,7 +34,13 @@ _SECRET_KEY = _ENV.get("AWS_SECRET_ACCESS_KEY", "local")
 
 _SECRETS = {
     "jwt-secret": "local-dev-jwt-signing-secret-not-for-production",
-    "git-token": "local-dev-git-token-not-for-production",
+    # GIT_PROVIDER_TOKEN (.env, gitignored) is the real PAT when the
+    # developer has set one — avoids re-pasting it into Secrets Manager
+    # every time LocalStack's data is wiped (Docker Desktop restart,
+    # `docker compose down -v`, etc.). Falls back to an obviously-fake
+    # placeholder — a real GitHub call against it 401s loudly rather than
+    # silently pretending to work.
+    "git-token": _ENV.get("GIT_PROVIDER_TOKEN") or "local-dev-git-token-not-for-production",
 }
 _BUCKETS = [
     _ENV.get("IAC_OUTPUT_BUCKET", "panasa-iac-artifacts-local"),
@@ -61,7 +67,16 @@ def _seed_secrets() -> None:
             client.create_secret(Name=name, SecretString=value)
             print(f"  created secret {name!r}")
         except client.exceptions.ResourceExistsException:
-            print(f"  secret {name!r} already exists")
+            # git-token is the one secret with an external source of truth
+            # (.env's GIT_PROVIDER_TOKEN) — re-sync it every run so a stale
+            # placeholder left over from a run before .env had a real PAT
+            # set doesn't linger forever. Every other secret here is
+            # locally generated with no such source, so leave it as-is.
+            if name == "git-token" and _ENV.get("GIT_PROVIDER_TOKEN"):
+                client.put_secret_value(SecretId=name, SecretString=value)
+                print(f"  secret {name!r} already exists — synced to .env's GIT_PROVIDER_TOKEN")
+            else:
+                print(f"  secret {name!r} already exists")
 
 
 def _seed_buckets() -> None:

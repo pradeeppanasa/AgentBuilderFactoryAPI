@@ -9,3 +9,5 @@ pydantic==2.10.4
 boto3==1.35.90
 litellm==1.96.2
 structlog==24.4.0
+# Sprint 3 Phase 9 (S-03, R70) — quota.py's rpm/rpd rate-limit counters.
+redis==5.2.1

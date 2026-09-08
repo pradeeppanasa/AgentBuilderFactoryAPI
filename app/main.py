@@ -14,6 +14,7 @@ from app.api.v1 import router as api_v1_router
 from app.config import settings
 from app.license.validator import LicenseError, LicenseValidator
 from app.middleware.xray import XRayMiddleware
+from app.modules.audit.security_log import SecurityAuditLogStore
 from app.modules.audit.writer import AuditWriter
 from app.modules.auth.db import create_db_engine, create_session_factory
 from app.modules.auth.secrets import fetch_jwt_secret
@@ -42,12 +43,14 @@ from app.modules.platform_settings.store import PlatformSettingsStore
 from app.modules.playground.store import PlaygroundSessionStore
 from app.modules.projects.store import ProjectStore
 from app.modules.prompts.store import PromptStore
+from app.modules.registry.config_validator import AgentConfigValidator
 from app.modules.registry.store import AgentRegistryStore
 from app.modules.runs.store import RunStore
 from app.modules.secrets.manager import SecretsManager
 from app.modules.skills.store import SkillStore
 from app.modules.task_planner.session_store import BuildWithAISessionStore
 from app.modules.telemetry.emitter import TelemetryConfig, TelemetryEmitter
+from app.modules.tool_registry.store import ToolRegistryStore
 from app.shared.aws_clients import (
     create_bedrock_agent_client,
     create_bedrock_client,
@@ -223,6 +226,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     platform_settings_store = PlatformSettingsStore(dynamodb, settings)
     await platform_settings_store.ensure_table()
     app.state.platform_settings_store = platform_settings_store
+
+    # Security Sprint 3 Phase 2 — Full Audit Trail (Section 61). Separate
+    # from app.state.audit_writer (S3 WORM, Section 14) — see
+    # security_log.py's module docstring for why both coexist.
+    security_audit_log_store = SecurityAuditLogStore(dynamodb, settings)
+    await security_audit_log_store.ensure_table()
+    app.state.security_audit_log_store = security_audit_log_store
+
+    # Security Sprint 3 Phase 7 — Tool Allowlist Registry (Section 62.2)
+    tool_registry_store = ToolRegistryStore(dynamodb, settings)
+    await tool_registry_store.ensure_table()
+    app.state.tool_registry_store = tool_registry_store
+    app.state.agent_config_validator = AgentConfigValidator(tool_registry_store)
 
     app.state.guardrail_engine = GuardrailEngine(
         create_bedrock_runtime_client(settings), mock_enabled=settings.mock_bedrock_guardrails

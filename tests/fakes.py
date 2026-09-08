@@ -13,6 +13,7 @@ import httpx
 from botocore.exceptions import ClientError
 
 from app.modules.git_provider.base import GitProvider
+from app.modules.git_provider.github import MissingWorkflowScopeError
 
 
 class FakeGitProvider(GitProvider):
@@ -22,15 +23,21 @@ class FakeGitProvider(GitProvider):
         self,
         existing_repos: set[str] | None = None,
         existing_files: set[str] | None = None,
+        raise_missing_workflow_scope: bool = False,
     ) -> None:
         self.existing_repos: set[str] = existing_repos or set()
         self.existing_files: set[str] = existing_files or set()
         """Paths that already exist on a repo's default branch — e.g. a
         CI/CD workflow file committed by an earlier deploy. Not keyed by
         repo since every test here exercises a single agent/repo."""
+        self.raise_missing_workflow_scope = raise_missing_workflow_scope
+        """Mirrors the real GitHubProvider's own commit_files() check —
+        raises MissingWorkflowScopeError only when `files` actually
+        contains a .github/workflows/ path, same condition."""
         self.created_repos: list[str] = []
         self.created_branches: list[tuple[str, str, str]] = []
         self.committed_files: list[tuple[str, str, dict[str, str], str]] = []
+        self.commit_omit_base_tree_calls: list[bool] = []
         self.opened_prs: list[tuple[str, str, str, str]] = []
         self.merged: list[tuple[str, str]] = []
         self.closed: list[tuple[str, str, str]] = []
@@ -49,9 +56,19 @@ class FakeGitProvider(GitProvider):
         return path in self.existing_files
 
     async def commit_files(
-        self, repo: str, branch: str, files: dict[str, str], message: str
+        self,
+        repo: str,
+        branch: str,
+        files: dict[str, str],
+        message: str,
+        omit_base_tree: bool = False,
     ) -> str:
+        if self.raise_missing_workflow_scope and any(
+            path.startswith(".github/workflows/") for path in files
+        ):
+            raise MissingWorkflowScopeError()
         self.committed_files.append((repo, branch, files, message))
+        self.commit_omit_base_tree_calls.append(omit_base_tree)
         return "fake-commit-sha"
 
     async def create_pull_request(
@@ -103,7 +120,12 @@ class FailingGitProvider(GitProvider):
         )
 
     async def commit_files(
-        self, repo: str, branch: str, files: dict[str, str], message: str
+        self,
+        repo: str,
+        branch: str,
+        files: dict[str, str],
+        message: str,
+        omit_base_tree: bool = False,
     ) -> str:
         raise AssertionError(
             "commit_files should never be reached — repository_exists fails first"

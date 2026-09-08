@@ -9,6 +9,7 @@ the real (moto-backed) client rather than reading it back from moto.
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 import boto3
@@ -34,18 +35,23 @@ class _RecordingCodeBuildClient:
 @pytest.fixture
 def codebuild_client():
     client = boto3.client("codebuild", region_name="eu-west-2")
+    # conftest.py's mocked_aws is session-scoped (perf refactor,
+    # 2026-09-08) — these projects now persist across the whole pytest
+    # session instead of a fresh set per test, so a second test hitting an
+    # unguarded create_project would raise ResourceAlreadyExistsException.
     for scan_type in SCAN_TYPES:
-        client.create_project(
-            name=codebuild_project_name(scan_type),
-            source={"type": "GITHUB", "location": "https://github.com/example/repo.git"},
-            artifacts={"type": "NO_ARTIFACTS"},
-            environment={
-                "type": "LINUX_CONTAINER",
-                "image": "aws/codebuild/standard:7.0",
-                "computeType": "BUILD_GENERAL1_SMALL",
-            },
-            serviceRole="arn:aws:iam::123456789012:role/service-role/test",
-        )
+        with contextlib.suppress(client.exceptions.ResourceAlreadyExistsException):
+            client.create_project(
+                name=codebuild_project_name(scan_type),
+                source={"type": "GITHUB", "location": "https://github.com/example/repo.git"},
+                artifacts={"type": "NO_ARTIFACTS"},
+                environment={
+                    "type": "LINUX_CONTAINER",
+                    "image": "aws/codebuild/standard:7.0",
+                    "computeType": "BUILD_GENERAL1_SMALL",
+                },
+                serviceRole="arn:aws:iam::123456789012:role/service-role/test",
+            )
     return _RecordingCodeBuildClient(client)
 
 

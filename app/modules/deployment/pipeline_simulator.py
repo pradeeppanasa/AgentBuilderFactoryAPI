@@ -41,6 +41,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from aws_xray_sdk.core import xray_recorder
+
 from app.config import Settings
 from app.modules.deployment.iac_scan_runner import IaCScanRunner
 from app.modules.deployment.models import DEPLOYMENT_STAGE_ORDER, DeploymentRecord
@@ -48,6 +50,7 @@ from app.modules.deployment.status_store import DeploymentStatusStore
 from app.modules.git_provider._util import agent_repo_identifier
 from app.modules.registry.models import AgentConfiguration
 from app.modules.registry.store import AgentRegistryStore
+from app.modules.security.models import SecurityScanSummary
 from app.shared.logging import get_logger
 
 log = get_logger()
@@ -55,6 +58,34 @@ log = get_logger()
 _PRE_SCAN_STAGES = ["VALIDATING", "CHANGE_IMPACT", "GENERATING_IAC"]
 _POST_SCAN_FAKE_STAGES = ["EVALUATING", "TERRAFORM_PLAN"]
 _STAGES_APPLYING_ONWARD = ["APPLYING", "DEPLOYING"]  # HEALTH_CHECK is paired with ACTIVE below
+
+_SEVERITY_SORT_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+_SECURITY_FINDINGS_OUTPUT_CHAR_LIMIT = 4000
+"""Real tfsec/checkov output can run to dozens of findings — worst
+(CRITICAL/HIGH) first, matching StageResult.output_summary's own
+"human-readable, never raw payloads" rule (Section 4.4): every field here
+already comes from SecurityFinding (severity/category/description/
+location), never raw tool stdout."""
+
+
+def _format_security_findings(summary: SecurityScanSummary) -> str:
+    """The one-line summary() alone (e.g. "tfsec + checkov: 1 critical, 7
+    high, ...") used to be the entire output_summary — the per-finding
+    detail was computed by IaCScanRunner but then discarded, with no way
+    for a user to see anything beyond the aggregate counts already shown
+    in the Console's stage tracker. This is the fix: the same detail
+    TERRAFORM_VALIDATE's own output_summary already shows per-check."""
+    if not summary.findings:
+        return summary.summary
+
+    sorted_findings = sorted(
+        summary.findings, key=lambda f: _SEVERITY_SORT_ORDER.get(f.severity, 4)
+    )
+    lines = [summary.summary, ""]
+    for finding in sorted_findings:
+        location = f" ({finding.location})" if finding.location else ""
+        lines.append(f"{finding.severity:<8} {finding.category}: {finding.description}{location}")
+    return "\n".join(lines)[:_SECURITY_FINDINGS_OUTPUT_CHAR_LIMIT]
 
 assert DEPLOYMENT_STAGE_ORDER == [
     "VALIDATING",
@@ -69,6 +100,25 @@ assert DEPLOYMENT_STAGE_ORDER == [
     "DEPLOYING",
     "HEALTH_CHECK",
 ], "pipeline_simulator's hardcoded stage groupings assume this exact order"
+
+
+def _detach_from_request_xray_segment() -> None:
+    """run()/resume_after_approval() are FastAPI BackgroundTasks — they
+    execute after the triggering request's own response has been sent, by
+    which point app/middleware/xray.py's `finally: xray_recorder.
+    end_segment()` may already have run for that request. AsyncContext
+    propagates contextvars into the background task regardless, so without
+    this it doesn't see "no segment" (which app/main.py's
+    context_missing="LOG_ERROR" already handles gracefully) — it sees a
+    REAL but already-ended segment reference, and the first boto3 call
+    inside it (patch(["boto3"]) instruments every one) raises
+    aws_xray_sdk.core.exceptions.exceptions.AlreadyEndedException,
+    aborting the whole background run. Reproduced live: every deployment
+    sat at PENDING forever, `deployment_pipeline_simulator.run.failed` in
+    the logs on literally the first DynamoDB call. clear_trace_entities()
+    drops that stale reference so subsequent boto3 calls correctly hit the
+    already-handled "no segment" path instead."""
+    xray_recorder.clear_trace_entities()
 
 
 class DeploymentPipelineSimulator:
@@ -105,6 +155,7 @@ class DeploymentPipelineSimulator:
         TERRAFORM_VALIDATE/POLICY_CHECK path (see module docstring); either
         omitted falls back to fabricating all three like every other stage.
         """
+        _detach_from_request_xray_segment()
         try:
             record = await self._deployments.get_deployment(agent_id, deployment_id)
             if record is None:
@@ -137,6 +188,7 @@ class DeploymentPipelineSimulator:
     ) -> None:
         """Entry point for a "manual"-mode deployment that was just approved
         via POST .../approve — continues from APPLYING onward."""
+        _detach_from_request_xray_segment()
         try:
             record = await self._deployments.get_deployment(agent_id, deployment_id)
             if record is None:
@@ -183,7 +235,7 @@ class DeploymentPipelineSimulator:
             deployment_id,
             stage="SECURITY_SCANNING",
             stage_status="PASSED",
-            output_summary=scan_result.security_summary.summary,
+            output_summary=_format_security_findings(scan_result.security_summary),
         )
 
         await self._advance_stages(agent_id, deployment_id, ["EVALUATING"])

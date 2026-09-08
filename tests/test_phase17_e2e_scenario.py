@@ -65,10 +65,48 @@ def _bearer(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+async def _register_tool(tool_id: str, display_name: str) -> None:
+    """Sprint 3 Phase 7 (S-13a, Section 62.2) — approves a tool in the
+    platform-wide registry, mirroring an admin's one-time review before any
+    agent may reference it. Must be called only after `with TestClient(app)`
+    has entered (app.state.dynamodb/tool_registry_store don't exist until
+    the lifespan hook has run — see fake_git's docstring above for the same
+    ordering constraint)."""
+    from datetime import UTC, datetime
+
+    from app.config import settings
+    from app.modules.tool_registry.models import ToolRegistryEntry
+
+    entry = ToolRegistryEntry(
+        tool_id=tool_id,
+        display_name=display_name,
+        risk_level="LOW",
+        allowed_scopes=[],
+        lambda_arn=None,
+        last_reviewed_at=datetime.now(UTC).isoformat(),
+        reviewed_by="test-admin@panasatech.com",
+        status="APPROVED",
+    )
+    table = app.state.dynamodb.Table(settings.dynamodb_tool_registry_table)
+    await asyncio.to_thread(table.put_item, Item=entry.model_dump())
+
+
 def _kyc_configuration(
     system_prompt: str = "You are a KYC verification agent for {{company_name}}.",
     tools: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    resolved_tools = (
+        tools
+        if tools is not None
+        else [
+            {
+                "tool_id": "jira",
+                "tool_name": "Jira",
+                "executor_type": "http",
+                "endpoint": "https://acme.atlassian.net/rest/api/3",
+            }
+        ]
+    )
     return {
         "model_id": "anthropic.claude-3-5-sonnet-20241022-v2:0",
         "model_provider": "bedrock",
@@ -86,18 +124,16 @@ def _kyc_configuration(
             "s3_bucket": "customer-kyc-kb",
             "top_k": 5,
         },
-        "tools": (
-            tools
-            if tools is not None
-            else [
-                {
-                    "tool_id": "jira",
-                    "tool_name": "Jira",
-                    "executor_type": "http",
-                    "endpoint": "https://acme.atlassian.net/rest/api/3",
-                }
-            ]
-        ),
+        "tools": resolved_tools,
+        # Sprint 3 Phase 4 (S-08, R64) — every configured tool needs a
+        # matching tool_policies entry or the runtime denies it by default;
+        # Phase 7's AgentConfigValidator (S-13a) now enforces this at
+        # save-time too. Derived 1:1 from resolved_tools so every call site
+        # below (base config, edited prompt, Jira+Salesforce v3) stays in
+        # sync automatically.
+        "tool_policies": [
+            {"tool": t["tool_id"], "allowed": True, "risk": "LOW"} for t in resolved_tools
+        ],
         "human_review": {
             "enabled": True,
             "trigger_conditions": ["high_risk_decision"],
@@ -243,6 +279,8 @@ async def test_phase17_full_lifecycle_e2e(make_user_and_token, fake_git: FakeGit
 
     with TestClient(app) as client:
         app.state.git_provider = fake_git
+        await _register_tool("jira", "Jira")
+        await _register_tool("salesforce", "Salesforce")
         _, token = await make_user_and_token(TENANT, role="developer")
         headers = _bearer(token)
 

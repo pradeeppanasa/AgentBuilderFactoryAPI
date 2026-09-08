@@ -24,26 +24,34 @@ from app.modules.platform.health import (
 
 
 async def test_check_database_ok_when_table_exists() -> None:
+    # Perf refactor (2026-09-08): conftest.py's mocked_aws is now
+    # session-scoped, so a hand-rolled create_table with a schema that
+    # diverges from the real one (this used to omit AgentRegistryStore's
+    # project-index GSI) would either raise ResourceInUseException once
+    # some other test has already created the real table, or — if this
+    # test happened to run first — permanently poison the shared table's
+    # schema for the rest of the session. Using the real store's own
+    # ensure_tables() (same pattern as test_policy_enforcement.py) is both
+    # correct and already idempotent (ResourceInUseException-safe).
+    from app.modules.registry.store import AgentRegistryStore
+
     dynamodb = boto3.resource("dynamodb", region_name="eu-west-2")
-    dynamodb.create_table(
-        TableName=settings.dynamodb_agents_table,
-        KeySchema=[
-            {"AttributeName": "tenant_id", "KeyType": "HASH"},
-            {"AttributeName": "agent_id", "KeyType": "RANGE"},
-        ],
-        AttributeDefinitions=[
-            {"AttributeName": "tenant_id", "AttributeType": "S"},
-            {"AttributeName": "agent_id", "AttributeType": "S"},
-        ],
-        BillingMode="PAY_PER_REQUEST",
-    )
+    await AgentRegistryStore(dynamodb, settings).ensure_tables()
 
     assert await check_database(dynamodb, settings) == "ok"
 
 
 async def test_check_database_error_when_table_missing() -> None:
+    # Perf refactor (2026-09-08): the real agents table now persists for
+    # the whole session (almost certainly already created by an earlier
+    # test), so "missing" can no longer be exercised via the shared table
+    # name — point check_database at a name guaranteed never to exist
+    # instead of relying on settings.dynamodb_agents_table being absent.
     dynamodb = boto3.resource("dynamodb", region_name="eu-west-2")
-    assert await check_database(dynamodb, settings) == "error"
+    missing_table_settings = settings.model_copy(
+        update={"dynamodb_agents_table": "panasa-agents-table-that-does-not-exist"}
+    )
+    assert await check_database(dynamodb, missing_table_settings) == "error"
 
 
 async def test_check_storage_ok_when_bucket_exists() -> None:

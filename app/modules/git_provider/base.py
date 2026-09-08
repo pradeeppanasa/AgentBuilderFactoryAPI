@@ -56,9 +56,35 @@ class GitProvider(ABC):
 
     @abstractmethod
     async def commit_files(
-        self, repo: str, branch: str, files: dict[str, str], message: str
+        self,
+        repo: str,
+        branch: str,
+        files: dict[str, str],
+        message: str,
+        omit_base_tree: bool = False,
     ) -> str:
-        """Commit files to branch. Returns the new commit SHA/id."""
+        """Commit files to branch. Returns the new commit SHA/id.
+
+        omit_base_tree=True is a GitHub-specific optimisation for the one
+        case where `files` is already a complete, exhaustive description of
+        everything that should exist on `branch` — the true v1 direct-to-
+        main commit, whose repo was created moments ago and has nothing on
+        it yet but create_repository()'s own auto-init commit (which
+        `files` already supersedes: it includes its own README.md).
+        GitHub's Git Data API can briefly 404 building a tree that
+        references that just-created auto-init commit's tree sha as
+        `base_tree` while it propagates (github.py's
+        _post_retrying_404/_TREE_PROPAGATION_* — widened three times now
+        and still occasionally insufficient, up to ~90s observed live).
+        Building the tree from `files` alone, with no `base_tree`
+        reference to any pre-existing (possibly-not-yet-propagated)
+        object, sidesteps that dependency entirely rather than just
+        waiting longer for it to resolve. Not safe when `files` is a
+        partial update (v2+ deploys, which may omit an already-committed,
+        not-regenerated file like the CI/CD workflow — see cicd_templates.
+        py) — every other provider ignores this parameter; only GitHub's
+        commit mechanism has a base_tree concept to skip.
+        """
         ...
 
     @abstractmethod

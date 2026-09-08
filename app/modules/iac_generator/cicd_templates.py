@@ -57,6 +57,7 @@ succeeded but that same attempt's commit_files() call then failed.
 from __future__ import annotations
 
 from app.modules.deployment.models import ApprovalMode, CICDProvider
+from app.modules.iac_generator.policy_check_script import generate_policy_check_script
 
 # Stage 1 commands are illustrative of the five scan types R58/45.5 name,
 # not a specific vendor endorsement — a customer is free to swap tools in
@@ -88,6 +89,68 @@ deployment-metadata.json (agent_id/tenant_id/deployment_id/version/status,
 regenerated every deploy) sits right next to the .tf files, same as
 terraform.auto.tfvars.json."""
 
+_DEPLOY_ROLE_NAME = "panasa-deploy-role"
+"""Must match bootstrap/stage1/github_oidc.tf's aws_iam_role name exactly
+— that Terraform creates the role this workflow assumes; there is no
+Terraform output wired to this Python constant (bootstrap is a one-time,
+human-run step, not something the Runtime reads from — R03/F0), so the
+two are kept in sync by convention, both using the default
+var.resource_prefix ("panasa"). If a customer ever changes resource_prefix
+away from the default, this constant must be updated to match."""
+
+_AWS_CREDENTIALS_STEP = f"""      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{{{ secrets.AWS_ACCOUNT_ID }}}}:role/{_DEPLOY_ROLE_NAME}
+          aws-region: ${{{{ secrets.AWS_REGION }}}}
+"""
+"""Sprint 3 Phase 6 (S-04) — GitHub OIDC, not static long-lived keys.
+AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY are gone from GitHub Secrets
+entirely; only AWS_ACCOUNT_ID (not sensitive on its own, but kept in
+Secrets for consistency with the other two) and AWS_REGION remain. The
+`permissions: id-token: write` block this needs is set once at the
+workflow level (see content= below), not per-step — GitHub's own
+requirement for the OIDC token exchange configure-aws-credentials@v4
+performs.
+
+GitHub-only for now (other providers' own credential-injection idioms —
+GitLab CI/CD variables, Azure service connections, CodeBuild's environment
+role, Bitbucket repository variables — differ enough not to share one
+string; extend per-provider if/when those need the same treatment)."""
+
+# GitHub Actions-specific — install steps interleaved directly before the
+# scan command that needs them (some job setup already covers a tool no
+# install step is listed for: checkov/tfsec ship via existing base image
+# tooling assumptions the other 4 providers' _SCAN_COMMANDS share; not
+# duplicated here to keep this list's shape a strict superset of that one).
+_GITHUB_SCAN_STEPS = [
+    ("SAST", "pip install semgrep safety", "semgrep --config auto ."),
+    (
+        "Secret scan",
+        # One chained command, not two separate `run:` lines — a plain
+        # YAML scalar spanning multiple lines folds them together with a
+        # single space, which would silently mangle two shell commands
+        # into one broken line (curl's own args swallowing apt-get's).
+        "sudo apt-get update -qq && sudo apt-get install -y curl && "
+        "curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/"
+        "main/scripts/install.sh | sh -s -- -b /usr/local/bin",
+        "trufflehog filesystem . --fail",
+    ),
+    ("IaC scan", None, "checkov -d . && tfsec ."),
+    ("Dependency scan", "pip install semgrep safety", "safety check --full-report"),
+    (
+        "SBOM",
+        "curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh",
+        "syft . -o spdx-json=sbom.json",
+    ),
+    (
+        "Container scan",
+        "curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/"
+        "install.sh | sh -s -- -b /usr/local/bin",
+        "trivy fs --exit-code 1 --severity HIGH,CRITICAL .",
+    ),
+]
+
 
 def generate_cicd_workflow(
     provider: CICDProvider, approval_mode: ApprovalMode, agent_id: str
@@ -112,37 +175,28 @@ def generate_cicd_workflow(
     return generators[provider](approval_mode, tf_dir)
 
 
-def _github_actions(approval_mode: ApprovalMode, tf_dir: str) -> tuple[str, str]:
+def _github_actions(_approval_mode: ApprovalMode, tf_dir: str) -> tuple[str, str]:
+    """_approval_mode is unused here — deliberately, not an oversight: this
+    provider's terraform_apply job always carries `environment: production`
+    (a required-reviewer check on that GitHub Environment IS the R50
+    approval gate — CLAUDE.md instruction, 2026-09-07), and the automated-
+    mode-only auto-merge step this used to have is gone too. Every GitHub
+    Actions deploy now goes through the same one shape; the other 4
+    providers still branch on approval_mode for their own Stage 5 (see
+    each's own gate_job/gate_note/gate_step)."""
     scan_steps = "\n".join(
-        f"""      - name: {name}
+        (
+            f"""      - name: {name}
         run: {command}"""
-        for name, command in _SCAN_COMMANDS
+            if install is None
+            else f"""      - name: Install tooling for {name}
+        run: {install}
+      - name: {name}
+        run: {command}"""
+        )
+        for name, install, command in _GITHUB_SCAN_STEPS
     )
-    auto_merge_step = (
-        ""
-        if approval_mode == "manual"
-        else """
-      - name: Auto-merge (automated approval mode — POLICY_CHECK is the only gate)
-        if: github.event_name == 'pull_request'
-        run: gh pr merge --auto --squash "${{ github.event.pull_request.number }}"
-        env:
-          GH_TOKEN: ${{ github.token }}
-"""
-    )
-    gate_job = (
-        """
-  gate:
-    name: "Stage 5 — Approval gate"
-    needs: terraform_plan
-    runs-on: ubuntu-latest
-    environment: production  # a required reviewer on this environment is the approval gate
-    steps:
-      - run: echo "Awaiting manual approval via the 'production' environment's protection rule."
-"""
-        if approval_mode == "manual"
-        else ""
-    )
-    apply_needs = "gate" if approval_mode == "manual" else "terraform_plan"
+    policy_check_script_path, _policy_check_script_content = generate_policy_check_script()
     content = f"""name: Panasa Deploy
 
 on:
@@ -150,6 +204,15 @@ on:
     branches: [main]
   push:
     branches: [main]
+
+# Sprint 3 Phase 6 (S-04) — required once, at workflow level, for
+# aws-actions/configure-aws-credentials@v4's OIDC token exchange
+# (bootstrap/stage1/github_oidc.tf's IAM OIDC provider trusts this
+# token). Applies to every job below by default; a job would need its
+# own `permissions:` block to narrow this further, none currently do.
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
   security_scan:
@@ -169,7 +232,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
-      - run: terraform fmt -check
+{_AWS_CREDENTIALS_STEP}      - run: terraform fmt -check
       - run: terraform init
       - run: terraform validate
 
@@ -179,8 +242,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: {_POLICY_CHECK_COMMAND}
-{auto_merge_step}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: hashicorp/setup-terraform@v3
+      - run: pip install python-hcl2
+      - name: Run Panasa policy checks
+        run: python {policy_check_script_path} {tf_dir}
+
   terraform_plan:
     name: "Stage 4 — Terraform plan"
     needs: policy_check
@@ -191,7 +260,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
-      - run: terraform init
+{_AWS_CREDENTIALS_STEP}      - run: terraform init
       - run: terraform plan -out=tfplan
       - name: Post plan as PR comment
         if: github.event_name == 'pull_request'
@@ -202,19 +271,21 @@ jobs:
         with:
           name: tfplan
           path: {tf_dir}/tfplan
-{gate_job}
+
   terraform_apply:
     name: "Stage 6 — Terraform apply"
-    needs: {apply_needs}
+    needs: terraform_plan
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # R50 human approval gate — set a required reviewer on this GitHub Environment
+    environment: production
     defaults:
       run:
         working-directory: {tf_dir}
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
-      - uses: actions/download-artifact@v4
+{_AWS_CREDENTIALS_STEP}      - uses: actions/download-artifact@v4
         with:
           name: tfplan
           path: {tf_dir}

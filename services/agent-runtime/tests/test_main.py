@@ -5,27 +5,82 @@ patched BEFORE main is first imported in this process. sub-components
 (LLMClient, RAGClient, …) are safe to construct for real here: building a
 boto3 client object never makes a network call or needs real credentials,
 only actually *calling* one does — and these tests never call /chat
-without first replacing orchestrator.run with a fake."""
+without first replacing orchestrator.run with a fake.
+
+Sprint 3 Phase 1 (CLAUDE.md Section 64.1) replaced the old AGENT_API_KEY
+env-var check with auth_middleware, backed by auth.auth_chain (Secrets
+Manager) and config_loader.get_current_agent_record (a fresh per-request
+DynamoDB read, separate from the startup-cached agent_config). Every test
+here also patches get_current_agent_record and auth's Secrets Manager
+client, and neuters audit writes to a fast in-memory recorder — none of
+these tests should ever attempt a real AWS call.
+"""
 
 from __future__ import annotations
 
 import sys
+import time
 from typing import Any
 
+import auth as auth_module
 import pytest
 from fastapi.testclient import TestClient
 
 
-def _fresh_main(monkeypatch: pytest.MonkeyPatch, config: dict[str, Any]) -> Any:
+class _FakeSecretsClient:
+    def __init__(self, values: dict[str, str]) -> None:
+        self._values = values
+
+    def get_secret_value(self, SecretId: str) -> dict[str, str]:
+        return {"SecretString": self._values[SecretId]}
+
+
+class _AuditRecorder:
+    """Replaces audit.write_audit_event in-process — fast, no AWS call,
+    and lets tests assert on exactly what was recorded."""
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    def __call__(self, **kwargs: Any) -> None:
+        self.events.append(kwargs)
+
+
+@pytest.fixture(autouse=True)
+def _reset_auth_key_cache() -> None:
+    auth_module._key_cache.clear()
+    yield
+    auth_module._key_cache.clear()
+
+
+def _fresh_main(
+    monkeypatch: pytest.MonkeyPatch,
+    config: dict[str, Any],
+    agent_record: dict[str, Any] | None = None,
+    secrets: dict[str, str] | None = None,
+) -> Any:
     monkeypatch.setenv("AGENT_ID", config["agent_id"])
     monkeypatch.setenv("TENANT_ID", config["tenant_id"])
 
     import config_loader
 
     monkeypatch.setattr(config_loader, "load_agent_config", lambda dynamodb=None: config)
+    monkeypatch.setattr(
+        config_loader,
+        "get_current_agent_record",
+        lambda dynamodb=None: agent_record
+        if agent_record is not None
+        else {"tenant_id": config["tenant_id"], "agent_id": config["agent_id"]},
+    )
+
+    monkeypatch.setattr(
+        auth_module, "_get_secrets_client", lambda: _FakeSecretsClient(secrets or {})
+    )
 
     sys.modules.pop("main", None)
     import main as main_module
+
+    monkeypatch.setattr(main_module, "write_audit_event", _AuditRecorder())
 
     return main_module
 
@@ -44,6 +99,19 @@ def _config(**overrides: Any) -> dict[str, Any]:
     return defaults
 
 
+_KEY_ARN = "arn:aws:secretsmanager:eu-west-2:123456789012:secret:faq-agent-1-api-key"
+
+
+def _agent_record_with_key(**overrides: Any) -> dict[str, Any]:
+    defaults: dict[str, Any] = {
+        "tenant_id": "tenant-a",
+        "agent_id": "faq-agent-1",
+        "api_key_secret_arn": _KEY_ARN,
+    }
+    defaults.update(overrides)
+    return defaults
+
+
 def test_health_returns_agent_identity(monkeypatch: pytest.MonkeyPatch) -> None:
     main_module = _fresh_main(monkeypatch, _config())
 
@@ -55,6 +123,27 @@ def test_health_returns_agent_identity(monkeypatch: pytest.MonkeyPatch) -> None:
     assert body["status"] == "healthy"
     assert body["agent_id"] == "faq-agent-1"
     assert body["agent_name"] == "FAQ Agent"
+
+
+def test_health_requires_no_auth_even_when_agent_lookup_would_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/health must stay reachable even if the DB lookup auth_middleware
+    would otherwise perform is broken — it is exempt entirely, not just
+    "usually passes auth"."""
+    main_module = _fresh_main(monkeypatch, _config())
+
+    import config_loader
+
+    def _boom(dynamodb: Any = None) -> Any:
+        raise RuntimeError("DynamoDB unreachable")
+
+    monkeypatch.setattr(config_loader, "get_current_agent_record", _boom)
+
+    with TestClient(main_module.app) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 200
 
 
 def test_config_endpoint_never_leaks_system_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -89,9 +178,16 @@ def test_config_endpoint_never_leaks_system_prompt(monkeypatch: pytest.MonkeyPat
 
 
 def test_chat_returns_orchestrator_result(monkeypatch: pytest.MonkeyPatch) -> None:
-    main_module = _fresh_main(monkeypatch, _config())
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record=_agent_record_with_key(),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
 
-    async def _fake_run(message: str, session_id: str, user_id: str | None = None) -> dict[str, Any]:
+    async def _fake_run(
+        message: str, session_id: str, user_id: str | None = None
+    ) -> dict[str, Any]:
         return {
             "response": "The refund window is 30 days.",
             "session_id": session_id,
@@ -103,7 +199,9 @@ def test_chat_returns_orchestrator_result(monkeypatch: pytest.MonkeyPatch) -> No
 
     with TestClient(main_module.app) as client:
         response = client.post(
-            "/chat", json={"message": "What's your refund policy?", "session_id": "s1"}
+            "/chat",
+            json={"message": "What's your refund policy?", "session_id": "s1"},
+            headers={"Authorization": "Bearer sk-correct"},
         )
 
     assert response.status_code == 200
@@ -115,60 +213,588 @@ def test_chat_returns_orchestrator_result(monkeypatch: pytest.MonkeyPatch) -> No
 def test_chat_returns_500_with_no_internal_detail_on_orchestrator_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    main_module = _fresh_main(monkeypatch, _config())
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record=_agent_record_with_key(),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
 
-    async def _failing_run(message: str, session_id: str, user_id: str | None = None) -> dict[str, Any]:
+    async def _failing_run(
+        message: str, session_id: str, user_id: str | None = None
+    ) -> dict[str, Any]:
         raise RuntimeError("Bedrock threw a very specific internal exception with sensitive detail")
 
     monkeypatch.setattr(main_module.orchestrator, "run", _failing_run)
 
     with TestClient(main_module.app) as client:
-        response = client.post("/chat", json={"message": "hi", "session_id": "s1"})
+        response = client.post(
+            "/chat",
+            json={"message": "hi", "session_id": "s1"},
+            headers={"Authorization": "Bearer sk-correct"},
+        )
 
     assert response.status_code == 500
     assert "sensitive detail" not in response.text
     assert response.json()["detail"] == "Agent execution failed"
 
 
-def test_chat_without_api_key_configured_requires_no_auth(monkeypatch: pytest.MonkeyPatch) -> None:
-    main_module = _fresh_main(monkeypatch, _config())
-    monkeypatch.delenv("AGENT_API_KEY", raising=False)
+def test_chat_with_valid_api_key_returns_200(monkeypatch: pytest.MonkeyPatch) -> None:
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record=_agent_record_with_key(),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
 
-    async def _fake_run(message: str, session_id: str, user_id: str | None = None) -> dict[str, Any]:
+    async def _fake_run(
+        message: str, session_id: str, user_id: str | None = None
+    ) -> dict[str, Any]:
         return {"response": "ok", "session_id": session_id, "run_id": "r1", "hitl_pending": False}
 
     monkeypatch.setattr(main_module.orchestrator, "run", _fake_run)
 
     with TestClient(main_module.app) as client:
-        response = client.post("/chat", json={"message": "hi", "session_id": "s1"})
+        response = client.post(
+            "/chat",
+            json={"message": "hi", "session_id": "s1"},
+            headers={"Authorization": "Bearer sk-correct"},
+        )
 
     assert response.status_code == 200
 
 
-def test_chat_with_api_key_configured_rejects_missing_or_wrong_key(
+def test_chat_with_wrong_api_key_returns_401(monkeypatch: pytest.MonkeyPatch) -> None:
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record=_agent_record_with_key(),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
+
+    with TestClient(main_module.app) as client:
+        response = client.post(
+            "/chat",
+            json={"message": "hi", "session_id": "s1"},
+            headers={"Authorization": "Bearer wrong-key"},
+        )
+
+    assert response.status_code == 401
+    audit_events = main_module.write_audit_event.events
+    assert any(e["event_type"] == "auth.failed" for e in audit_events)
+
+
+def test_chat_with_no_authorization_header_returns_401(monkeypatch: pytest.MonkeyPatch) -> None:
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record=_agent_record_with_key(),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
+
+    with TestClient(main_module.app) as client:
+        response = client.post("/chat", json={"message": "hi", "session_id": "s1"})
+
+    assert response.status_code == 401
+
+
+def test_chat_with_no_key_provisioned_for_agent_returns_401(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    main_module = _fresh_main(monkeypatch, _config())
-    monkeypatch.setenv("AGENT_API_KEY", "correct-key")
+    """An agent with no api_key_secret_arn at all must default-deny —
+    never silently allow every caller through."""
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record={"tenant_id": "tenant-a", "agent_id": "faq-agent-1"},
+    )
 
-    async def _fake_run(message: str, session_id: str, user_id: str | None = None) -> dict[str, Any]:
+    with TestClient(main_module.app) as client:
+        response = client.post(
+            "/chat",
+            json={"message": "hi", "session_id": "s1"},
+            headers={"Authorization": "Bearer anything"},
+        )
+
+    assert response.status_code == 401
+
+
+def test_chat_with_revoked_key_returns_401_even_if_key_value_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record=_agent_record_with_key(api_key_revoked=True),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
+
+    with TestClient(main_module.app) as client:
+        response = client.post(
+            "/chat",
+            json={"message": "hi", "session_id": "s1"},
+            headers={"Authorization": "Bearer sk-correct"},
+        )
+
+    assert response.status_code == 401
+
+
+def test_chat_accepts_previous_key_during_rotation_grace_period(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prev_arn = "arn:aws:secretsmanager:eu-west-2:123456789012:secret:faq-agent-1-api-key-old"
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record=_agent_record_with_key(
+            previous_api_key_secret_arn=prev_arn,
+            previous_key_expires_at=time.time() + 3600,
+        ),
+        secrets={_KEY_ARN: "sk-new", prev_arn: "sk-old"},
+    )
+
+    async def _fake_run(
+        message: str, session_id: str, user_id: str | None = None
+    ) -> dict[str, Any]:
         return {"response": "ok", "session_id": session_id, "run_id": "r1", "hitl_pending": False}
 
     monkeypatch.setattr(main_module.orchestrator, "run", _fake_run)
 
     with TestClient(main_module.app) as client:
-        no_key = client.post("/chat", json={"message": "hi", "session_id": "s1"})
-        wrong_key = client.post(
+        response = client.post(
             "/chat",
             json={"message": "hi", "session_id": "s1"},
-            headers={"Authorization": "Bearer wrong-key"},
-        )
-        right_key = client.post(
-            "/chat",
-            json={"message": "hi", "session_id": "s1"},
-            headers={"Authorization": "Bearer correct-key"},
+            headers={"Authorization": "Bearer sk-old"},
         )
 
-    assert no_key.status_code == 401
-    assert wrong_key.status_code == 401
-    assert right_key.status_code == 200
+    assert response.status_code == 200
+
+
+def test_chat_rejects_previous_key_once_grace_period_has_expired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prev_arn = "arn:aws:secretsmanager:eu-west-2:123456789012:secret:faq-agent-1-api-key-old"
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record=_agent_record_with_key(
+            previous_api_key_secret_arn=prev_arn,
+            previous_key_expires_at=time.time() - 10,
+        ),
+        secrets={_KEY_ARN: "sk-new", prev_arn: "sk-old"},
+    )
+
+    with TestClient(main_module.app) as client:
+        response = client.post(
+            "/chat",
+            json={"message": "hi", "session_id": "s1"},
+            headers={"Authorization": "Bearer sk-old"},
+        )
+
+    assert response.status_code == 401
+
+
+def test_chat_tenant_mismatch_returns_403_and_writes_audit_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R67 — even a caller who authenticates successfully must be denied if
+    the resulting AuthContext's tenant doesn't match this agent's own DB
+    record. Not naturally reachable through ApiKeyAuthProvider alone today
+    (its AuthContext.tenant_id is always copied from the very record being
+    checked) — this exercises the middleware's own comparison directly by
+    swapping in a fake auth chain, the same way it will become reachable
+    for real once JwtAuthProvider (S-12) starts returning external tenant
+    claims."""
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record=_agent_record_with_key(),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
+
+    from auth import AuthContext
+
+    class _FakeChain:
+        async def authenticate(
+            self, authorization: str, agent_record: dict[str, Any]
+        ) -> AuthContext:
+            return AuthContext(
+                tenant_id="some-other-tenant",
+                agent_id=agent_record["agent_id"],
+                principal_id="jwt-caller",
+                auth_method="jwt",
+            )
+
+    monkeypatch.setattr(main_module, "auth_chain", _FakeChain())
+
+    with TestClient(main_module.app) as client:
+        response = client.post(
+            "/chat",
+            json={"message": "hi", "session_id": "s1"},
+            headers={"Authorization": "Bearer sk-correct"},
+        )
+
+    assert response.status_code == 403
+    audit_events = main_module.write_audit_event.events
+    mismatch_events = [e for e in audit_events if e["event_type"] == "auth.tenant_mismatch"]
+    assert len(mismatch_events) == 1
+    assert mismatch_events[0]["tenant_id"] == "some-other-tenant"
+    assert mismatch_events[0]["result"] == "denied"
+
+
+def test_chat_returns_403_when_orchestrator_raises_tool_denied_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sprint 3 Phase 4 (R64) — HTTP-layer mapping only; ToolPolicyEngine's
+    own decision logic is covered directly in tests/test_tool_policy.py,
+    and its propagation out of ToolExecutor.execute() in
+    tests/test_tool_executor.py."""
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record=_agent_record_with_key(),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
+
+    from tool_policy import ToolDeniedError
+
+    async def _denied_run(message: str, session_id: str, user_id: str | None = None) -> Any:
+        raise ToolDeniedError(
+            "db-delete", "Tool 'db-delete' not in agent tool policy — default deny"
+        )
+
+    monkeypatch.setattr(main_module.orchestrator, "run", _denied_run)
+
+    with TestClient(main_module.app) as client:
+        response = client.post(
+            "/chat",
+            json={"message": "hi", "session_id": "s1"},
+            headers={"Authorization": "Bearer sk-correct"},
+        )
+
+    assert response.status_code == 403
+    assert "default deny" in response.json()["detail"]
+
+
+def test_chat_returns_202_awaiting_approval_when_orchestrator_raises_approval_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record=_agent_record_with_key(),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
+
+    from tool_policy import ApprovalRequiredError
+
+    async def _pending_run(message: str, session_id: str, user_id: str | None = None) -> Any:
+        raise ApprovalRequiredError("payment-transfer")
+
+    monkeypatch.setattr(main_module.orchestrator, "run", _pending_run)
+
+    with TestClient(main_module.app) as client:
+        response = client.post(
+            "/chat",
+            json={"message": "hi", "session_id": "s1"},
+            headers={"Authorization": "Bearer sk-correct"},
+        )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "awaiting_approval"
+    assert "human approval" in body["message"]
+
+
+# ── Sprint 4 Phase 2 (S-05, CLAUDE.md Section 61.2) ─────────────────────
+# agent.invoked — success and error paths. ToolDeniedError/
+# ApprovalRequiredError deliberately do NOT write agent.invoked (they have
+# their own distinct HTTP mapping and aren't a completed/failed run in the
+# Section 61.2 sense) — see test_main.py's earlier tests for those paths.
+
+
+def test_chat_success_writes_agent_invoked_audit_event_with_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """latency_ms/input_tokens/output_tokens come from orchestrator.run()'s
+    own return dict and must land in the audit event's extra — but never in
+    the ChatResponse body itself, which only has the original 4 fields."""
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record=_agent_record_with_key(),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
+
+    async def _fake_run(
+        message: str, session_id: str, user_id: str | None = None
+    ) -> dict[str, Any]:
+        return {
+            "response": "ok",
+            "session_id": session_id,
+            "run_id": "r1",
+            "hitl_pending": False,
+            "latency_ms": 42,
+            "input_tokens": 10,
+            "output_tokens": 5,
+        }
+
+    monkeypatch.setattr(main_module.orchestrator, "run", _fake_run)
+
+    with TestClient(main_module.app) as client:
+        response = client.post(
+            "/chat",
+            json={"message": "hi", "session_id": "s1"},
+            headers={"Authorization": "Bearer sk-correct"},
+        )
+
+    assert response.status_code == 200
+    assert "latency_ms" not in response.json()
+
+    audit_events = main_module.write_audit_event.events
+    invoked_events = [e for e in audit_events if e["event_type"] == "agent.invoked"]
+    assert len(invoked_events) == 1
+    assert invoked_events[0]["result"] == "success"
+    assert invoked_events[0]["extra"] == {
+        "latency_ms": 42,
+        "input_tokens": 10,
+        "output_tokens": 5,
+    }
+
+
+def test_chat_error_writes_agent_invoked_audit_event_with_error_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record=_agent_record_with_key(),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
+
+    async def _failing_run(
+        message: str, session_id: str, user_id: str | None = None
+    ) -> dict[str, Any]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(main_module.orchestrator, "run", _failing_run)
+
+    with TestClient(main_module.app) as client:
+        response = client.post(
+            "/chat",
+            json={"message": "hi", "session_id": "s1"},
+            headers={"Authorization": "Bearer sk-correct"},
+        )
+
+    assert response.status_code == 500
+    audit_events = main_module.write_audit_event.events
+    invoked_events = [e for e in audit_events if e["event_type"] == "agent.invoked"]
+    assert len(invoked_events) == 1
+    assert invoked_events[0]["result"] == "error"
+    assert invoked_events[0]["extra"] == {"error_type": "RuntimeError"}
+
+
+# ── Sprint 3 Phase 9 (S-03, R70, CLAUDE.md Section 67) ──────────────────
+# quota.py's own pure-logic unit tests live in test_quota.py; these cover
+# only the auth_middleware wiring — that a 429/402 actually short-circuits
+# the request before orchestrator.run() is ever called.
+
+
+def _fake_run_ok(monkeypatch: pytest.MonkeyPatch, main_module: Any) -> None:
+    async def _fake_run(message: str, session_id: str, user_id: str | None = None) -> Any:
+        return {"response": "ok", "session_id": session_id, "run_id": "r1", "hitl_pending": False}
+
+    monkeypatch.setattr(main_module.orchestrator, "run", _fake_run)
+
+
+def test_chat_returns_429_once_rpm_limit_is_exceeded(monkeypatch: pytest.MonkeyPatch) -> None:
+    import fakeredis
+
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(rate_limit_rpm=1),
+        agent_record=_agent_record_with_key(),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
+    monkeypatch.setattr(main_module, "redis_client", fakeredis.FakeAsyncRedis())
+    _fake_run_ok(monkeypatch, main_module)
+
+    with TestClient(main_module.app) as client:
+        first = client.post(
+            "/chat",
+            json={"message": "hi", "session_id": "s1"},
+            headers={"Authorization": "Bearer sk-correct"},
+        )
+        second = client.post(
+            "/chat",
+            json={"message": "hi again", "session_id": "s1"},
+            headers={"Authorization": "Bearer sk-correct"},
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert "rpm" in second.json()["detail"]
+
+
+def test_chat_rate_limit_exceeded_writes_audit_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sprint 4 Phase 2 (S-05, CLAUDE.md Section 61.2)."""
+    import fakeredis
+
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(rate_limit_rpm=1),
+        agent_record=_agent_record_with_key(),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
+    monkeypatch.setattr(main_module, "redis_client", fakeredis.FakeAsyncRedis())
+    _fake_run_ok(monkeypatch, main_module)
+
+    with TestClient(main_module.app) as client:
+        client.post(
+            "/chat",
+            json={"message": "hi", "session_id": "s1"},
+            headers={"Authorization": "Bearer sk-correct"},
+        )
+        second = client.post(
+            "/chat",
+            json={"message": "hi again", "session_id": "s1"},
+            headers={"Authorization": "Bearer sk-correct"},
+        )
+
+    assert second.status_code == 429
+    audit_events = main_module.write_audit_event.events
+    exceeded_events = [e for e in audit_events if e["event_type"] == "rate_limit.exceeded"]
+    assert len(exceeded_events) == 1
+    assert exceeded_events[0]["result"] == "denied"
+    assert exceeded_events[0]["extra"] == {"reason": "rpm_exceeded"}
+
+
+def test_chat_rate_limit_fails_open_when_redis_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ExplodingRedis:
+        async def incr(self, key: str) -> int:
+            raise ConnectionError("redis unavailable")
+
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(rate_limit_rpm=1),
+        agent_record=_agent_record_with_key(),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
+    monkeypatch.setattr(main_module, "redis_client", _ExplodingRedis())
+    _fake_run_ok(monkeypatch, main_module)
+
+    with TestClient(main_module.app) as client:
+        # Would be denied on the second call if Redis were reachable —
+        # R29/R39: rate limiting fails open, so both still succeed.
+        for _ in range(2):
+            response = client.post(
+                "/chat",
+                json={"message": "hi", "session_id": "s1"},
+                headers={"Authorization": "Bearer sk-correct"},
+            )
+            assert response.status_code == 200
+
+
+def test_chat_returns_402_once_monthly_budget_is_exceeded(monkeypatch: pytest.MonkeyPatch) -> None:
+    current_period = time.strftime("%Y-%m", time.gmtime())
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(monthly_budget_usd=1.0),
+        agent_record=_agent_record_with_key(
+            current_month_spend_usd=5.0, current_month_spend_period=current_period
+        ),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
+    _fake_run_ok(monkeypatch, main_module)
+
+    with TestClient(main_module.app) as client:
+        response = client.post(
+            "/chat",
+            json={"message": "hi", "session_id": "s1"},
+            headers={"Authorization": "Bearer sk-correct"},
+        )
+
+    assert response.status_code == 402
+
+
+def test_chat_budget_exceeded_writes_audit_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sprint 4 Phase 2 (S-05, CLAUDE.md Section 61.2)."""
+    current_period = time.strftime("%Y-%m", time.gmtime())
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(monthly_budget_usd=1.0),
+        agent_record=_agent_record_with_key(
+            current_month_spend_usd=5.0, current_month_spend_period=current_period
+        ),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
+    _fake_run_ok(monkeypatch, main_module)
+
+    with TestClient(main_module.app) as client:
+        response = client.post(
+            "/chat",
+            json={"message": "hi", "session_id": "s1"},
+            headers={"Authorization": "Bearer sk-correct"},
+        )
+
+    assert response.status_code == 402
+    audit_events = main_module.write_audit_event.events
+    exceeded_events = [e for e in audit_events if e["event_type"] == "budget.exceeded"]
+    assert len(exceeded_events) == 1
+    assert exceeded_events[0]["result"] == "denied"
+
+
+def test_chat_allowed_when_spend_is_within_monthly_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_period = time.strftime("%Y-%m", time.gmtime())
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(monthly_budget_usd=10.0),
+        agent_record=_agent_record_with_key(
+            current_month_spend_usd=1.0, current_month_spend_period=current_period
+        ),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
+    _fake_run_ok(monkeypatch, main_module)
+
+    with TestClient(main_module.app) as client:
+        response = client.post(
+            "/chat",
+            json={"message": "hi", "session_id": "s1"},
+            headers={"Authorization": "Bearer sk-correct"},
+        )
+
+    assert response.status_code == 200
+
+
+def test_chat_without_quota_configured_never_touches_redis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No rate_limit_rpm/rpd/monthly_budget_usd on the agent config at all
+    — the quota check block must be skipped entirely, not run with
+    effectively-infinite limits."""
+
+    class _ExplodingRedis:
+        async def incr(self, key: str) -> int:
+            raise AssertionError("Redis should never be touched when no limit is configured")
+
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record=_agent_record_with_key(),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
+    monkeypatch.setattr(main_module, "redis_client", _ExplodingRedis())
+    _fake_run_ok(monkeypatch, main_module)
+
+    with TestClient(main_module.app) as client:
+        response = client.post(
+            "/chat",
+            json={"message": "hi", "session_id": "s1"},
+            headers={"Authorization": "Bearer sk-correct"},
+        )
+
+    assert response.status_code == 200

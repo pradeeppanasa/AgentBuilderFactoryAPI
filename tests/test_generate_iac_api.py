@@ -110,13 +110,17 @@ async def test_generate_iac_reflects_new_config_after_edit_and_regenerate(
         v2_config = _minimal_agent_payload()["configuration"]
         v2_config["tools"] = [
             {
-                "tool_id": "jira",
+                "tool_id": "jira_search",
                 "tool_name": "Jira",
                 "executor_type": "http",
                 "endpoint": "https://acme.atlassian.net/rest/api/3",
                 "input_schema": {},
             }
         ]
+        # Sprint 3 Phase 7 (S-13a) — jira_search is one of the 4 tools
+        # seeded APPROVED in the tool registry at startup (Section 62.2);
+        # every configured tool also needs a tool_policies entry (S-08).
+        v2_config["tool_policies"] = [{"tool": "jira_search", "allowed": True, "risk": "LOW"}]
         put_response = client.put(
             f"/api/v1/agents/{agent_id}",
             json={"configuration": v2_config, "change_description": "Add Jira tool"},

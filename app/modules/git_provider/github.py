@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 import httpx
 
@@ -20,21 +21,35 @@ _API_BASE = "https://api.github.com"
 
 # A repo created moments ago via create_repository()'s auto_init=True has
 # its initial commit written, but the Git Data API (blobs/trees/commits)
-# can briefly 404 on that commit's tree sha while it propagates — seen in
-# practice building a tree on top of a just-created repo's base_tree.
-# Retry with backoff rather than surfacing a transient 404 as a deploy
-# failure. Widened twice now: an initial 4-attempt/0.5s-base budget (~4.5s
-# worst case) proved too tight, then a 7-attempt/1s-8s-capped budget
-# (~30s worst case) *also* proved too tight — reproduced live, a deploy's
-# tree-creation call still 404'd after exhausting all 7 attempts, and the
-# identical call succeeded moments later when retried by hand. Budgets
-# ~75s worst case now (1+2+4+8+15+15+15+15 across 8 waits, 9 attempts),
-# capping growth rather than letting it run away — deploy_agent() awaits
-# this inline and the UI's http client has no request timeout, so a
-# generous ceiling here is safe.
+# can in principle briefly 404 on that commit's tree sha while it
+# propagates, before it's queryable — this retry exists for that. Widened
+# twice chasing what turned out to be a DIFFERENT, permanent cause hiding
+# behind the same generic 404 (see MissingWorkflowScopeError below) — a
+# git token missing the 'workflow' OAuth scope makes GitHub's trees
+# endpoint 404 on ANY tree containing a .github/workflows/ path, on every
+# attempt, with no amount of retrying ever succeeding. That's now checked
+# for explicitly and fails fast instead of silently eating a ~75s retry
+# budget first. This retry stays as defense-in-depth for the genuinely
+# transient case the widening was originally aimed at, real or not.
 _TREE_PROPAGATION_ATTEMPTS = 9
 _TREE_PROPAGATION_BASE_DELAY_SECONDS = 1.0
 _TREE_PROPAGATION_MAX_DELAY_SECONDS = 15.0
+
+
+class MissingWorkflowScopeError(RuntimeError):
+    """The configured git token can't create/update files under
+    .github/workflows/ — GitHub's Git Data API rejects this with a plain
+    404 on the trees endpoint, indistinguishable from any other 404 unless
+    checked for explicitly (commit_files' _check_workflow_scope call)."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The configured git token is missing the 'workflow' OAuth scope "
+            "required to create or update files under .github/workflows/. "
+            "Regenerate the token with the 'workflow' scope enabled (classic "
+            "PAT) or 'Workflows: Read and write' permission (fine-grained "
+            "PAT), then update GIT_CREDENTIALS_SECRET."
+        )
 
 
 class GitHubProvider(GitProvider):
@@ -126,18 +141,46 @@ class GitHubProvider(GitProvider):
         response.raise_for_status()
         return True
 
+    async def _check_workflow_scope(self) -> None:
+        """Best-effort: classic PATs report their granted scopes on every
+        API response via the X-OAuth-Scopes header; fine-grained PATs and
+        GitHub App tokens don't send it at all, so this silently no-ops for
+        those rather than false-flagging a token GitHub itself doesn't
+        describe this way — such tokens still fail normally (just without
+        this specific diagnosis) if they truly lack the permission."""
+        response = await self._client.get("/user")
+        response.raise_for_status()
+        scopes_header = response.headers.get("x-oauth-scopes")
+        if scopes_header is None:
+            return
+        scopes = {s.strip() for s in scopes_header.split(",") if s.strip()}
+        if "workflow" not in scopes:
+            raise MissingWorkflowScopeError()
+
     async def commit_files(
-        self, repo: str, branch: str, files: dict[str, str], message: str
+        self,
+        repo: str,
+        branch: str,
+        files: dict[str, str],
+        message: str,
+        omit_base_tree: bool = False,
     ) -> str:
+        if any(path.startswith(".github/workflows/") for path in files):
+            await self._check_workflow_scope()
+
         slug = self._repo(repo)
 
         branch_ref = await self._client.get(f"/repos/{slug}/git/ref/heads/{branch}")
         branch_ref.raise_for_status()
         parent_commit_sha = branch_ref.json()["object"]["sha"]
 
-        parent_commit = await self._client.get(f"/repos/{slug}/git/commits/{parent_commit_sha}")
-        parent_commit.raise_for_status()
-        base_tree_sha = parent_commit.json()["tree"]["sha"]
+        base_tree_sha: str | None = None
+        if not omit_base_tree:
+            parent_commit = await self._client.get(
+                f"/repos/{slug}/git/commits/{parent_commit_sha}"
+            )
+            parent_commit.raise_for_status()
+            base_tree_sha = parent_commit.json()["tree"]["sha"]
 
         tree_entries = []
         for path, content in files.items():
@@ -153,11 +196,12 @@ class GitHubProvider(GitProvider):
                 {"path": path, "mode": "100644", "type": "blob", "sha": blob.json()["sha"]}
             )
 
+        tree_payload: dict[str, Any] = {"tree": tree_entries}
+        if base_tree_sha is not None:
+            tree_payload["base_tree"] = base_tree_sha
+
         tree = await self._post_retrying_404(
-            lambda: self._client.post(
-                f"/repos/{slug}/git/trees",
-                json={"base_tree": base_tree_sha, "tree": tree_entries},
-            )
+            lambda: self._client.post(f"/repos/{slug}/git/trees", json=tree_payload)
         )
         new_tree_sha = tree.json()["sha"]
 

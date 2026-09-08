@@ -84,8 +84,14 @@ class GitLabProvider(GitProvider):
         return await self._file_exists_by_project_id(self._project_id(repo), branch, path)
 
     async def commit_files(
-        self, repo: str, branch: str, files: dict[str, str], message: str
+        self,
+        repo: str,
+        branch: str,
+        files: dict[str, str],
+        message: str,
+        omit_base_tree: bool = False,  # GitHub-only optimisation — see base.py; no-op here
     ) -> str:
+        del omit_base_tree
         project_id = self._project_id(repo)
         actions = [
             {

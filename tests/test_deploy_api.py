@@ -88,6 +88,10 @@ async def test_deploy_v1_creates_agent_repo_and_pushes_straight_to_main(
     # Section 45.6/R58 — default cicd_provider is github_actions; committed
     # once, alongside the repo's very first Terraform.
     assert ".github/workflows/panasa-deploy.yml" in committed_files
+    # `files` is complete here (nothing preexisting to preserve) — skips
+    # GitHub's base_tree dependency on the just-created repo's auto-init
+    # commit rather than retrying its propagation delay for longer.
+    assert fake_git.commit_omit_base_tree_calls == [True]
 
 
 async def test_deploy_v1_commits_the_tenants_chosen_cicd_workflow_file(
@@ -134,7 +138,13 @@ async def test_deploy_v2_plus_opens_pr_against_existing_repo(make_user_and_token
         agent_id = created["agent_id"]
         repo = f"test-org/panasa-iac-{agent_id}"
 
-        fake_git = FakeGitProvider(existing_repos={repo})
+        # existing_files marks this as a genuinely established repo with
+        # real prior content (unlike test_deploy_v2_plus_commits_missing_
+        # workflow_file's fixture below) — this test is about branch+PR
+        # mechanics generally, not that specific edge case.
+        fake_git = FakeGitProvider(
+            existing_repos={repo}, existing_files={".github/workflows/panasa-deploy.yml"}
+        )
         app.state.git_provider = fake_git
 
         response = client.post(f"/api/v1/agents/{agent_id}/deploy", headers=_bearer(token))
@@ -155,6 +165,11 @@ async def test_deploy_v2_plus_opens_pr_against_existing_repo(make_user_and_token
     assert agent_id in pr_title
     assert "Deploy" in pr_title
     assert "pending" in pr_description.lower()
+    # v2+ `files` is only the current deploy's own regenerated content —
+    # not an exhaustive snapshot of the branch (an unregenerated file like
+    # an already-committed CI/CD workflow could be lost) — base_tree stays
+    # required here, unlike the true v1 case above.
+    assert fake_git.commit_omit_base_tree_calls == [False]
 
 
 async def test_deploy_v2_plus_skips_workflow_file_already_committed(
@@ -181,6 +196,8 @@ async def test_deploy_v2_plus_skips_workflow_file_already_committed(
 
     _repo, _branch, committed_files, _message = fake_git.committed_files[0]
     assert ".github/workflows/panasa-deploy.yml" not in committed_files
+    # Genuinely has real prior content — base_tree stays required.
+    assert fake_git.commit_omit_base_tree_calls == [False]
 
 
 async def test_deploy_v2_plus_commits_missing_workflow_file(make_user_and_token) -> None:
@@ -208,6 +225,11 @@ async def test_deploy_v2_plus_commits_missing_workflow_file(make_user_and_token)
 
     _repo, _branch, committed_files, _message = fake_git.committed_files[0]
     assert ".github/workflows/panasa-deploy.yml" in committed_files
+    # Same underlying case as the true-v1 fix: this repo has never
+    # received real content (only its own auto-init commit) despite
+    # "existing" — the branch cut for this PR is equally safe to commit
+    # without a base_tree reference, not just true v1's direct-to-main push.
+    assert fake_git.commit_omit_base_tree_calls == [True]
 
 
 async def test_deploy_git_provider_failure_returns_structured_502_not_bare_500(
@@ -236,6 +258,48 @@ async def test_deploy_git_provider_failure_returns_structured_502_not_bare_500(
     assert body["detail"]["error"] == "git_provider_failed"
     message = body["detail"]["message"].lower()
     assert "credentials" in message or "token" in message
+
+
+async def test_deploy_missing_workflow_scope_returns_structured_502_with_clear_message(
+    make_user_and_token,
+) -> None:
+    """The real bug found live (2026-09-07): a git token with only 'repo'
+    scope makes GitHub's trees endpoint 404 on ANY commit touching
+    .github/workflows/ — on every retry, forever, misdiagnosed for a long
+    time as a transient propagation delay because the response is a bare
+    404 indistinguishable from one. This must surface as its own specific,
+    actionable error rather than the generic git_provider_failed message,
+    and mark the deployment FAILED rather than leave it stuck."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        fake_git = FakeGitProvider(raise_missing_workflow_scope=True)
+        app.state.git_provider = fake_git
+
+        created = client.post(
+            "/api/v1/agents", json=_minimal_agent_payload(), headers=_bearer(token)
+        ).json()
+        agent_id = created["agent_id"]
+
+        response = client.post(f"/api/v1/agents/{agent_id}/deploy", headers=_bearer(token))
+
+        assert response.status_code == 502
+        body = response.json()
+        assert body["detail"]["error"] == "git_provider_missing_workflow_scope"
+        message = body["detail"]["message"].lower()
+        assert "workflow" in message
+        assert "scope" in message
+
+        deployments = client.get(
+            f"/api/v1/agents/{agent_id}/deployments", headers=_bearer(token)
+        ).json()["items"]
+        deployment_id = deployments[0]["deployment_id"]
+        deployment_detail = client.get(
+            f"/api/v1/deployments/{deployment_id}", headers=_bearer(token)
+        ).json()
+
+    assert deployment_detail["status"] == "FAILED"
+    assert "workflow" in deployment_detail["failure_reason"].lower()
 
 
 async def test_deploy_404_for_unknown_agent(make_user_and_token) -> None:

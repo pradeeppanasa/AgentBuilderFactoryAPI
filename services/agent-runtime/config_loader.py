@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import os
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
 import boto3
 
@@ -106,3 +106,33 @@ def load_agent_config(dynamodb: Any | None = None) -> dict[str, Any]:
         **configuration,
     }
     return _decimal_to_native(config)
+
+
+def get_current_agent_record(dynamodb: Any | None = None) -> dict[str, Any]:
+    """Re-fetch this container's own AgentRecord fresh from panasa-agents.
+
+    Sprint 3 Phase 1 (CLAUDE.md Section 64.1, R67) — unlike
+    load_agent_config() above (called once at startup and cached for the
+    process lifetime), the auth layer calls this on every request so that
+    credential rotation/revocation (Section 64.4, Phase 8) and the R67
+    tenant-isolation check see the agent's current DB state without
+    waiting for a redeploy. A bare GetItem on a table keyed by
+    {tenant_id, agent_id} is cheap enough to do per request.
+
+    Returns the raw agent_item (tenant_id, agent_id, api_key_secret_arn,
+    previous_api_key_secret_arn, previous_key_expires_at, api_key_revoked,
+    ...) — not merged with AgentConfiguration like load_agent_config()
+    does, since auth has no business reading system_prompt/tools/etc.
+    """
+    agent_id = os.environ["AGENT_ID"]
+    tenant_id = os.environ["TENANT_ID"]
+    region = os.environ.get("AWS_REGION", "eu-west-2")
+    agents_table_name = os.environ.get("DYNAMODB_AGENTS_TABLE", "panasa-agents")
+
+    resource = dynamodb or boto3.resource("dynamodb", region_name=region)
+    agents_table = resource.Table(agents_table_name)
+    response = agents_table.get_item(Key={"tenant_id": tenant_id, "agent_id": agent_id})
+    item = response.get("Item")
+    if item is None:
+        raise AgentNotFoundError(tenant_id, agent_id)
+    return cast("dict[str, Any]", _decimal_to_native(item))

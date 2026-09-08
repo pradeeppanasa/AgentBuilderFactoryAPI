@@ -23,7 +23,12 @@ from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel
 
 from app.config import settings
-from app.dependencies import get_deployment_status_store, get_registry_store
+from app.dependencies import (
+    get_deployment_status_store,
+    get_registry_store,
+    get_security_audit_log_store,
+)
+from app.modules.audit.security_log import SecurityAuditLogStore
 from app.modules.deployment.status_store import DeploymentNotFoundError, DeploymentStatusStore
 from app.modules.registry.store import AgentRegistryStore
 from app.shared.exceptions import AgentNotFoundError
@@ -68,6 +73,9 @@ async def deployment_complete(
     payload: DeploymentCompleteRequest,
     registry_store: Annotated[AgentRegistryStore, Depends(get_registry_store)],
     deployment_status_store: Annotated[DeploymentStatusStore, Depends(get_deployment_status_store)],
+    security_audit_log_store: Annotated[
+        SecurityAuditLogStore, Depends(get_security_audit_log_store)
+    ],
     authorization: str | None = Header(default=None),
 ) -> DeploymentCompleteResponse:
     _check_webhook_secret(authorization)
@@ -92,6 +100,21 @@ async def deployment_complete(
         )
     except DeploymentNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    # Sprint 3 Phase 2 (CLAUDE.md Section 61.2) — "agent.deployed": the
+    # customer CI/CD itself is the principal here (this endpoint's only
+    # caller — _check_webhook_secret above is what authenticates it), not a
+    # human user.
+    await security_audit_log_store.write_event(
+        tenant_id=payload.tenant_id,
+        event_type="agent.deployed",
+        agent_id=payload.agent_id,
+        principal_id="ci-cd-webhook",
+        action="deploy",
+        resource=payload.deployment_id,
+        result="success",
+        extra={"version": payload.version},
+    )
 
     return DeploymentCompleteResponse(
         agent_id=payload.agent_id,

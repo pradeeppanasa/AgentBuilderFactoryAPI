@@ -62,6 +62,12 @@ class Settings(BaseSettings):
     # ── Observability — Runs Feature, Phase 1 ───────────────────────────────
     dynamodb_runs_table: str = "panasa-runs"
 
+    # ── Security Sprint 3 Phase 2 — Full Audit Trail (Section 61) ──────────
+    dynamodb_audit_log_table: str = "panasa-audit-log"
+
+    # ── Security Sprint 3 Phase 7 — Tool Allowlist Registry (Section 62.2) ──
+    dynamodb_tool_registry_table: str = "panasa-tool-registry"
+
     # ── Task Planner (Section 38.6/38.7 — A2-3) ────────────────────────────
     # Factory-internal call (Section 5.11/22 rule): uses the Runtime's own
     # Bedrock access, never the generated agent's own model config.

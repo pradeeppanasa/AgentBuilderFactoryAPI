@@ -36,8 +36,14 @@ class MockGitProvider(GitProvider):
         return False
 
     async def commit_files(
-        self, repo: str, branch: str, files: dict[str, str], message: str
+        self,
+        repo: str,
+        branch: str,
+        files: dict[str, str],
+        message: str,
+        omit_base_tree: bool = False,  # GitHub-only optimisation — see base.py; no-op here
     ) -> str:
+        del omit_base_tree
         commit_sha = f"mock-commit-{uuid.uuid4().hex[:12]}"
         log.info(
             "git.mock.commit_files",
