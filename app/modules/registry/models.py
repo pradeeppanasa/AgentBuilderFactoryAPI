@@ -603,6 +603,37 @@ class AgentRecord(BaseModel):
     auth.py) — a revoked key is denied immediately, even within its own
     5-minute value-cache TTL."""
 
+    # ── Sprint 4 Phase 4 (S-12, CLAUDE.md Section 63.1) ─────────────────
+    # Per-agent trust config for services/agent-runtime/auth.py's
+    # JwtAuthProvider — a completely different trust root from this
+    # Runtime's OWN Factory Console user auth (app/modules/auth/,
+    # jwt_secret_arn in app/config.py), which signs and verifies its own
+    # HS256 tokens against one shared secret. These fields instead let a
+    # CUSTOMER's own OAuth2/OIDC identity provider authenticate business
+    # apps calling the generated agent directly. Flat fields on this
+    # record (not AgentConfiguration) for the same reason as the API-key
+    # block above: services/agent-runtime/config_loader.py's
+    # get_current_agent_record() reads only this table, fresh, on every
+    # request (R67) — AgentConfiguration is a different table, loaded
+    # once at startup. An agent with jwt_issuer or jwt_jwks_url unset has
+    # JWT auth off entirely; JwtAuthProvider always defers in that case.
+    jwt_issuer: str | None = None
+    jwt_audience: str | None = None
+    """None means "don't check audience" — some customer IdPs don't issue
+    an aud claim meaningful to a downstream API; this is deliberately
+    less strict than requiring one, in favour of jwt_issuer + JWKS-pinned
+    signature verification remaining mandatory either way."""
+    jwt_jwks_url: str | None = None
+    """Must be HTTPS — JwtAuthProvider rejects an http:// value outright
+    rather than attempting the fetch."""
+    jwt_tenant_claim: str = "tenant_id"
+    """Which claim in the verified token carries this business app's
+    tenant_id — some IdPs use a custom/namespaced claim name (e.g.
+    Auth0-style "https://myapp.com/org_id"). The extracted value is
+    trusted as-is; services/agent-runtime/main.py's existing R67
+    tenant-mismatch check (comparing it against THIS record's own
+    tenant_id) is what actually enforces it belongs here."""
+
     # ── Sprint 3 Phase 9 (S-03, R70, Section 67.3) ──────────────────────
     # Durable running spend total, updated by the Generated Agent Runtime
     # via an atomic DynamoDB update after every /chat request's real
@@ -646,6 +677,19 @@ class AgentVersionRecord(BaseModel):
 
     # Full desired configuration snapshot (immutable after creation)
     configuration: AgentConfiguration
+
+    # Sprint 4 Phase 5 (S-13b, CLAUDE.md Section 62.4/R68) — SHA-256 of
+    # `configuration`'s canonical JSON (app/shared/config_hash.py),
+    # computed once at build_version() time and never touched by
+    # record_derived_fields() — immutable, like configuration itself.
+    # `| None` only for backward compatibility with version records
+    # written before this field existed; every version created from now
+    # on always has one. services/agent-runtime's generated
+    # compute.tf.j2 bakes this same value in as the AGENT_CONFIG_HASH env
+    # var; config_loader.py recomputes it independently from the raw
+    # dict it loads and refuses to start on a mismatch (R68's "refuse to
+    # start, write alert event").
+    config_hash: str | None = None
 
     # Capability contract (Amendment A1, R11) — mandatory, auto-generated
     capability_contract: AgentCapabilityContract

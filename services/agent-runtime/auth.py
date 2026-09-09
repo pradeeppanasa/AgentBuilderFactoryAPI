@@ -21,12 +21,22 @@ agent record) holds ARNs only.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
+import json
 import time
+import urllib.request
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import boto3
+import jwt
+import structlog
+
+if TYPE_CHECKING:
+    from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
+
+logger = structlog.get_logger()
 
 # Replaces an indefinite @lru_cache on purpose (CLAUDE.md Phase 1 "What not
 # to do") — an lru_cache never expires, so a rotated or revoked key would
@@ -57,6 +67,31 @@ def _get_secret_value(secret_arn: str) -> str:
     value: str = _get_secrets_client().get_secret_value(SecretId=secret_arn)["SecretString"]
     _key_cache[secret_arn] = (value, time.monotonic())
     return value
+
+
+# Sprint 4 Phase 4 (S-12) — same TTL-cache convention as _key_cache above,
+# a second dict rather than reusing that one since the values are JWKS
+# documents (dict), not secret strings, and the cache key is a JWKS URL,
+# not a Secrets Manager ARN. Module-level function (not a class/injectable
+# client) matching _get_secret_value's own shape, so tests can monkeypatch
+# it exactly the same way they already monkeypatch _get_secrets_client.
+_JWKS_CACHE_TTL_SECONDS = 300
+_jwks_cache: dict[str, tuple[dict[str, Any], float]] = {}
+
+
+def _fetch_jwks(jwks_url: str) -> dict[str, Any]:
+    """Synchronous by design — called via asyncio.to_thread() from
+    JwtAuthProvider so the blocking urllib call never stalls the event
+    loop, matching this codebase's established pattern for blocking I/O
+    inside async methods (e.g. tool_executor.py's Lambda invoke,
+    hitl.py's DynamoDB put_item)."""
+    cached = _jwks_cache.get(jwks_url)
+    if cached is not None and (time.monotonic() - cached[1]) < _JWKS_CACHE_TTL_SECONDS:
+        return cached[0]
+    with urllib.request.urlopen(jwks_url, timeout=5) as response:  # noqa: S310
+        jwks: dict[str, Any] = json.loads(response.read())
+    _jwks_cache[jwks_url] = (jwks, time.monotonic())
+    return jwks
 
 
 @dataclass
@@ -139,22 +174,127 @@ class ApiKeyAuthProvider(AuthProvider):
 
 
 class JwtAuthProvider(AuthProvider):
-    """Stub only — real JWT/OAuth2 validation is S-12 (P2, CLAUDE.md
-    Section 63.1). Recognises the token shape (a compact JWT's base64url
-    header always starts "eyJ") purely so a JWT-shaped credential fails
-    the same way today as it will once this is implemented for real,
-    rather than silently falling through to ApiKeyAuthProvider's
-    Bearer-token check and failing for an unrelated reason."""
+    """Sprint 4 Phase 4 (S-12, CLAUDE.md Section 63.1) — validates a JWT
+    Bearer token issued by the CUSTOMER's OWN OAuth2/OIDC identity
+    provider. A completely different trust root from the Factory
+    Console's own single-secret HS256 user auth (app/modules/auth/ in the
+    Factory Runtime, which signs and verifies its own tokens against one
+    shared `jwt_secret_arn`) — this provider never signs anything; it only
+    verifies a signature against public keys fetched from the CUSTOMER's
+    own JWKS endpoint. The two systems share no code and no trust root.
+
+    Per-agent trust config (issuer, audience, JWKS URL, tenant-claim name)
+    lives as flat fields directly on AgentRecord — the same panasa-agents
+    table config_loader.get_current_agent_record() already reads on every
+    request, matching the api_key_secret_arn-style precedent.
+    AgentConfiguration (a different table, loaded once at startup) is
+    deliberately not consulted here, same reasoning as ApiKeyAuthProvider.
+    An agent with none of these fields set has JWT auth off entirely —
+    this provider always defers (returns None), never partially validates.
+
+    Scope, deliberately: RS256 only (the default for essentially every
+    major OIDC provider — Okta, Auth0, Azure AD, Google, Cognito). No
+    ES256/other JWA algorithms — a real future improvement, not built
+    here. `audience` is optional (only enforced if the agent record sets
+    one); `issuer` and a resolvable JWKS key are always required.
+
+    Every failure path returns None (never raises) — a security control,
+    so it fails CLOSED (R39): an unreachable JWKS endpoint, an unknown
+    `kid`, a malformed key, an expired/wrong-issuer/wrong-audience/
+    bad-signature token, or a missing tenant claim all result in the same
+    401 as an unrecognised credential, with the specific reason only in
+    this process's own logs, never in the response body."""
 
     async def authenticate(
         self, authorization: str, agent_record: dict[str, Any]
     ) -> AuthContext | None:
         if not authorization.startswith("Bearer ey"):
             return None
-        # TODO (S-12): validate JWT signature, expiry, issuer; extract
-        # tenant_id/agent_id/scopes from claims and return a real
-        # AuthContext. Until then this always defers (returns None).
-        return None
+        token = authorization.removeprefix("Bearer ").strip()
+
+        jwks_url = agent_record.get("jwt_jwks_url")
+        issuer = agent_record.get("jwt_issuer")
+        if not jwks_url or not issuer:
+            return None
+        if not jwks_url.startswith("https://"):
+            # Every real OIDC JWKS endpoint is HTTPS; a misconfigured
+            # http:// value is a config error, not something to attempt.
+            logger.warning("jwt_jwks_url_not_https", jwks_url=jwks_url)
+            return None
+
+        try:
+            unverified_header = jwt.get_unverified_header(token)
+        except jwt.PyJWTError:
+            return None
+        kid = unverified_header.get("kid")
+
+        try:
+            jwks = await asyncio.to_thread(_fetch_jwks, jwks_url)
+        except Exception as exc:
+            logger.warning("jwt_jwks_fetch_failed", jwks_url=jwks_url, error=str(exc))
+            return None
+
+        key_data = next(
+            (k for k in jwks.get("keys", []) if k.get("kid") == kid),
+            None,
+        )
+        if key_data is None:
+            return None
+
+        try:
+            # from_jwk()'s return type also covers RSAPrivateKey (the same
+            # method parses private JWKs too); a JWKS document only ever
+            # contains public keys, so this cast reflects a real guarantee
+            # the type checker can't see, not a workaround.
+            public_key = cast(
+                "RSAPublicKey", jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(key_data))
+            )
+            audience = agent_record.get("jwt_audience")
+            options: dict[str, Any] = {"require": ["exp", "iat"]}
+            if audience is None:
+                # PyJWT rejects a token that carries an `aud` claim unless
+                # an `audience` to check it against was also given — an
+                # unconfigured audience must mean "don't check", not "no
+                # token with an aud claim can ever pass".
+                options["verify_aud"] = False
+            claims = jwt.decode(
+                token,
+                key=public_key,
+                algorithms=["RS256"],
+                issuer=issuer,
+                audience=audience,
+                leeway=30,
+                options=options,
+            )
+        except Exception as exc:
+            # Broad on purpose: PyJWTError covers expired/wrong-issuer/
+            # wrong-audience/bad-signature tokens, but a malformed JWKS
+            # key entry can also raise a plain ValueError out of
+            # from_jwk() — both must fail closed the same way.
+            logger.warning("jwt_validation_failed", error=str(exc))
+            return None
+
+        tenant_claim = agent_record.get("jwt_tenant_claim") or "tenant_id"
+        tenant_id = claims.get(tenant_claim)
+        if not tenant_id:
+            logger.warning("jwt_missing_tenant_claim", tenant_claim=tenant_claim)
+            return None
+
+        scope_claim = claims.get("scope")
+        if isinstance(scope_claim, str):
+            scopes = scope_claim.split()
+        elif isinstance(claims.get("scopes"), list):
+            scopes = claims["scopes"]
+        else:
+            scopes = ["agent:invoke"]
+
+        return AuthContext(
+            tenant_id=str(tenant_id),
+            agent_id=agent_record["agent_id"],
+            principal_id=str(claims.get("sub") or claims.get("client_id") or "jwt_caller"),
+            scopes=scopes,
+            auth_method="jwt",
+        )
 
 
 class AuthChain:

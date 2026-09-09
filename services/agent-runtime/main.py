@@ -28,7 +28,7 @@ from fastapi.responses import JSONResponse
 from orchestrator import AgentOrchestrator
 from pydantic import BaseModel
 from quota import check_monthly_budget, check_rate_limit, get_redis_client
-from tool_policy import ApprovalRequiredError, ToolDeniedError
+from tool_policy import ToolDeniedError
 
 logger = structlog.get_logger()
 
@@ -113,11 +113,13 @@ async def auth_middleware(request: Request, call_next):  # type: ignore[no-untyp
         )
         return JSONResponse(status_code=403, content={"detail": "Access denied"})
 
-    # Sprint 3 Phase 9 (S-03, R70, Section 67) — /chat only, deliberately:
-    # this middleware runs on every non-exempt route, and rpm/rpd/budget
-    # are specifically about business-request cost/abuse, not e.g. a
-    # future non-/chat route sharing the same limits unintentionally.
-    if request.url.path == "/chat":
+    # Sprint 3 Phase 9 (S-03, R70, Section 67), extended in Sprint 4 Phase 3
+    # (S-11) to also cover /approvals/{review_id}/resume — a resume call
+    # can invoke a real tool and a real LLM call just like /chat can, so it
+    # gets the same rpm/rpd/budget gate. Every OTHER route is deliberately
+    # excluded (rpm/rpd/budget are specifically about business-request
+    # cost/abuse, not e.g. /health or /config).
+    if request.url.path == "/chat" or request.url.path.startswith("/approvals/"):
         rpm_limit = agent_config.get("rate_limit_rpm")
         rpd_limit = agent_config.get("rate_limit_rpd")
         if rpm_limit is not None or rpd_limit is not None:
@@ -179,6 +181,12 @@ class ChatResponse(BaseModel):
     session_id: str
     run_id: str
     hitl_pending: bool = False
+    # Sprint 4 Phase 3 (S-11) — populated only when this turn paused on a
+    # HIGH/DESTRUCTIVE tool call (hitl_pending=True) or was produced by
+    # POST /approvals/{review_id}/resume; otherwise both stay None so
+    # ordinary /chat responses are unchanged.
+    approval_review_id: str | None = None
+    approval_status: str | None = None
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -210,26 +218,25 @@ async def chat(request: ChatRequest, http_request: Request) -> ChatResponse | JS
                 "output_tokens": result.get("output_tokens"),
             },
         )
-        return ChatResponse(
+        response = ChatResponse(
             response=result["response"],
             session_id=result["session_id"],
             run_id=result["run_id"],
             hitl_pending=result["hitl_pending"],
+            approval_review_id=result.get("approval_review_id"),
+            approval_status=result.get("approval_status"),
         )
+        # Sprint 4 Phase 3 (S-11) — orchestrator.run() now catches
+        # ApprovalRequiredError itself and returns hitl_pending=True with
+        # an approval_review_id rather than letting it propagate here (it
+        # needs the accumulated conversation state to persist a resumable
+        # request, which only it has); reflect that in the HTTP status.
+        if result["hitl_pending"] and result.get("approval_review_id"):
+            return JSONResponse(status_code=202, content=response.model_dump())
+        return response
     except ToolDeniedError as exc:
         # Sprint 3 Phase 4 (R64) — "403 with a default deny message"
         raise HTTPException(status_code=403, detail=f"Tool denied: {exc.reason}") from exc
-    except ApprovalRequiredError:
-        # Sprint 3 Phase 4 stub — the full async approval flow (a human
-        # actually approving/rejecting, and the tool then running) is
-        # S-11 (P1), not built here.
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status": "awaiting_approval",
-                "message": "This action requires human approval. Check your Panasa Console.",
-            },
-        )
     except Exception as exc:
         write_audit_event(
             tenant_id=auth_ctx.tenant_id,
@@ -243,6 +250,49 @@ async def chat(request: ChatRequest, http_request: Request) -> ChatResponse | JS
         )
         logger.error("chat_error", error=str(exc))
         raise HTTPException(status_code=500, detail="Agent execution failed") from exc
+
+
+@app.post("/approvals/{review_id}/resume", response_model=ChatResponse)
+async def resume_approval(review_id: str, http_request: Request) -> ChatResponse | JSONResponse:
+    """Sprint 4 Phase 3 (S-11, R64) — call after a human has decided on a
+    tool-call approval request (via the Factory Runtime's own
+    POST /api/v1/hitl/reviews/{review_id}/approve|reject) to actually
+    invoke the tool and continue the paused turn, or to learn it was
+    rejected/timed out/is still pending. Auth-gated the same as /chat
+    (this path is not in _AUTH_EXEMPT_PATHS) — R67 tenant isolation
+    applies here too, same as every other non-exempt route."""
+    # request.state.auth is set by auth_middleware above; used only for the
+    # failure-path audit event below — the review record itself, not the
+    # caller, decides the outcome (R67 tenant isolation already ran in the
+    # middleware, same as every other non-exempt route).
+    auth_ctx = http_request.state.auth
+    try:
+        result = await orchestrator.resume_after_approval(review_id)
+    except Exception as exc:
+        write_audit_event(
+            tenant_id=auth_ctx.tenant_id,
+            event_type="agent.invoked",
+            agent_id=agent_config["agent_id"],
+            principal_id=auth_ctx.principal_id,
+            action=f"POST /approvals/{review_id}/resume",
+            resource=agent_config["agent_id"],
+            result="error",
+            extra={"error_type": type(exc).__name__},
+        )
+        logger.error("resume_approval_error", review_id=review_id, error=str(exc))
+        raise HTTPException(status_code=500, detail="Agent execution failed") from exc
+
+    response = ChatResponse(
+        response=result["response"],
+        session_id=result["session_id"],
+        run_id=result["run_id"],
+        hitl_pending=result["hitl_pending"],
+        approval_review_id=result.get("approval_review_id"),
+        approval_status=result.get("approval_status"),
+    )
+    if result["hitl_pending"]:
+        return JSONResponse(status_code=202, content=response.model_dump())
+    return response
 
 
 @app.get("/health")

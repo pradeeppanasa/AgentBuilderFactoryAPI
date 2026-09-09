@@ -153,6 +153,62 @@ async def test_human_review_enabled_contains_sqs_queue() -> None:
     assert report.passed, [c for c in report.checks if not c.passed]
 
 
+async def test_human_review_enabled_grants_hitl_reviews_table_and_queue_access() -> None:
+    """Sprint 4 Phase 6 (S-13c) — services/agent-runtime/tool_approval.py
+    (S-11) and hitl.py both read/write panasa-hitl-reviews directly; the
+    human_review_workflow state machine sends to its own SQS queue as
+    agent_execution_role — both grants were missing entirely before this
+    phase."""
+    config = _config(human_review={"enabled": True, "trigger_conditions": ["high_risk_decision"]})
+    modules = resolve_required_modules(config)
+    files = _backend.render(_AGENT_ID, _TENANT_ID, _VERSION, config, modules)
+    human_loop_tf = next(c for path, c in files.items() if "human_loop" in path)
+
+    assert "agent_hitl_reviews_access" in human_loop_tf
+    assert "agent_hitl_queue_access" in human_loop_tf
+    assert "dynamodb:PutItem" in human_loop_tf
+    assert "dynamodb:UpdateItem" in human_loop_tf
+    assert "sqs:SendMessage" in human_loop_tf
+    # No notification_sns_arn configured — the SNS grant must not render.
+    assert "agent_hitl_notifications" not in human_loop_tf
+
+    report = await _validator.validate(
+        agent_id=_AGENT_ID,
+        tenant_id=_TENANT_ID,
+        version=_VERSION,
+        config=config,
+        files=files,
+        tool="terraform",
+    )
+    assert report.passed, [c for c in report.checks if not c.passed]
+
+
+async def test_human_review_with_sns_arn_grants_scoped_publish() -> None:
+    config = _config(
+        human_review={
+            "enabled": True,
+            "trigger_conditions": ["high_risk_decision"],
+            "notification_sns_arn": "arn:aws:sns:eu-west-2:123456789012:customer-topic",
+        }
+    )
+    modules = resolve_required_modules(config)
+    files = _backend.render(_AGENT_ID, _TENANT_ID, _VERSION, config, modules)
+    human_loop_tf = next(c for path, c in files.items() if "human_loop" in path)
+
+    assert "agent_hitl_notifications" in human_loop_tf
+    assert "arn:aws:sns:eu-west-2:123456789012:customer-topic" in human_loop_tf
+
+    report = await _validator.validate(
+        agent_id=_AGENT_ID,
+        tenant_id=_TENANT_ID,
+        version=_VERSION,
+        config=config,
+        files=files,
+        tool="terraform",
+    )
+    assert report.passed, [c for c in report.checks if not c.passed]
+
+
 async def test_human_review_disabled_contains_no_sqs_queue() -> None:
     config = _config(human_review={"enabled": False})
     modules = resolve_required_modules(config)

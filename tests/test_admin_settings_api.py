@@ -186,6 +186,9 @@ async def test_deployment_settings_aws_target_defaults_unconfigured(
     assert body["agent_runtime_ecr_registry"] is None
     assert body["bedrock_endpoint_cidr"] is None
     assert body["opensearch_endpoint_cidr"] is None
+    assert body["dynamodb_endpoint_cidr"] is None
+    assert body["s3_endpoint_cidr"] is None
+    assert body["cloudwatch_endpoint_cidr"] is None
 
 
 async def test_save_and_read_back_aws_target_settings(make_user_and_token) -> None:
@@ -204,6 +207,9 @@ async def test_save_and_read_back_aws_target_settings(make_user_and_token) -> No
                 ),
                 "bedrock_endpoint_cidr": "10.0.1.0/24",
                 "opensearch_endpoint_cidr": "10.0.2.0/24",
+                "dynamodb_endpoint_cidr": "10.0.3.0/24",
+                "s3_endpoint_cidr": "10.0.4.0/24",
+                "cloudwatch_endpoint_cidr": "10.0.5.0/24",
             },
             headers=_bearer(admin_token),
         )
@@ -219,6 +225,9 @@ async def test_save_and_read_back_aws_target_settings(make_user_and_token) -> No
         )
         assert saved_body["bedrock_endpoint_cidr"] == "10.0.1.0/24"
         assert saved_body["opensearch_endpoint_cidr"] == "10.0.2.0/24"
+        assert saved_body["dynamodb_endpoint_cidr"] == "10.0.3.0/24"
+        assert saved_body["s3_endpoint_cidr"] == "10.0.4.0/24"
+        assert saved_body["cloudwatch_endpoint_cidr"] == "10.0.5.0/24"
 
         # Omitting on a later save keeps them.
         resaved = client.patch(

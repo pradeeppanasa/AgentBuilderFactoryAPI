@@ -24,6 +24,7 @@ from app.modules.registry.models import (
     AgentVersionRecord,
     normalise_agent_type,
 )
+from app.shared.config_hash import compute_config_hash
 from app.shared.dynamodb_types import decimal_to_native
 
 _JSON_FIELDS = {
@@ -101,6 +102,7 @@ class AgentVersioner:
             changed_by=changed_by,
             created_at=_now(),
             configuration=configuration,
+            config_hash=compute_config_hash(configuration),
             capability_contract=contract,
             rolled_back_from_version=rolled_back_from_version,
         )

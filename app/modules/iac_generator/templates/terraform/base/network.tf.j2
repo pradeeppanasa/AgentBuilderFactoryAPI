@@ -15,6 +15,10 @@ variable "bedrock_endpoint_cidr" {
   type = string
 }
 
+variable "dynamodb_endpoint_cidr" {
+  type = string
+}
+
 resource "aws_security_group" "agent_sg" {
   name        = "panasa-{{ agent_id }}-sg"
   description = "Default-deny egress; every rule below is explicit (R17)"
@@ -51,6 +55,18 @@ resource "aws_security_group" "agent_sg" {
     description = "Bedrock model inference"
   }
 
+  # Sprint 4 Phase 9 (S-10, closes CLAUDE.md F6's own documented egress
+  # gap) — unconditional: every agent reads its own config from
+  # panasa-agent-versions at startup and checks tenant_id on every request
+  # (R67), regardless of memory/tools/KB configuration.
+  egress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [var.dynamodb_endpoint_cidr]
+    description = "DynamoDB (agent config, tenant isolation check, memory)"
+  }
+
 {% if agent.knowledge_base and agent.knowledge_base.enabled %}
   egress {
     from_port   = 443
@@ -58,6 +74,24 @@ resource "aws_security_group" "agent_sg" {
     protocol    = "tcp"
     cidr_blocks = [var.opensearch_endpoint_cidr]
     description = "OpenSearch Knowledge Base"
+  }
+{% endif %}
+{% if agent.audit_enabled %}
+  egress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [var.s3_endpoint_cidr]
+    description = "S3 (audit WORM writes)"
+  }
+{% endif %}
+{% if agent.observability_enabled %}
+  egress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [var.cloudwatch_endpoint_cidr]
+    description = "CloudWatch Logs / X-Ray (observability)"
   }
 {% endif %}
 {% for skill in agent.skills %}
@@ -87,6 +121,16 @@ resource "aws_security_group" "agent_sg" {
 
 {% if agent.knowledge_base and agent.knowledge_base.enabled %}
 variable "opensearch_endpoint_cidr" {
+  type = string
+}
+{% endif %}
+{% if agent.audit_enabled %}
+variable "s3_endpoint_cidr" {
+  type = string
+}
+{% endif %}
+{% if agent.observability_enabled %}
+variable "cloudwatch_endpoint_cidr" {
   type = string
 }
 {% endif %}

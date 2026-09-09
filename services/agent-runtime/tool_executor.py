@@ -21,6 +21,17 @@ risk) — both propagate out of execute() rather than being swallowed into
 a results-list entry like "unknown tool"/"invalid arguments" are, since
 main.py's /chat handler needs to turn them into a distinct HTTP 403/202,
 not a 200 with an error string buried in the body.
+
+Sprint 4 Phase 3 (S-11) — `pre_approved_call_id` lets orchestrator.py's
+resume path re-invoke a call that ToolPolicyEngine already put through a
+full enforce() once (default-deny AND risk both checked) and a human has
+since approved via the Factory Runtime's HITL API; enforce() is skipped
+for that one call id only, never for any other call in the same batch.
+Known limitation: if the original tool_calls batch had a LOW/MEDIUM-risk
+call ordered BEFORE the one needing approval, resuming re-executes the
+whole batch and that earlier call runs a second time — batches containing
+more than one tool call together with a HIGH/DESTRUCTIVE one are rare in
+practice and not specially handled here.
 """
 
 from __future__ import annotations
@@ -87,7 +98,9 @@ class ToolExecutor:
             for tool in self._tools.values()
         ]
 
-    async def execute(self, tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    async def execute(
+        self, tool_calls: list[dict[str, Any]], pre_approved_call_id: str | None = None
+    ) -> list[dict[str, Any]]:
         import asyncio
 
         results = []
@@ -105,12 +118,15 @@ class ToolExecutor:
             # Sprint 3 Phase 4 (R64) — raises ToolDeniedError/
             # ApprovalRequiredError, propagated out of execute() rather
             # than appended as a results-list entry (see module docstring).
-            self._policy_engine.enforce(
-                tool_id,
-                tenant_id=self._tenant_id,
-                agent_id=self._agent_id,
-                principal_id="agent-runtime",
-            )
+            # Sprint 4 Phase 3 (S-11) — skipped only for the one call id a
+            # human has already approved (see module docstring).
+            if call.get("id") != pre_approved_call_id:
+                self._policy_engine.enforce(
+                    tool_id,
+                    tenant_id=self._tenant_id,
+                    agent_id=self._agent_id,
+                    principal_id="agent-runtime",
+                )
 
             function_name = tool_lambda_name(self._agent_id, tool_id)
             response = await asyncio.to_thread(

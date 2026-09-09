@@ -3,11 +3,13 @@
 ## Agent: {{ agent_id }}  Version: {{ version }}
 ## Generic Agent Runtime instruction (2026-09-03): every agent's ECS task
 ## runs the SAME reusable agent-runtime container image
-## (services/agent-runtime/) — AGENT_ID/TENANT_ID are the only
-## agent-specific inputs baked in here. The container loads everything
-## else (model, prompt, KB, tools, memory, guardrails, HITL) from DynamoDB
-## at startup (config_loader.py) — never bake agent config into the image
-## or this task definition.
+## (services/agent-runtime/) — AGENT_ID/TENANT_ID/AGENT_CONFIG_HASH are
+## the only agent-specific inputs baked in here (the last one is S-13b,
+## Sprint 4 Phase 5 — a pinned SHA-256 the container verifies its loaded
+## config against at startup, not the config itself). The container
+## loads everything else (model, prompt, KB, tools, memory, guardrails,
+## HITL) from DynamoDB at startup (config_loader.py) — never bake agent
+## config into the image or this task definition.
 ##
 ## API Gateway HTTP APIs can't integrate with a private ECS service
 ## directly; the internal ALB below is the bridge api_gateway.tf's VPC
@@ -49,6 +51,7 @@ resource "aws_ecs_task_definition" "compute" {
         { name = "AGENT_ID", value = "{{ agent_id }}" },
         { name = "TENANT_ID", value = "{{ tenant_id }}" },
         { name = "AWS_REGION", value = var.aws_region },
+        { name = "AGENT_CONFIG_HASH", value = "{{ config_hash }}" },
       ]
 
       logConfiguration = {

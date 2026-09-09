@@ -9,6 +9,14 @@ block) have real call sites here (app/api/v1/agents.py,
 app/modules/security/policy_enforcement.py). The other two are defined in
 AuditEventType for schema consistency with whatever eventually writes them.
 
+Sprint 4 Phase 8 (S-14, R69) added a seventh, kb_document_rejected —
+a KB document failing ingestion-time validation/prompt-injection scanning
+(app/modules/knowledge_base/ingestion_scan.py) is closer to "block" in
+spirit (a security control fired and stopped something) but distinct
+enough, and common enough, to deserve its own filterable event type on
+the Audit Log page rather than being folded into the generic "block"
+bucket used for deployment-pipeline blocks.
+
 Write failures are logged, never raised — the same fail-open posture as
 app.modules.observability.metrics for the same reason: an audit-bucket
 outage blocking agent creation/deployment outright would be a worse
@@ -36,7 +44,13 @@ from app.shared.logging import get_logger
 log = get_logger()
 
 AuditEventType = Literal[
-    "config_change", "deploy", "guardrail_decision", "tool_call", "rollback", "block"
+    "config_change",
+    "deploy",
+    "guardrail_decision",
+    "tool_call",
+    "rollback",
+    "block",
+    "kb_document_rejected",
 ]
 
 

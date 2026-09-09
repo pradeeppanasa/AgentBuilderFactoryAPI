@@ -49,10 +49,15 @@ def test_unconfigured_target_renders_null_values() -> None:
     assert values["aws_region"] == "eu-west-2"
     assert values["vpc_id"] is None
     assert values["bedrock_endpoint_cidr"] is None
+    assert values["dynamodb_endpoint_cidr"] is None
     assert values["ecs_cluster_arn"] is None
     assert values["subnet_ids"] == []
     assert values["runtime_image"] is None
     assert "opensearch_endpoint_cidr" not in values
+    # audit_enabled/observability_enabled both default True on AgentConfiguration
+    # (Section 4.3) — their CIDR keys are still emitted, just null.
+    assert values["s3_endpoint_cidr"] is None
+    assert values["cloudwatch_endpoint_cidr"] is None
 
 
 def test_configured_target_renders_real_values() -> None:
@@ -63,6 +68,7 @@ def test_configured_target_renders_real_values() -> None:
         agent_ecs_cluster_arn="arn:aws:ecs:us-east-1:111122223333:cluster/acme",
         agent_runtime_ecr_registry="111122223333.dkr.ecr.us-east-1.amazonaws.com/agent-runtime",
         bedrock_endpoint_cidr="10.0.1.0/24",
+        dynamodb_endpoint_cidr="10.0.3.0/24",
     )
 
     tfvars_json = render_terraform_tfvars(
@@ -75,6 +81,7 @@ def test_configured_target_renders_real_values() -> None:
     assert values["subnet_ids"] == ["subnet-aaa", "subnet-bbb"]
     assert values["ecs_cluster_arn"] == "arn:aws:ecs:us-east-1:111122223333:cluster/acme"
     assert values["bedrock_endpoint_cidr"] == "10.0.1.0/24"
+    assert values["dynamodb_endpoint_cidr"] == "10.0.3.0/24"
     assert values["runtime_image"] == (
         "111122223333.dkr.ecr.us-east-1.amazonaws.com/agent-runtime:latest"
     )
@@ -101,6 +108,42 @@ def test_opensearch_cidr_only_emitted_when_rag_module_resolved() -> None:
         )
     )
     assert with_rag["opensearch_endpoint_cidr"] == "10.0.2.0/24"
+
+
+def test_s3_cidr_only_emitted_when_audit_enabled() -> None:
+    tenant_settings = _tenant_settings(s3_endpoint_cidr="10.0.4.0/24")
+
+    with_audit = json.loads(
+        render_terraform_tfvars(
+            tenant_settings, "eu-west-2", _config(audit_enabled=True), ALWAYS_ON_MODULES
+        )
+    )
+    assert with_audit["s3_endpoint_cidr"] == "10.0.4.0/24"
+
+    without_audit = json.loads(
+        render_terraform_tfvars(
+            tenant_settings, "eu-west-2", _config(audit_enabled=False), ALWAYS_ON_MODULES
+        )
+    )
+    assert "s3_endpoint_cidr" not in without_audit
+
+
+def test_cloudwatch_cidr_only_emitted_when_observability_enabled() -> None:
+    tenant_settings = _tenant_settings(cloudwatch_endpoint_cidr="10.0.5.0/24")
+
+    with_observability = json.loads(
+        render_terraform_tfvars(
+            tenant_settings, "eu-west-2", _config(observability_enabled=True), ALWAYS_ON_MODULES
+        )
+    )
+    assert with_observability["cloudwatch_endpoint_cidr"] == "10.0.5.0/24"
+
+    without_observability = json.loads(
+        render_terraform_tfvars(
+            tenant_settings, "eu-west-2", _config(observability_enabled=False), ALWAYS_ON_MODULES
+        )
+    )
+    assert "cloudwatch_endpoint_cidr" not in without_observability
 
 
 def test_tool_cidr_emitted_only_when_endpoint_and_endpoint_cidr_both_set() -> None:

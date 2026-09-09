@@ -35,6 +35,7 @@ from app.modules.iac_generator.naming import (
     tool_role_name,
 )
 from app.modules.registry.models import AgentConfiguration
+from app.shared.config_hash import compute_config_hash
 
 _TEMPLATES_ROOT = Path(__file__).parent.parent / "templates" / "terraform"
 
@@ -76,6 +77,15 @@ class TerraformBackend(IaCBackend):
             "tenant_id": tenant_id,
             "version": version,
             "agent": config,
+            # Sprint 4 Phase 5 (S-13b, R68) — baked into compute.tf.j2 as
+            # AGENT_CONFIG_HASH; services/agent-runtime/config_loader.py
+            # recomputes the identical hash from the raw config dict it
+            # loads and refuses to start on a mismatch. Computed fresh
+            # here (not read back off an AgentVersionRecord) so a
+            # generate-iac/validate call against a config that was never
+            # actually saved as a version still renders a hash matching
+            # exactly what THIS render's `agent` context contains.
+            "config_hash": compute_config_hash(config),
             # Generic Agent Runtime instruction (2026-09-03) — the runtime's
             # own DynamoDB permissions (authentication.tf.j2) need the real
             # table names. These are platform-wide constants (same for
@@ -99,6 +109,13 @@ class TerraformBackend(IaCBackend):
             ),
             "dynamodb_knowledge_bases_table": (
                 settings.dynamodb_knowledge_bases_table if settings else "panasa-knowledge-bases"
+            ),
+            # Sprint 4 Phase 6 (S-13c) — human_loop.tf.j2's IAM grant for
+            # services/agent-runtime/tool_approval.py (S-11), which reads/
+            # writes this table directly (F8 — no call back to this
+            # Runtime's own HITL API).
+            "dynamodb_hitl_reviews_table": (
+                settings.dynamodb_hitl_reviews_table if settings else "panasa-hitl-reviews"
             ),
         }
         files: dict[str, str] = {}

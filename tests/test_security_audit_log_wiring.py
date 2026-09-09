@@ -122,3 +122,38 @@ async def test_deployment_complete_writes_agent_deployed_security_audit_event(
     assert matching[0]["result"] == "success"
     assert matching[0]["principal_id"] == "ci-cd-webhook"
     assert matching[0]["resource"] == deploy["deployment_id"]
+
+
+async def test_rollback_writes_version_rolled_back_security_audit_event(
+    make_user_and_token,
+) -> None:
+    """Sprint 4 Phase 7 (S-13d) — agent.version_rolled_back was wired in
+    Phase 2 (S-05) but never had a dedicated test confirming it actually
+    lands in panasa-audit-log, unlike created/updated/deployed above."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        app.state.git_provider = FakeGitProvider()
+        created = client.post(
+            "/api/v1/agents", json=_minimal_agent_payload(), headers=_bearer(token)
+        ).json()
+        agent_id = created["agent_id"]
+
+        payload = _minimal_agent_payload()
+        payload["configuration"]["temperature"] = 0.7
+        client.put(
+            f"/api/v1/agents/{agent_id}",
+            json={"configuration": payload["configuration"], "change_description": "v2"},
+            headers=_bearer(token),
+        )
+
+        client.post(
+            f"/api/v1/agents/{agent_id}/rollback",
+            json={"target_version": 1, "reason": "v2 regressed"},
+            headers=_bearer(token),
+        )
+
+    events = _events_for_agent(TENANT_A, agent_id)
+    matching = [e for e in events if e["event_type"] == "agent.version_rolled_back"]
+    assert len(matching) == 1
+    assert matching[0]["result"] == "success"

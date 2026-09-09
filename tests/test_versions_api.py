@@ -212,6 +212,44 @@ async def test_rollback_creates_new_version_from_target_config(make_user_and_tok
     assert version_detail["iac_s3_key"]
 
 
+async def test_rollback_created_version_has_a_config_hash(make_user_and_token) -> None:
+    """Sprint 4 Phase 7 (S-13d) reconciliation check — rollback goes
+    through the same _create_new_version -> versioner.build_version()
+    path as every other version creation, so it must pick up S-13b's
+    config_hash automatically. No special-casing needed in rollback
+    itself; this just confirms that's actually true end-to-end."""
+    _, token = await make_user_and_token(TENANT_A, role="developer")
+
+    with TestClient(app) as client:
+        app.state.git_provider = FakeGitProvider()
+        created = client.post(
+            "/api/v1/agents", json=_minimal_agent_payload(), headers=_bearer(token)
+        ).json()
+        agent_id = created["agent_id"]
+
+        v2_config = _minimal_agent_payload()["configuration"]
+        v2_config["temperature"] = 0.9
+        client.put(
+            f"/api/v1/agents/{agent_id}",
+            json={"configuration": v2_config, "change_description": "v2"},
+            headers=_bearer(token),
+        )
+
+        response = client.post(
+            f"/api/v1/agents/{agent_id}/rollback",
+            json={"target_version": 1, "reason": "v2 regressed"},
+            headers=_bearer(token),
+        )
+        rolled_back_version = response.json()["version"]
+
+        version_detail = client.get(
+            f"/api/v1/agents/{agent_id}/versions/{rolled_back_version}", headers=_bearer(token)
+        ).json()
+
+    assert version_detail["config_hash"]
+    assert len(version_detail["config_hash"]) == 64
+
+
 async def test_rollback_to_current_version_returns_400(make_user_and_token) -> None:
     _, token = await make_user_and_token(TENANT_A, role="developer")
 

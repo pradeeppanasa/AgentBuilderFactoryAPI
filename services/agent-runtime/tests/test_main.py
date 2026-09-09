@@ -18,12 +18,15 @@ these tests should ever attempt a real AWS call.
 
 from __future__ import annotations
 
+import json as _json
 import sys
 import time
 from typing import Any
 
 import auth as auth_module
+import jwt as _pyjwt
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
 from fastapi.testclient import TestClient
 
 
@@ -402,9 +405,10 @@ def test_chat_tenant_mismatch_returns_403_and_writes_audit_event(
     record. Not naturally reachable through ApiKeyAuthProvider alone today
     (its AuthContext.tenant_id is always copied from the very record being
     checked) — this exercises the middleware's own comparison directly by
-    swapping in a fake auth chain, the same way it will become reachable
-    for real once JwtAuthProvider (S-12) starts returning external tenant
-    claims."""
+    swapping in a fake auth chain, decoupled from which real provider
+    would produce a mismatched tenant claim (see
+    test_chat_with_jwt_tenant_mismatch_returns_403 below for that, via the
+    real JwtAuthProvider, S-12)."""
     main_module = _fresh_main(
         monkeypatch,
         _config(),
@@ -442,6 +446,97 @@ def test_chat_tenant_mismatch_returns_403_and_writes_audit_event(
     assert mismatch_events[0]["result"] == "denied"
 
 
+# ── Sprint 4 Phase 4 (S-12) — end-to-end through the REAL auth_chain and
+# JwtAuthProvider, not a fake chain (test_auth.py covers the provider's
+# own logic in isolation; these confirm main.py actually wires it up).
+
+_JWT_PRIVATE_KEY = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+_JWT_KID = "test-key-1"
+_JWT_ISSUER = "https://idp.example.com/"
+_JWT_JWKS_URL = "https://idp.example.com/.well-known/jwks.json"
+
+
+def _jwt_jwks_document() -> dict[str, Any]:
+    jwk = _json.loads(_pyjwt.algorithms.RSAAlgorithm.to_jwk(_JWT_PRIVATE_KEY.public_key()))
+    jwk["kid"] = _JWT_KID
+    return {"keys": [jwk]}
+
+
+def _make_jwt(tenant_id: str) -> str:
+    now = int(time.time())
+    payload = {"iss": _JWT_ISSUER, "tenant_id": tenant_id, "iat": now, "exp": now + 300}
+    return _pyjwt.encode(payload, _JWT_PRIVATE_KEY, algorithm="RS256", headers={"kid": _JWT_KID})
+
+
+def test_chat_with_valid_jwt_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ApiKeyAuthProvider defers (no api_key_secret_arn on this record),
+    so this exercises AuthChain falling through to the real JwtAuthProvider."""
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record=_agent_record_with_key(
+            api_key_secret_arn=None, jwt_issuer=_JWT_ISSUER, jwt_jwks_url=_JWT_JWKS_URL
+        ),
+    )
+    monkeypatch.setattr(auth_module, "_fetch_jwks", lambda url: _jwt_jwks_document())
+    _fake_run_ok(monkeypatch, main_module)
+
+    with TestClient(main_module.app) as client:
+        response = client.post(
+            "/chat",
+            json={"message": "hi", "session_id": "s1"},
+            headers={"Authorization": f"Bearer {_make_jwt('tenant-a')}"},
+        )
+
+    assert response.status_code == 200
+
+
+def test_chat_with_jwt_tenant_mismatch_returns_403(monkeypatch: pytest.MonkeyPatch) -> None:
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record=_agent_record_with_key(
+            api_key_secret_arn=None, jwt_issuer=_JWT_ISSUER, jwt_jwks_url=_JWT_JWKS_URL
+        ),
+    )
+    monkeypatch.setattr(auth_module, "_fetch_jwks", lambda url: _jwt_jwks_document())
+    _fake_run_ok(monkeypatch, main_module)
+
+    with TestClient(main_module.app) as client:
+        response = client.post(
+            "/chat",
+            json={"message": "hi", "session_id": "s1"},
+            headers={"Authorization": f"Bearer {_make_jwt('some-other-tenant')}"},
+        )
+
+    assert response.status_code == 403
+    audit_events = main_module.write_audit_event.events
+    mismatch_events = [e for e in audit_events if e["event_type"] == "auth.tenant_mismatch"]
+    assert len(mismatch_events) == 1
+    assert mismatch_events[0]["tenant_id"] == "some-other-tenant"
+
+
+def test_chat_with_jwt_when_agent_has_no_jwt_config_returns_401(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An agent with JWT auth off entirely (no jwt_issuer/jwt_jwks_url) —
+    both providers defer, AuthChain returns None, 401."""
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record=_agent_record_with_key(api_key_secret_arn=None),
+    )
+
+    with TestClient(main_module.app) as client:
+        response = client.post(
+            "/chat",
+            json={"message": "hi", "session_id": "s1"},
+            headers={"Authorization": f"Bearer {_make_jwt('tenant-a')}"},
+        )
+
+    assert response.status_code == 401
+
+
 def test_chat_returns_403_when_orchestrator_raises_tool_denied_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -476,9 +571,13 @@ def test_chat_returns_403_when_orchestrator_raises_tool_denied_error(
     assert "default deny" in response.json()["detail"]
 
 
-def test_chat_returns_202_awaiting_approval_when_orchestrator_raises_approval_required(
+def test_chat_returns_202_awaiting_approval_when_orchestrator_pauses_for_tool_approval(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Sprint 4 Phase 3 (S-11) — orchestrator.run() now catches
+    ApprovalRequiredError itself (tests/test_orchestrator.py covers that
+    directly) and returns a hitl_pending dict with an approval_review_id;
+    this test only covers main.py's own plumbing of that dict into a 202."""
     main_module = _fresh_main(
         monkeypatch,
         _config(),
@@ -486,10 +585,18 @@ def test_chat_returns_202_awaiting_approval_when_orchestrator_raises_approval_re
         secrets={_KEY_ARN: "sk-correct"},
     )
 
-    from tool_policy import ApprovalRequiredError
-
     async def _pending_run(message: str, session_id: str, user_id: str | None = None) -> Any:
-        raise ApprovalRequiredError("payment-transfer")
+        return {
+            "response": "This action requires human approval before it can proceed.",
+            "session_id": session_id,
+            "run_id": "r1",
+            "hitl_pending": True,
+            "approval_review_id": "TAPR-ABCD1234",
+            "approval_status": "pending",
+            "latency_ms": 10,
+            "input_tokens": 5,
+            "output_tokens": 0,
+        }
 
     monkeypatch.setattr(main_module.orchestrator, "run", _pending_run)
 
@@ -502,8 +609,120 @@ def test_chat_returns_202_awaiting_approval_when_orchestrator_raises_approval_re
 
     assert response.status_code == 202
     body = response.json()
-    assert body["status"] == "awaiting_approval"
-    assert "human approval" in body["message"]
+    assert body["hitl_pending"] is True
+    assert body["approval_review_id"] == "TAPR-ABCD1234"
+    assert body["approval_status"] == "pending"
+
+
+def test_resume_approval_returns_202_while_still_pending(monkeypatch: pytest.MonkeyPatch) -> None:
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record=_agent_record_with_key(),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
+
+    async def _fake_resume(review_id: str) -> Any:
+        return {
+            "response": "This action is still awaiting human approval.",
+            "session_id": "",
+            "run_id": "r2",
+            "hitl_pending": True,
+            "approval_review_id": review_id,
+            "approval_status": "pending",
+            "latency_ms": 1,
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
+
+    monkeypatch.setattr(main_module.orchestrator, "resume_after_approval", _fake_resume)
+
+    with TestClient(main_module.app) as client:
+        response = client.post(
+            "/approvals/TAPR-ABCD1234/resume", headers={"Authorization": "Bearer sk-correct"}
+        )
+
+    assert response.status_code == 202
+    assert response.json()["approval_status"] == "pending"
+
+
+def test_resume_approval_returns_200_once_approved_and_executed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record=_agent_record_with_key(),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
+
+    async def _fake_resume(review_id: str) -> Any:
+        return {
+            "response": "Payment transfer completed.",
+            "session_id": "s1",
+            "run_id": "r3",
+            "hitl_pending": False,
+            "approval_review_id": review_id,
+            "approval_status": "approved",
+            "latency_ms": 42,
+            "input_tokens": 10,
+            "output_tokens": 5,
+        }
+
+    monkeypatch.setattr(main_module.orchestrator, "resume_after_approval", _fake_resume)
+
+    with TestClient(main_module.app) as client:
+        response = client.post(
+            "/approvals/TAPR-ABCD1234/resume", headers={"Authorization": "Bearer sk-correct"}
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["approval_status"] == "approved"
+    assert body["response"] == "Payment transfer completed."
+
+
+def test_resume_approval_requires_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record=_agent_record_with_key(),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
+
+    with TestClient(main_module.app) as client:
+        response = client.post("/approvals/TAPR-ABCD1234/resume")
+
+    assert response.status_code == 401
+
+
+def test_resume_approval_returns_500_with_no_internal_detail_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main_module = _fresh_main(
+        monkeypatch,
+        _config(),
+        agent_record=_agent_record_with_key(),
+        secrets={_KEY_ARN: "sk-correct"},
+    )
+
+    async def _failing_resume(review_id: str) -> Any:
+        raise RuntimeError("Bedrock threw a very specific internal exception with sensitive detail")
+
+    monkeypatch.setattr(main_module.orchestrator, "resume_after_approval", _failing_resume)
+
+    with TestClient(main_module.app) as client:
+        response = client.post(
+            "/approvals/TAPR-ABCD1234/resume", headers={"Authorization": "Bearer sk-correct"}
+        )
+
+    assert response.status_code == 500
+    assert "sensitive detail" not in response.text
+    assert response.json()["detail"] == "Agent execution failed"
+    audit_events = main_module.write_audit_event.events
+    error_events = [e for e in audit_events if e["result"] == "error"]
+    assert len(error_events) == 1
+    assert error_events[0]["action"] == "POST /approvals/TAPR-ABCD1234/resume"
 
 
 # ── Sprint 4 Phase 2 (S-05, CLAUDE.md Section 61.2) ─────────────────────

@@ -52,6 +52,11 @@ def render_terraform_tfvars(
         "aws_region": tenant_settings.aws_region or fallback_aws_region,
         "vpc_id": tenant_settings.agent_vpc_id,
         "bedrock_endpoint_cidr": tenant_settings.bedrock_endpoint_cidr,
+        # Sprint 4 Phase 9 (S-10) — unconditional, same reasoning as
+        # bedrock_endpoint_cidr: every agent reads its own config from
+        # panasa-agent-versions at startup and checks tenant_id on every
+        # request (R67), regardless of what other modules are resolved.
+        "dynamodb_endpoint_cidr": tenant_settings.dynamodb_endpoint_cidr,
         "ecs_cluster_arn": tenant_settings.agent_ecs_cluster_arn,
         "subnet_ids": tenant_settings.agent_subnet_ids,
         "runtime_image": _runtime_image(tenant_settings),
@@ -59,6 +64,12 @@ def render_terraform_tfvars(
 
     if "rag" in resolved_modules:
         values["opensearch_endpoint_cidr"] = tenant_settings.opensearch_endpoint_cidr
+
+    if config.audit_enabled:
+        values["s3_endpoint_cidr"] = tenant_settings.s3_endpoint_cidr
+
+    if config.observability_enabled:
+        values["cloudwatch_endpoint_cidr"] = tenant_settings.cloudwatch_endpoint_cidr
 
     for tool in config.tools:
         if tool.endpoint and tool.endpoint_cidr:

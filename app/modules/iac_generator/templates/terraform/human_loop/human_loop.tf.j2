@@ -38,3 +38,73 @@ resource "aws_sfn_state_machine" "human_review_workflow" {
   })
 {{ macros.panasa_tags(agent_id, tenant_id, version) }}
 }
+
+## Sprint 4 Phase 6 (S-13c, CLAUDE.md Section 62.6) — three IAM grants that
+## were entirely missing before this phase, closed here as the natural home
+## (this module only renders when human_review.enabled — the same gate
+## tool-approval's underlying human_review_workflow needs anyway):
+
+resource "aws_iam_role_policy" "agent_hitl_queue_access" {
+  # Pre-existing gap, fixed alongside the two below rather than filed
+  # separately: human_review_workflow above runs AS agent_execution_role
+  # but nothing ever granted it sqs:SendMessage on its own queue — the
+  # AwaitApproval state would have failed with AccessDenied on its very
+  # first real execution.
+  name = "panasa-{{ agent_id }}-hitl-queue-access"
+  role = aws_iam_role.agent_execution_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "sqs:SendMessage"
+      Resource = aws_sqs_queue.human_review_queue.arn
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "agent_hitl_reviews_access" {
+  # services/agent-runtime/tool_approval.py (S-11) and hitl.py both read/
+  # write panasa-hitl-reviews directly via boto3 (F8 — no call back to
+  # this Runtime's own HITL API). Whole-table grant, not row-scoped —
+  # matching the SAME already-accepted precedent as authentication.tf.j2's
+  # agent_read_own_config/agent_persistent_memory (DynamoDB IAM condition
+  # keys aren't a clean fit for this table's access pattern either;
+  # per-tenant/per-review isolation is enforced at the application layer,
+  # same as those two).
+  name = "panasa-{{ agent_id }}-hitl-reviews-access"
+  role = aws_iam_role.agent_execution_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"]
+      Resource = "arn:aws:dynamodb:${var.aws_region}:${data.aws_caller_identity.current.account_id}:table/{{ dynamodb_hitl_reviews_table }}"
+    }]
+  })
+}
+
+{% if agent.human_review.notification_sns_arn %}
+resource "aws_iam_role_policy" "agent_hitl_notifications" {
+  # hitl.py/tool_approval.py's SNS publish, gated the same way the config
+  # field itself is: only when this agent's own human_review.
+  # notification_sns_arn is actually set. Scoped to exactly that one ARN —
+  # a customer-supplied topic, not something this Terraform creates
+  # (aws_sns_topic.human_review_notifications above is a separate,
+  # structural resource this specific grant doesn't reference; see
+  # guardrails.tf.j2/rag.tf.j2 for the same "structural resource vs.
+  # actually-invoked resource" distinction).
+  name = "panasa-{{ agent_id }}-hitl-notifications"
+  role = aws_iam_role.agent_execution_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "sns:Publish"
+      Resource = "{{ agent.human_review.notification_sns_arn }}"
+    }]
+  })
+}
+{% endif %}

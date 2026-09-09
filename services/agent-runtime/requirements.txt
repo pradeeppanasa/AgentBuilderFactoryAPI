@@ -11,3 +11,9 @@ litellm==1.96.2
 structlog==24.4.0
 # Sprint 3 Phase 9 (S-03, R70) — quota.py's rpm/rpd rate-limit counters.
 redis==5.2.1
+# Sprint 4 Phase 4 (S-12) — JwtAuthProvider's JWKS/RS256 verification.
+# Same pinned version as the Factory Runtime's OWN (unrelated) HS256
+# Console-user auth (requirements.txt) purely for consistency — the two
+# never share code or a trust root (see auth.py's JwtAuthProvider
+# docstring). [crypto] extra pulls in `cryptography`, needed for RS256.
+pyjwt[crypto]==2.10.1

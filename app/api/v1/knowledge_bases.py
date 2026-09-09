@@ -19,25 +19,35 @@ an agent), not to gate uploads.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Annotated, Any, Literal
 from urllib.parse import unquote
 
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.dependencies import (
+    get_audit_writer,
     get_bedrock_kb_provisioner,
+    get_guardrail_engine,
     get_knowledge_base_store,
     get_platform_settings_store,
     get_registry_store,
     get_s3_client,
     get_tenant_id,
 )
+from app.modules.audit.writer import AuditEvent, AuditWriter
 from app.modules.auth.dependencies import require_role
 from app.modules.auth.schemas import CurrentUser
+from app.modules.guardrails.engine import GuardrailEngine
+from app.modules.knowledge_base.ingestion_scan import (
+    ALLOWED_DOCUMENT_EXTENSIONS,
+    scan_for_prompt_injection,
+    validate_document,
+)
 from app.modules.knowledge_base.models import EmbeddingModel, KBSourceType, KnowledgeBaseRecord
 from app.modules.knowledge_base.provisioner import (
     BedrockKnowledgeBaseProvisioner,
@@ -58,10 +68,34 @@ log = get_logger()
 _READ_ROLES = ("developer", "analyst", "auditor")
 _WRITE_ROLES = ("developer",)
 
-# instructions_kb_api.md's exact supported-file-type list.
-_ALLOWED_DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".doc", ".txt", ".md", ".html", ".csv"}
+# Sprint 4 Phase 8 (S-14) — now re-exported from ingestion_scan.py, the new
+# canonical home for this list (kept as a module-level alias so nothing
+# else in this file needs to change its references).
+_ALLOWED_DOCUMENT_EXTENSIONS = ALLOWED_DOCUMENT_EXTENSIONS
 
 _NOT_CONFIGURED_MESSAGE = "Configure your S3 bucket in Settings → Deployment first."
+
+
+async def _write_kb_rejection_audit_event(
+    audit_writer: AuditWriter,
+    *,
+    tenant_id: str,
+    kb_id: str,
+    filename: str,
+    reason: str,
+    actor: str,
+) -> None:
+    await audit_writer.write(
+        AuditEvent(
+            event_type="kb_document_rejected",
+            tenant_id=tenant_id,
+            agent_id=None,
+            actor=actor,
+            summary=f"KB document {filename!r} rejected ({reason}) for knowledge base {kb_id!r}",
+            metadata={"kb_id": kb_id, "filename": filename, "reason": reason},
+            occurred_at=datetime.now(UTC).isoformat(),
+        )
+    )
 
 
 async def _resolve_kb_bucket(
@@ -150,9 +184,7 @@ async def create_knowledge_base(
     current_user: Annotated[CurrentUser, Depends(require_role(*_WRITE_ROLES))],
     store: Annotated[KnowledgeBaseStore, Depends(get_knowledge_base_store)],
     provisioner: Annotated[BedrockKnowledgeBaseProvisioner, Depends(get_bedrock_kb_provisioner)],
-    platform_settings_store: Annotated[
-        PlatformSettingsStore, Depends(get_platform_settings_store)
-    ],
+    platform_settings_store: Annotated[PlatformSettingsStore, Depends(get_platform_settings_store)],
 ) -> KnowledgeBaseRecord:
     # Real Bedrock/S3 provisioning only once a bucket is configured (this
     # tenant's Settings, or the local-dev env var fallback) — otherwise
@@ -248,9 +280,18 @@ class UploadedDocumentSummary(BaseModel):
     size_bytes: int
 
 
+class RejectedDocumentSummary(BaseModel):
+    filename: str
+    reason: str  # "validation" | "prompt_injection" — ingestion_scan.ScanResult.reason
+
+
 class UploadDocumentsResponse(BaseModel):
     uploaded: list[UploadedDocumentSummary]
     count: int
+    # Sprint 4 Phase 8 (S-14, R69) — quarantined, not uploaded. A file
+    # appearing here was never written to S3 at all (unlike sync-time
+    # quarantine, which removes an already-uploaded object).
+    rejected: list[RejectedDocumentSummary] = Field(default_factory=list)
 
 
 class DocumentSummary(BaseModel):
@@ -289,9 +330,11 @@ async def upload_documents(
     kb_id: str,
     files: list[UploadFile],
     tenant_id: Annotated[str, Depends(get_tenant_id)],
-    _current_user: Annotated[CurrentUser, Depends(require_role(*_WRITE_ROLES))],
+    current_user: Annotated[CurrentUser, Depends(require_role(*_WRITE_ROLES))],
     store: Annotated[KnowledgeBaseStore, Depends(get_knowledge_base_store)],
     s3_client: Annotated[Any, Depends(get_s3_client)],
+    guardrail_engine: Annotated[GuardrailEngine, Depends(get_guardrail_engine)],
+    audit_writer: Annotated[AuditWriter, Depends(get_audit_writer)],
     subfolder: str | None = None,
 ) -> UploadDocumentsResponse:
     kb = await _get_kb_or_404(store, tenant_id, kb_id)
@@ -312,11 +355,38 @@ async def upload_documents(
             )
 
     uploaded: list[UploadedDocumentSummary] = []
+    rejected: list[RejectedDocumentSummary] = []
     try:
         for file in files:
             filename = file.filename or "document"
-            s3_key = _document_s3_key(kb, filename, subfolder)
             content = await file.read()
+
+            # Sprint 4 Phase 8 (S-14, R69) — size/structural validation and
+            # prompt-injection content scan, BEFORE this file ever reaches
+            # S3 (stronger than R69's own "never reaches Bedrock's sync
+            # step" bar — this file never lands in the bucket at all).
+            # Extension is already gated above; validate_document's own
+            # extension check is redundant there and only fires on
+            # size/emptiness here in practice.
+            scan = validate_document(filename, content)
+            if scan.passed:
+                scan = await scan_for_prompt_injection(
+                    filename, content, tenant_id, guardrail_engine
+                )
+            if not scan.passed:
+                assert scan.reason is not None
+                rejected.append(RejectedDocumentSummary(filename=filename, reason=scan.reason))
+                await _write_kb_rejection_audit_event(
+                    audit_writer,
+                    tenant_id=tenant_id,
+                    kb_id=kb_id,
+                    filename=filename,
+                    reason=scan.reason,
+                    actor=current_user.email,
+                )
+                continue
+
+            s3_key = _document_s3_key(kb, filename, subfolder)
             await asyncio.to_thread(
                 s3_client.put_object,
                 Bucket=kb.s3_bucket,
@@ -339,7 +409,7 @@ async def upload_documents(
         ) from exc
 
     await store.set_document_count(tenant_id, kb_id, kb.document_count + len(uploaded))
-    return UploadDocumentsResponse(uploaded=uploaded, count=len(uploaded))
+    return UploadDocumentsResponse(uploaded=uploaded, count=len(uploaded), rejected=rejected)
 
 
 @router.get("/{kb_id}/documents", response_model=DocumentListResponse)
@@ -394,6 +464,77 @@ async def delete_document(
     await store.set_document_count(tenant_id, kb_id, max(0, kb.document_count - 1))
 
 
+async def _quarantine_prefix_for(kb: KnowledgeBaseRecord) -> str:
+    assert kb.s3_prefix is not None
+    # A sibling prefix in the SAME bucket, derived uniformly regardless of
+    # whether s3_prefix is Panasa's own "{prefix}/{kb_id}/raw/" shape
+    # (Section 43.2) or a customer-supplied "Existing S3 Path" (Section
+    # 47.5) — never string-surgery on a literal "raw/" segment that may
+    # not be there for the latter.
+    return kb.s3_prefix.rstrip("/") + "-quarantine/"
+
+
+async def _scan_and_quarantine_kb_documents(
+    kb: KnowledgeBaseRecord,
+    tenant_id: str,
+    s3_client: Any,
+    guardrail_engine: GuardrailEngine,
+    audit_writer: AuditWriter,
+    actor: str,
+) -> list[RejectedDocumentSummary]:
+    """Sprint 4 Phase 8 (S-14, R69) — the enforcement gate that actually
+    closes the presigned-upload gap: those files never pass through
+    upload_documents' own inline scan (the browser PUTs straight to S3,
+    Section 47), so THIS is the first and only point this Runtime ever
+    sees their bytes before Bedrock would otherwise index them. Runs on
+    every sync call — every object under the KB's prefix is re-scanned
+    each time (a real, accepted inefficiency for a first working version;
+    a future optimisation could tag already-scanned-clean objects to
+    skip them, not built here), never only "new since last sync"."""
+    assert kb.s3_bucket is not None and kb.s3_prefix is not None
+    quarantine_prefix = await _quarantine_prefix_for(kb)
+
+    response = await asyncio.to_thread(
+        s3_client.list_objects_v2, Bucket=kb.s3_bucket, Prefix=kb.s3_prefix
+    )
+    rejected: list[RejectedDocumentSummary] = []
+    for obj in response.get("Contents", []):
+        s3_key = obj["Key"]
+        filename = s3_key[len(kb.s3_prefix) :]
+        if not filename:
+            continue
+
+        body = await asyncio.to_thread(s3_client.get_object, Bucket=kb.s3_bucket, Key=s3_key)
+        content = await asyncio.to_thread(body["Body"].read)
+
+        scan = validate_document(filename, content)
+        if scan.passed:
+            scan = await scan_for_prompt_injection(filename, content, tenant_id, guardrail_engine)
+        if scan.passed:
+            continue
+
+        assert scan.reason is not None
+        rejected.append(RejectedDocumentSummary(filename=filename, reason=scan.reason))
+        quarantine_key = f"{quarantine_prefix}{filename}"
+        await asyncio.to_thread(
+            s3_client.copy_object,
+            Bucket=kb.s3_bucket,
+            CopySource={"Bucket": kb.s3_bucket, "Key": s3_key},
+            Key=quarantine_key,
+        )
+        await asyncio.to_thread(s3_client.delete_object, Bucket=kb.s3_bucket, Key=s3_key)
+        await _write_kb_rejection_audit_event(
+            audit_writer,
+            tenant_id=tenant_id,
+            kb_id=kb.kb_id,
+            filename=filename,
+            reason=scan.reason,
+            actor=actor,
+        )
+
+    return rejected
+
+
 async def _delete_all_under_prefix(s3_client: Any, bucket: str, prefix: str) -> None:
     response = await asyncio.to_thread(s3_client.list_objects_v2, Bucket=bucket, Prefix=prefix)
     keys = [{"Key": obj["Key"]} for obj in response.get("Contents", [])]
@@ -407,6 +548,9 @@ async def _delete_all_under_prefix(s3_client: Any, bucket: str, prefix: str) -> 
 class SyncTriggerResponse(BaseModel):
     ingestion_job_id: str
     status: str
+    # Sprint 4 Phase 8 (S-14, R69) — documents quarantined (moved out of
+    # the synced prefix) by this sync call, before Bedrock ever saw them.
+    rejected: list[RejectedDocumentSummary] = Field(default_factory=list)
 
 
 class SyncStatusResponse(BaseModel):
@@ -424,9 +568,12 @@ class SyncStatusResponse(BaseModel):
 async def trigger_sync(
     kb_id: str,
     tenant_id: Annotated[str, Depends(get_tenant_id)],
-    _current_user: Annotated[CurrentUser, Depends(require_role(*_WRITE_ROLES))],
+    current_user: Annotated[CurrentUser, Depends(require_role(*_WRITE_ROLES))],
     store: Annotated[KnowledgeBaseStore, Depends(get_knowledge_base_store)],
     provisioner: Annotated[BedrockKnowledgeBaseProvisioner, Depends(get_bedrock_kb_provisioner)],
+    s3_client: Annotated[Any, Depends(get_s3_client)],
+    guardrail_engine: Annotated[GuardrailEngine, Depends(get_guardrail_engine)],
+    audit_writer: Annotated[AuditWriter, Depends(get_audit_writer)],
 ) -> SyncTriggerResponse:
     kb = await _get_kb_or_404(store, tenant_id, kb_id)
     _require_provisioned(kb)
@@ -438,6 +585,16 @@ async def trigger_sync(
                 "message": "A sync is already running for this knowledge base.",
             },
         )
+
+    # Sprint 4 Phase 8 (S-14, R69) — closes the presigned-upload gap
+    # (Section 47): those files never pass through upload_documents' own
+    # inline scan, so this is the enforcement gate nothing skips. Runs
+    # BEFORE start_sync — a quarantined document is removed from the
+    # prefix Bedrock is about to crawl, never handed to it at all.
+    rejected = await _scan_and_quarantine_kb_documents(
+        kb, tenant_id, s3_client, guardrail_engine, audit_writer, current_user.email
+    )
+
     try:
         ingestion_job_id = await provisioner.start_sync(kb)
     except KnowledgeBaseProvisioningError as exc:
@@ -447,7 +604,9 @@ async def trigger_sync(
         ) from exc
 
     await store.update_sync_state(tenant_id, kb_id, sync_status="IN_PROGRESS")
-    return SyncTriggerResponse(ingestion_job_id=ingestion_job_id, status="IN_PROGRESS")
+    return SyncTriggerResponse(
+        ingestion_job_id=ingestion_job_id, status="IN_PROGRESS", rejected=rejected
+    )
 
 
 @router.get("/{kb_id}/sync/status", response_model=SyncStatusResponse)

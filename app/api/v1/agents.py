@@ -202,6 +202,25 @@ class RevealApiKeyResponse(BaseModel):
     api_key: str
 
 
+class SetJwtConfigRequest(BaseModel):
+    """S-12 — None for jwt_issuer/jwt_jwks_url turns JWT auth back off for
+    this agent (see AgentRegistryStore.set_jwt_config's own docstring)."""
+
+    jwt_issuer: str | None = None
+    jwt_audience: str | None = None
+    jwt_jwks_url: str | None = None
+    jwt_tenant_claim: str = "tenant_id"
+
+
+class JwtConfigResponse(BaseModel):
+    agent_id: str
+    jwt_issuer: str | None
+    jwt_audience: str | None
+    jwt_jwks_url: str | None
+    jwt_tenant_claim: str
+    updated_at: str
+
+
 class AgentDetailResponse(BaseModel):
     agent: AgentRecord
     configuration: AgentConfiguration
@@ -1573,6 +1592,73 @@ async def revoke_agent_api_key(
     return RevokeApiKeyResponse(
         agent_id=agent_id,
         api_key_revoked=record.api_key_revoked,
+        updated_at=record.updated_at,
+    )
+
+
+@router.put("/{agent_id}/credentials/jwt-config", response_model=JwtConfigResponse)
+async def set_agent_jwt_config(
+    agent_id: str,
+    request: SetJwtConfigRequest,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    current_user: Annotated[CurrentUser, Depends(require_role(*_WRITE_ROLES))],
+    store: Annotated[AgentRegistryStore, Depends(get_registry_store)],
+    audit_writer: Annotated[AuditWriter, Depends(get_audit_writer)],
+    metrics_emitter: Annotated[MetricsEmitter, Depends(get_metrics_emitter)],
+    security_audit_log_store: Annotated[
+        SecurityAuditLogStore, Depends(get_security_audit_log_store)
+    ],
+) -> JwtConfigResponse:
+    """S-12 (CLAUDE.md Section 63.1) — configures this agent's JWT/OAuth2
+    trust for services/agent-runtime/auth.py's JwtAuthProvider: the
+    CUSTOMER's own identity provider, a completely separate trust root
+    from this Runtime's own Factory Console user auth. No UI wizard step
+    exists for this yet (API-only) — same "backend wired, no wizard form"
+    gap already flagged for S-03's quota fields, Section 67.4."""
+    if bool(request.jwt_issuer) != bool(request.jwt_jwks_url):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="jwt_issuer and jwt_jwks_url must be set together, or both left unset.",
+        )
+    if request.jwt_jwks_url is not None and not request.jwt_jwks_url.startswith("https://"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="jwt_jwks_url must be an https:// URL.",
+        )
+
+    try:
+        record = await store.set_jwt_config(
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            jwt_issuer=request.jwt_issuer,
+            jwt_audience=request.jwt_audience,
+            jwt_jwks_url=request.jwt_jwks_url,
+            jwt_tenant_claim=request.jwt_tenant_claim,
+            updated_by=current_user.email,
+        )
+    except AgentNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    await _record_event(
+        audit_writer=audit_writer,
+        metrics_emitter=metrics_emitter,
+        event_type="config_change",
+        metric_name="AgentJwtConfigUpdated",
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        actor=current_user.email,
+        summary=f"JWT auth config updated for agent {agent_id!r}",
+        security_audit_log_store=security_audit_log_store,
+        security_event_type="agent.updated",
+        security_action="update",
+    )
+
+    return JwtConfigResponse(
+        agent_id=agent_id,
+        jwt_issuer=record.jwt_issuer,
+        jwt_audience=record.jwt_audience,
+        jwt_jwks_url=record.jwt_jwks_url,
+        jwt_tenant_claim=record.jwt_tenant_claim,
         updated_at=record.updated_at,
     )
 

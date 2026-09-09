@@ -478,6 +478,36 @@ class AgentRegistryStore:
         await asyncio.to_thread(self._agents_table.put_item, Item=_agent_item(updated_record))
         return updated_record
 
+    async def set_jwt_config(
+        self,
+        tenant_id: str,
+        agent_id: str,
+        jwt_issuer: str | None,
+        jwt_audience: str | None,
+        jwt_jwks_url: str | None,
+        jwt_tenant_claim: str,
+        updated_by: str,
+    ) -> AgentRecord:
+        """S-12 (Sprint 4 Phase 4) — configures services/agent-runtime/
+        auth.py's JwtAuthProvider trust for this agent. Replaces the whole
+        config as one write (never a partial merge) — an admin clearing
+        jwt_issuer to None is exactly how JWT auth gets turned back off
+        for this agent, so a partial-update semantic would make that
+        impossible to express."""
+        record = await self._require_agent(tenant_id, agent_id)
+        updated_record = record.model_copy(
+            update={
+                "jwt_issuer": jwt_issuer,
+                "jwt_audience": jwt_audience,
+                "jwt_jwks_url": jwt_jwks_url,
+                "jwt_tenant_claim": jwt_tenant_claim,
+                "updated_by": updated_by,
+                "updated_at": _now(),
+            }
+        )
+        await asyncio.to_thread(self._agents_table.put_item, Item=_agent_item(updated_record))
+        return updated_record
+
     async def list_agents(
         self,
         tenant_id: str,

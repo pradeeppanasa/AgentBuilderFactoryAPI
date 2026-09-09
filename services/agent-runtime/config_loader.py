@@ -22,11 +22,14 @@ schema evolves without a lockstep redeploy of every already-running agent
 
 from __future__ import annotations
 
+import json
 import os
 from decimal import Decimal
 from typing import Any, cast
 
 import boto3
+from audit import write_audit_event
+from config_hash import compute_config_hash
 
 
 class AgentNotFoundError(RuntimeError):
@@ -43,6 +46,24 @@ class AgentVersionNotFoundError(RuntimeError):
         super().__init__(f"Agent version not found: agent_id={agent_id} version={version}")
 
 
+class ConfigIntegrityError(RuntimeError):
+    """Sprint 4 Phase 5 (S-13b, R68) — the config this container loaded
+    doesn't hash to the value compute.tf.j2 pinned into AGENT_CONFIG_HASH
+    at deploy time. Raised out of load_agent_config() at import time
+    (main.py's module-level `agent_config = load_agent_config()`), so the
+    container crashes before serving a single request — ECS marks the
+    task FAILED, matching R68's "refuse to start" exactly."""
+
+    def __init__(self, agent_id: str, expected: str, actual: str) -> None:
+        self.agent_id = agent_id
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            f"Config integrity check failed for agent_id={agent_id!r}: "
+            f"AGENT_CONFIG_HASH={expected!r} but loaded config hashes to {actual!r}"
+        )
+
+
 def _decimal_to_native(value: Any) -> Any:
     """DynamoDB returns numbers as Decimal — plain int/float is what every
     caller downstream (llm_client's temperature/max_tokens, JSON responses
@@ -54,6 +75,35 @@ def _decimal_to_native(value: Any) -> Any:
     if isinstance(value, list):
         return [_decimal_to_native(v) for v in value]
     return value
+
+
+def _verify_config_hash(configuration: dict[str, Any], *, tenant_id: str, agent_id: str) -> None:
+    """Sprint 4 Phase 5 (S-13b, R68). AGENT_CONFIG_HASH is only present on
+    task definitions rendered after this feature shipped (compute.tf.j2)
+    — absent entirely means an agent deployed before it existed, or a
+    local/dev run; skipped, not failed, for backward compatibility. Once
+    present, ANY mismatch is fatal — there is no partial/warn-only mode,
+    since a mismatch is exactly the tampered-or-stale-config scenario R68
+    exists to catch."""
+    expected_hash = os.environ.get("AGENT_CONFIG_HASH")
+    if not expected_hash:
+        return
+
+    actual_hash = compute_config_hash(configuration)
+    if actual_hash == expected_hash:
+        return
+
+    write_audit_event(
+        tenant_id=tenant_id,
+        event_type="agent.config_integrity_failed",
+        agent_id=agent_id,
+        principal_id="agent-runtime",
+        action="startup_config_verification",
+        resource=agent_id,
+        result="denied",
+        extra={"expected_hash": expected_hash, "actual_hash": actual_hash},
+    )
+    raise ConfigIntegrityError(agent_id, expected_hash, actual_hash)
 
 
 def load_agent_config(dynamodb: Any | None = None) -> dict[str, Any]:
@@ -95,8 +145,36 @@ def load_agent_config(dynamodb: Any | None = None) -> dict[str, Any]:
         raise AgentVersionNotFoundError(agent_id, version)
 
     configuration = version_item.get("configuration")
+    # Sprint 4 Phase 5 (S-13b) bug fix — a REAL Factory-Runtime-written item
+    # stores `configuration` as a JSON STRING (app/modules/registry/
+    # versioner.py's _to_item(), _JSON_FIELDS), never a native DynamoDB Map.
+    # This branch was missing entirely: every genuinely deployed agent
+    # would hit the isinstance check below, raise AgentVersionNotFoundError,
+    # and crash-loop forever — confirmed against a real moto-backed table,
+    # not just by reading the code. Every existing test fixture in this
+    # file passed `configuration` as a plain dict directly (bypassing the
+    # JSON-string round trip entirely), which is exactly why this was never
+    # caught: F8's zero-shared-code split also means the two services'
+    # test suites never exercised each other's actual wire format before
+    # (test_hitl_tool_approval_interop.py, added in S-11, is the only
+    # other place in this codebase that does).
+    if isinstance(configuration, str):
+        configuration = json.loads(configuration)
     if not isinstance(configuration, dict):
         raise AgentVersionNotFoundError(agent_id, version)
+
+    # Sprint 4 Phase 5 (S-13b, R68) — hashed BEFORE merging in
+    # agent_id/tenant_id/name/version below (none of those are part of
+    # AgentConfiguration; including them would never match the Factory
+    # Runtime's own compute_config_hash(AgentConfiguration)). Decimal-
+    # normalised first so a real DynamoDB-Number-typed field (never
+    # actually true for `configuration` today — versioner.py always
+    # stores it as a JSON string — but true for this file's own test
+    # fixtures) hashes the same way json.loads() already naturally
+    # produces native int/float, matching what model_dump(mode="json")
+    # produced on the Factory Runtime side.
+    configuration = _decimal_to_native(configuration)
+    _verify_config_hash(configuration, tenant_id=tenant_id, agent_id=agent_id)
 
     config: dict[str, Any] = {
         "agent_id": agent_id,

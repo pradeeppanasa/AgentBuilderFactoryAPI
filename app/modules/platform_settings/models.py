@@ -112,6 +112,14 @@ class PlatformSettingsRecord(BaseModel):
     f"{this}:latest" — see tfvars.py."""
     bedrock_endpoint_cidr: str | None = None
     opensearch_endpoint_cidr: str | None = None
+    # Sprint 4 Phase 9 (S-10, closes the F6 egress-allowlist gap) — DynamoDB
+    # (agent config load + R67 tenant check on every request, memory store)
+    # is unconditional, same as bedrock_endpoint_cidr above. S3 (audit WORM
+    # writes) and CloudWatch Logs (observability) are conditional on the
+    # matching agent config flag, same pattern as opensearch_endpoint_cidr.
+    dynamodb_endpoint_cidr: str | None = None
+    s3_endpoint_cidr: str | None = None
+    cloudwatch_endpoint_cidr: str | None = None
 
     updated_by: str
     updated_at: str

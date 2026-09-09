@@ -159,6 +159,11 @@ class DeploymentSettingsConfig(BaseModel):
     agent_runtime_ecr_registry: str | None
     bedrock_endpoint_cidr: str | None
     opensearch_endpoint_cidr: str | None
+    # Sprint 4 Phase 9 (S-10) — see PlatformSettingsRecord.dynamodb_endpoint_cidr's
+    # docstring for the unconditional-vs-conditional split.
+    dynamodb_endpoint_cidr: str | None
+    s3_endpoint_cidr: str | None
+    cloudwatch_endpoint_cidr: str | None
 
 
 class SaveDeploymentSettingsRequest(BaseModel):
@@ -198,6 +203,15 @@ class SaveDeploymentSettingsRequest(BaseModel):
     """None keeps the tenant's current value; "" clears it back to
     unconfigured."""
     opensearch_endpoint_cidr: str | None = None
+    """None keeps the tenant's current value; "" clears it back to
+    unconfigured."""
+    dynamodb_endpoint_cidr: str | None = None
+    """None keeps the tenant's current value; "" clears it back to
+    unconfigured."""
+    s3_endpoint_cidr: str | None = None
+    """None keeps the tenant's current value; "" clears it back to
+    unconfigured."""
+    cloudwatch_endpoint_cidr: str | None = None
     """None keeps the tenant's current value; "" clears it back to
     unconfigured."""
 
@@ -314,6 +328,9 @@ def _deployment_settings_response(record: Any) -> DeploymentSettingsConfig:
         agent_runtime_ecr_registry=record.agent_runtime_ecr_registry,
         bedrock_endpoint_cidr=record.bedrock_endpoint_cidr,
         opensearch_endpoint_cidr=record.opensearch_endpoint_cidr,
+        dynamodb_endpoint_cidr=record.dynamodb_endpoint_cidr,
+        s3_endpoint_cidr=record.s3_endpoint_cidr,
+        cloudwatch_endpoint_cidr=record.cloudwatch_endpoint_cidr,
     )
 
 
@@ -346,9 +363,7 @@ async def save_deployment_settings(
                 if payload.kb_s3_bucket is not None
                 else record.kb_s3_bucket
             ),
-            "kb_s3_prefix": (
-                payload.kb_s3_prefix if payload.kb_s3_prefix else record.kb_s3_prefix
-            ),
+            "kb_s3_prefix": (payload.kb_s3_prefix if payload.kb_s3_prefix else record.kb_s3_prefix),
             "git_organisation": (
                 (payload.git_organisation or None)
                 if payload.git_organisation is not None
@@ -389,6 +404,21 @@ async def save_deployment_settings(
                 if payload.opensearch_endpoint_cidr is not None
                 else record.opensearch_endpoint_cidr
             ),
+            "dynamodb_endpoint_cidr": (
+                (payload.dynamodb_endpoint_cidr or None)
+                if payload.dynamodb_endpoint_cidr is not None
+                else record.dynamodb_endpoint_cidr
+            ),
+            "s3_endpoint_cidr": (
+                (payload.s3_endpoint_cidr or None)
+                if payload.s3_endpoint_cidr is not None
+                else record.s3_endpoint_cidr
+            ),
+            "cloudwatch_endpoint_cidr": (
+                (payload.cloudwatch_endpoint_cidr or None)
+                if payload.cloudwatch_endpoint_cidr is not None
+                else record.cloudwatch_endpoint_cidr
+            ),
             "updated_by": current_user.email,
             "updated_at": _now(),
         }
@@ -403,7 +433,7 @@ async def validate_deployment_s3_bucket(
     _current_user: Annotated[CurrentUser, Depends(require_role())],
     s3_client: Annotated[Any, Depends(get_s3_client)],
 ) -> ValidateS3BucketResponse:
-    """"Customer S3 Bucket Name" validate button (Section 47) — checks
+    """ "Customer S3 Bucket Name" validate button (Section 47) — checks
     accessibility before the tenant saves it, same s3_client.head_bucket
     check knowledge_bases.py's validate-s3 does, just without needing an
     existing kb_id in the path (there isn't one yet on this settings page)."""
